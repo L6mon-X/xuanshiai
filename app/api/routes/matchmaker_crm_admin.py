@@ -11,8 +11,13 @@ from app.api.dependencies import CurrentMatchmakerAdmin, get_current_matchmaker_
 from app.db.session import get_db
 from app.schemas.matchmaker_crm_admin import MatchRecordCreate, MatchRecordItem, MatchRecordPage, MatchRecordResponse, MemberAssignmentResponse, MemberAssignmentUpdate, MemberDetail, MemberListItem, MemberPage, MemberStatistics, MemberStatusResponse, MemberStatusUpdate
 from app.schemas.admin import CertificationReviewRequest, RealnameReviewRequest
+from app.schemas.auth import PreferenceResponse, PreferenceUpdateRequest
 from app.services.auth import list_realname_reviews, review_realname
 from app.services.certifications import list_certification_reviews, review_certification
+from app.services.matchmaker_member_profile import (
+    get_member_preferences,
+    update_member_preferences,
+)
 
 router = APIRouter(prefix="/admin/matchmaker")
 
@@ -300,6 +305,16 @@ async def member_detail(member_id: int = Path(..., ge=1), current: CurrentMatchm
         except (TypeError, ValueError):
             data["tags"] = None
     return MemberDetail(**data)
+
+
+@router.get("/members/{member_id}/preferences", response_model=PreferenceResponse, summary="查询会员择偶要求")
+async def member_preferences(member_id: int = Path(..., ge=1), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> dict:
+    return await get_member_preferences(db, member_id)
+
+
+@router.patch("/members/{member_id}/preferences", response_model=PreferenceResponse, summary="修改会员择偶要求")
+async def update_member_preferences_route(member_id: int = Path(..., ge=1), body: PreferenceUpdateRequest = ..., current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> dict:
+    return await update_member_preferences(db, member_id, body)
 
 
 @router.patch("/members/{member_id}/assignment", response_model=MemberAssignmentResponse, summary="修改会员服务红娘")

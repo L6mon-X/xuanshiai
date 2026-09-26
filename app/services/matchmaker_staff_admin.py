@@ -220,15 +220,33 @@ async def create_staff(
             raise HTTPException(409, detail="该手机号已注册，请通过账号绑定选择普通用户")
         result = await db.execute(text("INSERT INTO users (phone,nickname,avatar,status) VALUES (:phone,:name,:avatar,1)"), {"phone": body.phone, "name": body.display_name, "avatar": body.avatar})
         user_id = int(result.lastrowid)
+    # 下面四张表都带唯一键，直接 INSERT 会在「该用户已提交过申请 / 已建过档案 / 已绑过门店」时
+    # 撞键抛 IntegrityError（接口 500）。统一改为幂等 upsert，并顺手补写审计字段 granted_by。
     await db.execute(
         text(
-            "INSERT INTO user_role (user_id,role_code,status) VALUES (:id,'service_matchmaker',1)"
+            """INSERT INTO user_role (user_id, role_code, status, granted_by)
+            VALUES (:id, 'service_matchmaker', 1, :actor)
+            ON DUPLICATE KEY UPDATE status = 1, granted_by = :actor,
+                granted_at = UTC_TIMESTAMP(), revoked_at = NULL, revoke_reason = NULL"""
         ),
-        {"id": user_id},
+        {"id": user_id, "actor": admin.account.id},
     )
     await db.execute(
         text(
-            "INSERT INTO user_matchmaker_apply (user_id,application_type,real_name,phone,intro,status,reviewed_by,reviewed_at) VALUES (:id,'service_matchmaker',:name,:phone,:description,1,:actor,UTC_TIMESTAMP())"
+            """INSERT INTO user_matchmaker_apply
+            (user_id, application_type, real_name, phone, intro, status, reviewed_by, reviewed_at)
+            VALUES (:id, 'service_matchmaker', :name, :phone, :description, 1, :actor, UTC_TIMESTAMP())
+            ON DUPLICATE KEY UPDATE
+                real_name = :name,
+                phone = :phone,
+                intro = :description,
+                status = 1,
+                fail_reason = NULL,
+                reviewed_by = :actor,
+                reviewed_at = UTC_TIMESTAMP(),
+                suspended_at = NULL,
+                suspension_reason = NULL,
+                updated_at = UTC_TIMESTAMP()"""
         ),
         {
             "id": user_id,
@@ -240,7 +258,16 @@ async def create_staff(
     )
     await db.execute(
         text(
-            "INSERT INTO matchmaker_profile (user_id,wechat,commission_level_id,role_tag,visible,description) VALUES (:id,:wechat,:level,:role,:visible,:description)"
+            """INSERT INTO matchmaker_profile
+            (user_id, wechat, commission_level_id, role_tag, visible, description)
+            VALUES (:id, :wechat, :level, :role, :visible, :description)
+            ON DUPLICATE KEY UPDATE
+                wechat = :wechat,
+                commission_level_id = :level,
+                role_tag = :role,
+                visible = :visible,
+                description = :description,
+                deleted_at = NULL"""
         ),
         {
             "id": user_id,
@@ -254,9 +281,13 @@ async def create_staff(
     if body.store_id:
         await db.execute(
             text(
-                "INSERT INTO organization_member (organization_id,user_id,role_code,status) VALUES (:store,:id,'store_matchmaker',1)"
+                """INSERT INTO organization_member
+                (organization_id, user_id, role_code, status, granted_by)
+                VALUES (:store, :id, 'store_matchmaker', 1, :actor)
+                ON DUPLICATE KEY UPDATE status = 1, granted_by = :actor,
+                    ended_at = NULL, end_reason = NULL"""
             ),
-            {"store": body.store_id, "id": user_id},
+            {"store": body.store_id, "id": user_id, "actor": admin.account.id},
         )
     await db.commit()
     return await get_staff(db, user_id)

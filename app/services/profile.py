@@ -212,6 +212,7 @@ async def get_profile(db: AsyncSession, user_id: int, public: bool = False) -> d
     result = await db.execute(
         text("""SELECT u.id AS user_id, u.nickname, u.gender, u.birthday, u.is_married, u.avatar,
                       p.height, p.weight, p.occupation, p.industry, p.education_level, p.income,
+                      p.house, p.car, p.ethnicity, p.ideal_partner,
                       p.hometown_province_code, p.hometown_city_code, p.hometown_district_code,
                       p.residence_province_code, p.residence_city_code, p.residence_district_code,
                       p.self_intro, p.interest_tags, p.personality_tags, p.mbti, p.tags,
@@ -270,11 +271,21 @@ async def get_profile(db: AsyncSession, user_id: int, public: bool = False) -> d
     return data
 
 
-async def update_profile(db: AsyncSession, user_id: int, request: ProfileUpdateRequest) -> dict[str, Any]:
+async def update_profile(
+    db: AsyncSession,
+    user_id: int,
+    request: ProfileUpdateRequest,
+    allow_gender_change: bool = False,
+) -> dict[str, Any]:
+    """更新用户资料并重算完整度。
+
+    allow_gender_change 供服务红娘代为修改会员资料使用：本人自助编辑时性别一经提交不可更改，
+    红娘需要纠正录入错误，因此代改路径放行。
+    """
     values = request.model_dump(exclude_unset=True)
     if "birthday" in values and values["birthday"] and _calculate_age(values["birthday"]) < 18:
         raise HTTPException(422, detail="用户必须年满18周岁")
-    if "gender" in values:
+    if "gender" in values and not allow_gender_change:
         result = await db.execute(text("SELECT gender FROM users WHERE id = :id FOR UPDATE"), {"id": user_id})
         old_gender = result.scalar()
         if old_gender is not None and old_gender != values["gender"]:
@@ -371,7 +382,7 @@ async def recalculate_completion(db: AsyncSession, user_id: int) -> float:
         "gender": row["gender"] in (1, 2),
         "birthday": bool(row["birthday"] and _calculate_age(row["birthday"]) >= 18),
         "location": bool(row["residence_province_code"] and row["residence_city_code"]),
-        "marriage": row["is_married"] in (1, 2, 3),
+        "marriage": row["is_married"] is not None,
         "occupation": bool(row["occupation"]),
         "education": row["education_level"] is not None,
         "income": row["income"] is not None,
@@ -444,7 +455,7 @@ async def get_completion(db: AsyncSession, user_id: int) -> CompletionResponse:
         "gender": row["gender"] in (1, 2),
         "birthday": bool(row["birthday"] and _calculate_age(row["birthday"]) >= 18),
         "location": bool(row["residence_province_code"] and row["residence_city_code"]),
-        "marriage": row["is_married"] in (1, 2, 3),
+        "marriage": row["is_married"] is not None,
         "occupation": bool(row["occupation"]),
         "education": row["education_level"] is not None,
         "income": row["income"] is not None,
@@ -529,7 +540,9 @@ async def get_preferences(db: AsyncSession, user_id: int) -> dict[str, Any]:
         return {
             "user_id": user_id, "age_min": None, "age_max": None, "height_min": None,
             "height_max": None, "education_min": None, "income_min": None,
-            "marriage_status": None, "preferred_province_code": None, "preferred_city_codes": [],
+            "marriage_status": None, "occupation_requirement": None,
+            "marriage_accept": None, "wedding_plan": None,
+            "preferred_province_code": None, "preferred_city_codes": [],
             "accept_long_distance": False, "accept_cross_province": False,
             "housing_requirement": None, "smoking_requirement": None,
             "drinking_requirement": None, "dating_goal": None,
@@ -576,7 +589,10 @@ async def update_preferences(db: AsyncSession, user_id: int, request: Preference
     return await get_preferences(db, user_id)
 
 
-async def upload_avatar(db: AsyncSession, user_id: int, file: UploadFile) -> dict[str, Any]:
+async def upload_avatar(
+    db: AsyncSession, user_id: int, file: UploadFile, auto_approve: bool = False
+) -> dict[str, Any]:
+    """上传头像。auto_approve 供服务红娘代传使用，直接标记为审核通过。"""
     data = await _read_limited(file, IMAGE_MAX_BYTES)
     image_data, thumbnail_data = await asyncio.to_thread(_image_outputs, data)
     name = uuid.uuid4().hex
@@ -594,8 +610,8 @@ async def upload_avatar(db: AsyncSession, user_id: int, file: UploadFile) -> dic
         text("""INSERT INTO user_media (user_id, media_type, file_url, storage_key, thumbnail_url,
                    mime_type, file_size, sort_order, is_primary, review_status)
                    VALUES (:user_id, 'avatar', :url, :storage_key, :thumbnail_url,
-                   'image/webp', :file_size, 0, 1, 0)"""),
-        {"user_id": user_id, "url": url, "storage_key": str(image_path), "thumbnail_url": thumbnail_url, "file_size": len(image_data)},
+                   'image/webp', :file_size, 0, 1, :review_status)"""),
+        {"user_id": user_id, "url": url, "storage_key": str(image_path), "thumbnail_url": thumbnail_url, "file_size": len(image_data), "review_status": 1 if auto_approve else 0},
     )
     await db.execute(text("UPDATE users SET avatar = :avatar, updated_at = UTC_TIMESTAMP() WHERE id = :id"), {"avatar": url, "id": user_id})
     await recalculate_completion(db, user_id)
@@ -638,7 +654,10 @@ async def upload_background(db: AsyncSession, user_id: int, file: UploadFile) ->
     return _media_response(media.mappings().one())
 
 
-async def upload_photo(db: AsyncSession, user_id: int, file: UploadFile) -> dict[str, Any]:
+async def upload_photo(
+    db: AsyncSession, user_id: int, file: UploadFile, auto_approve: bool = False
+) -> dict[str, Any]:
+    """上传相册图片。auto_approve 供服务红娘代传使用，直接标记为审核通过。"""
     result = await db.execute(text("SELECT COUNT(*) FROM user_media WHERE user_id = :user_id AND media_type = 'photo' AND deleted_at IS NULL"), {"user_id": user_id})
     if result.scalar() >= MAX_PHOTOS:
         raise HTTPException(409, detail="相册最多保存9张图片")
@@ -661,8 +680,8 @@ async def upload_photo(db: AsyncSession, user_id: int, file: UploadFile) -> dict
         text("""INSERT INTO user_media (user_id, media_type, file_url, storage_key, thumbnail_url,
                    mime_type, file_size, sort_order, is_primary, review_status)
                    VALUES (:user_id, 'photo', :url, :storage_key, :thumbnail_url,
-                   'image/webp', :file_size, :sort_order, :is_primary, 0)"""),
-        {"user_id": user_id, "url": url, "storage_key": str(image_path), "thumbnail_url": thumbnail_url, "file_size": len(image_data), "sort_order": sort_order, "is_primary": int(is_primary)},
+                   'image/webp', :file_size, :sort_order, :is_primary, :review_status)"""),
+        {"user_id": user_id, "url": url, "storage_key": str(image_path), "thumbnail_url": thumbnail_url, "file_size": len(image_data), "sort_order": sort_order, "is_primary": int(is_primary), "review_status": 1 if auto_approve else 0},
     )
     if is_primary:
         await db.execute(text("UPDATE users SET avatar = :avatar, updated_at = UTC_TIMESTAMP() WHERE id = :id"), {"avatar": url, "id": user_id})

@@ -1,6 +1,6 @@
 """Customer lead contracts for the back office."""
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -22,6 +22,9 @@ class CustomerLeadCreate(BaseModel):
     phone: str | None = Field(default=None, max_length=32)
     wechat: str | None = Field(default=None, max_length=128)
     source: str = Field(min_length=1, max_length=64)
+    photo: str | None = Field(default=None, max_length=512)
+    gender: Literal[1, 2] | None = None
+    birthday: date | None = None
     intention_level: Literal[1, 2, 3] = 1
     remark: str | None = Field(default=None, max_length=2000)
 
@@ -41,6 +44,9 @@ class CustomerLeadUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=128)
     phone: str | None = Field(default=None, max_length=32)
     wechat: str | None = Field(default=None, max_length=128)
+    photo: str | None = Field(default=None, max_length=512)
+    gender: Literal[1, 2] | None = None
+    birthday: date | None = None
     intention_level: Literal[1, 2, 3] | None = None
     status: LeadStatus | None = None
     remark: str | None = Field(default=None, max_length=2000)
@@ -53,7 +59,7 @@ class CustomerLeadUpdate(BaseModel):
 
     @model_validator(mode="after")
     def require_update(self) -> "CustomerLeadUpdate":
-        if all(value is None for value in (self.name, self.phone, self.wechat, self.intention_level, self.status, self.remark, self.next_follow_at)):
+        if all(value is None for value in (self.name, self.phone, self.wechat, self.photo, self.gender, self.birthday, self.intention_level, self.status, self.remark, self.next_follow_at)):
             raise ValueError("至少提供一个需要修改的字段")
         return self
 
@@ -93,6 +99,9 @@ class CustomerLead(BaseModel):
     phone: str | None
     wechat: str | None
     source: str
+    photo: str | None
+    gender: int | None
+    birthday: date | None
     intention_level: Literal[1, 2, 3]
     status: LeadStatus
     matchmaker_id: int | None

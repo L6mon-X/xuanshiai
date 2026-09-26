@@ -15,7 +15,7 @@ from app.services.customer_lead_contact import (
     ensure_contact_available, normalize_contact, raise_duplicate_contact,
 )
 
-LEAD_SELECT = """SELECT id, name, phone, wechat, source, intention_level, status, matchmaker_id,
+LEAD_SELECT = """SELECT id, name, phone, wechat, source, photo, gender, birthday, intention_level, status, matchmaker_id,
     organization_id, next_follow_at, converted_user_id, remark, created_by, created_at, updated_at
     FROM customer_lead"""
 
@@ -43,8 +43,8 @@ async def create_lead(db: AsyncSession, account_id: int, request: CustomerLeadCr
     await ensure_contact_available(db, phone, wechat)
     try:
         result = await db.execute(text("""INSERT INTO customer_lead
-            (name, phone, wechat, source, intention_level, remark, created_by)
-            VALUES (:name, :phone, :wechat, :source, :intention_level, :remark, :created_by)"""), {
+            (name, phone, wechat, source, photo, gender, birthday, intention_level, remark, created_by)
+            VALUES (:name, :phone, :wechat, :source, :photo, :gender, :birthday, :intention_level, :remark, :created_by)"""), {
             **request.model_dump(), "phone": phone, "wechat": wechat, "created_by": account_id,
         })
         lead_id = int(result.lastrowid)

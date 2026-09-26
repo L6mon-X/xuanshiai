@@ -69,6 +69,7 @@ class DiscoveryCard(BaseModel):
     user_id: int
     nickname: str | None
     avatar: str | None
+    gender: int | None = None
     age: int | None
     height: int | None
     education_level: int | None

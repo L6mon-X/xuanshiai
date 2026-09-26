@@ -5,6 +5,10 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+# 婚况编码：1未婚 2离异(兼容旧值) 3丧偶 4离婚未育 5离异未带孩 6离异带女孩 7离异带男孩
+MaritalStatus = Literal[1, 2, 3, 4, 5, 6, 7]
+
+
 def _adult_cutoff(today: date) -> date:
     try:
         return today.replace(year=today.year - 18)
@@ -17,7 +21,7 @@ class MatchmakerMemberCreate(BaseModel):
     nickname: str = Field(min_length=1, max_length=64)
     gender: Literal[1, 2]
     birthday: date | None = None
-    is_married: Literal[1, 2, 3] | None = None
+    is_married: MaritalStatus | None = None
     avatar: str | None = Field(default=None, max_length=255)
     remark: str | None = Field(default=None, max_length=2000)
 
@@ -32,7 +36,7 @@ class MatchmakerMemberUpdate(BaseModel):
     nickname: str | None = Field(default=None, min_length=1, max_length=64)
     gender: Literal[1, 2] | None = None
     birthday: date | None = None
-    is_married: Literal[1, 2, 3] | None = None
+    is_married: MaritalStatus | None = None
     avatar: str | None = Field(default=None, max_length=255)
     income: float | None = Field(default=None, ge=0, le=1_000_000)
     height: int | None = Field(default=None, ge=80, le=250)

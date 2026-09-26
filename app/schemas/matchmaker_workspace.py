@@ -73,6 +73,9 @@ class WorkspaceLeadCreate(BaseModel):
     source: str = Field(min_length=1, max_length=64)
     intention_level: Literal[1, 2, 3] = 1
     remark: str | None = Field(default=None, max_length=2000)
+    photo: str | None = Field(default=None, max_length=512)
+    gender: Literal[1, 2] | None = None
+    birthday: date | None = None
 
     @field_validator("phone", "wechat", mode="before")
     @classmethod
@@ -96,6 +99,9 @@ class WorkspaceLeadUpdate(BaseModel):
     status: LeadStatus | None = None
     remark: str | None = Field(default=None, max_length=2000)
     next_follow_at: datetime | None = None
+    photo: str | None = Field(default=None, max_length=512)
+    gender: Literal[1, 2] | None = None
+    birthday: date | None = None
 
     @field_validator("phone", "wechat", mode="before")
     @classmethod
@@ -127,6 +133,9 @@ class WorkspaceLead(BaseModel):
     remark: str | None = None
     last_follow_up_at: datetime | None = None
     converted_user_id: int | None = None
+    photo: str | None = None
+    gender: int | None = None
+    birthday: date | None = None
 
 
 class WorkspaceLeadPage(BaseModel):
@@ -277,8 +286,18 @@ class WorkspaceMemberFollowUpPage(BaseModel):
 
 
 class WorkspaceMemberContact(BaseModel):
+    """服务红娘受审计读取的会员联系方式。
+
+    ``scope`` 说明本次读取依据的权限范围：``ALL`` 表示超级红娘可查看所有会员，
+    ``SERVED`` 表示普通红娘仅能查看自己服务范围内的会员。
+    """
+
     user_id: int
-    phone: str | None
+    nickname: str | None = None
+    real_name: str | None = None
+    phone: str | None = None
+    wechat: str | None = None
+    scope: Literal["ALL", "SERVED"] = "SERVED"
 
 
 class WorkspaceMatchCandidate(BaseModel):
@@ -334,6 +353,7 @@ class WorkspaceIntroductionPerson(BaseModel):
     nickname: str
     avatar: str | None
     gender: Literal[1, 2] | None
+    is_vip: bool = False
 
 
 class WorkspaceIntroduction(BaseModel):
@@ -532,7 +552,7 @@ class WorkspaceMemberEntryCreate(BaseModel):
     real_name: str | None = Field(default=None, max_length=64)
     gender: Literal[1, 2]
     birthday: date | None = None
-    is_married: Literal[1, 2, 3] | None = None
+    is_married: Literal[1, 2, 3, 4, 5, 6, 7] | None = None
     wechat: str | None = Field(default=None, max_length=128)
     height: int | None = Field(default=None, ge=100, le=250)
     weight: int | None = Field(default=None, ge=40, le=120)
@@ -552,6 +572,26 @@ class WorkspaceMemberEntryCreate(BaseModel):
     marriage_plan: str | None = Field(default=None, max_length=64)
     tags: str | None = Field(default=None, max_length=128)
     remark: str | None = Field(default=None, max_length=2000)
+    # 择偶要求（录入时一并写入 user_partner_preference）
+    age_min: int | None = Field(default=None, ge=18, le=100)
+    age_max: int | None = Field(default=None, ge=18, le=100)
+    height_min: int | None = Field(default=None, ge=100, le=250)
+    height_max: int | None = Field(default=None, ge=100, le=250)
+    education_min: int | None = Field(default=None, ge=1, le=8)
+    income_min: float | None = Field(default=None, ge=0, le=1_000_000)
+    occupation_requirement: str | None = Field(default=None, max_length=64)
+    marriage_accept: Literal["不接受离异", "可接受离异未育", "接受离异带娃", "视情况而定"] | None = None
+    housing_requirement: Literal[0, 1, 2] | None = None
+    smoking_requirement: Literal[0, 1, 2] | None = None
+    wedding_plan: Literal["不限", "计划一年内", "计划两年内", "计划三年内", "时机成熟时结婚", "不婚"] | None = None
+
+    @model_validator(mode="after")
+    def validate_pref_ranges(self) -> "WorkspaceMemberEntryCreate":
+        if self.age_min is not None and self.age_max is not None and self.age_min > self.age_max:
+            raise ValueError("期望年龄下限不能大于上限")
+        if self.height_min is not None and self.height_max is not None and self.height_min > self.height_max:
+            raise ValueError("期望身高下限不能大于上限")
+        return self
 
 
 class WorkspaceMemberEntryResult(BaseModel):

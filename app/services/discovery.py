@@ -275,6 +275,7 @@ def _card(row: dict[str, Any], score: float, reason: str, detail_locked: bool = 
         user_id=int(row["user_id"]),
         nickname=row.get("nickname"),
         avatar=row.get("avatar"),
+        gender=row.get("card_gender") if row.get("card_gender") is not None else row.get("gender"),
         age=_calculate_age(row["birthday"]) if row.get("birthday") else None,
         height=row.get("height") if not detail_locked else None,
         education_level=row.get("education_level") if not detail_locked and not row.get("hide_school") else None,
@@ -674,9 +675,23 @@ async def view_profile(db: AsyncSession, viewer_id: int, target_id: int) -> Publ
     viewer = await _viewer_context(db, viewer_id)
     score, reason = _candidate_score(viewer, row)
     vip = await _is_vip(db, viewer_id)
-    privacy_locked = bool(row.get("only_vip_can_see_detail")) and not vip
-    quota = None if privacy_locked else await _consume_browse(db, viewer_id, score, vip, target_id)
-    full = vip or (not privacy_locked and quota is not None)
+    # 服务红娘在管理中心查看会员公开档案时不受会员/浏览额度限制。
+    is_matchmaker = bool(
+        await db.scalar(
+            text(
+                """SELECT 1 FROM user_role
+                WHERE user_id = :user_id AND role_code = 'service_matchmaker' AND status = 1 LIMIT 1"""
+            ),
+            {"user_id": viewer_id},
+        )
+    )
+    privacy_locked = bool(row.get("only_vip_can_see_detail")) and not vip and not is_matchmaker
+    quota = (
+        None
+        if privacy_locked
+        else (None if is_matchmaker else await _consume_browse(db, viewer_id, score, vip, target_id))
+    )
+    full = vip or is_matchmaker or (not privacy_locked and quota is not None)
     await _record_browse(db, viewer_id, target_id)
     card = _card(row, score, reason, detail_locked=not full)
     profile = await get_profile(db, target_id, public=True) if full else None

@@ -98,7 +98,7 @@ class ProfileUpdateRequest(BaseModel):
 
     gender: Literal[1, 2] | None = None
     birthday: date | None = None
-    is_married: Literal[1, 2, 3] | None = None
+    is_married: Literal[1, 2, 3, 4, 5, 6, 7] | None = None
     height: int | None = Field(default=None, ge=140, le=220)
     weight: int | None = Field(default=None, ge=40, le=120)
     occupation: str | None = Field(default=None, max_length=128)
@@ -201,6 +201,10 @@ class ProfileResponse(BaseModel):
     education_level: int | None
     income: float | None
     income_display: str | None = None
+    house: str | None = None
+    car: str | None = None
+    ethnicity: str | None = None
+    ideal_partner: str | None = None
     hometown_province_code: str | None
     hometown_city_code: str | None
     hometown_district_code: str | None
@@ -322,6 +326,9 @@ class PreferenceUpdateRequest(BaseModel):
     education_min: int | None = Field(default=None, ge=1, le=8)
     income_min: float | None = Field(default=None, ge=0, le=1_000_000)
     marriage_status: Literal[0, 1, 2, 3] | None = None
+    occupation_requirement: str | None = Field(default=None, max_length=64)
+    marriage_accept: Literal["不接受离异", "可接受离异未育", "接受离异带娃", "视情况而定"] | None = None
+    wedding_plan: Literal["不限", "计划一年内", "计划两年内", "计划三年内", "时机成熟时结婚", "不婚"] | None = None
     preferred_province_code: str | None = Field(default=None, max_length=32)
     preferred_city_codes: list[str] | None = Field(default=None, max_length=20)
     accept_long_distance: bool | None = None
@@ -352,6 +359,9 @@ class PreferenceResponse(BaseModel):
     education_min: int | None
     income_min: float | None
     marriage_status: int | None
+    occupation_requirement: str | None
+    marriage_accept: str | None
+    wedding_plan: str | None
     preferred_province_code: str | None
     preferred_city_codes: list[str]
     accept_long_distance: bool
