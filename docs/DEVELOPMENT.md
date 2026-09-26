@@ -128,6 +128,10 @@ python database_setup_marriage.py
 
 该脚本使用 `CREATE TABLE IF NOT EXISTS`，但生产环境仍应先备份并在发布窗口执行；真实支付、提现和第三方回调配置不能使用开发环境 Mock。
 
+### 聊天消息幂等键迁移
+
+生产/预发布环境保持 `AUTO_INIT_DB=false`，发布前对已选定并备份的目标库执行 `migrations/chat/20260923_01_chat_message_idempotency_up.sql`，再执行对应 `verify.sql` 并按 `migrations/chat/README.md` 核验；不得在未确认目标环境前执行。开发/测试初始化会通过 `database_setup_marriage.py` 幂等补齐该列与唯一键。回滚步骤见同目录 `README.md`，down 会删除新列中已写入的幂等键。
+
 生产或预发布环境必须配置：
 
 ```env
@@ -188,6 +192,19 @@ docker compose -f compose.ai-test.yml ps
 
 默认映射到 `127.0.0.1:3307`（MySQL）和 `127.0.0.1:6380`（Redis），数据库为 `xuanshiai_ai_test`，root 空密码只在这个临时测试服务中启用。可以用 `AI_TEST_MYSQL_DATABASE`、`AI_TEST_MYSQL_PORT` 和 `AI_TEST_REDIS_PORT` 覆盖默认值。
 
+**执行顺序（必须）**：全新卷上必须先跑业务 schema bootstrap（`initialize_database`，集成夹具会自动执行），再跑 `python scripts/manage_ai_migration.py up --target test`。顺序颠倒时，AI 迁移会在空库上先建表，bootstrap 的 `CREATE TABLE IF NOT EXISTS` 会跳过这些表，留下缺列的旧定义（2026-09-13 曾因此误判为"bootstrap 落后"）。
+
+手动执行 bootstrap/迁移时的环境变量（bootstrap 的 URL 解析只认 `mysql://` 与 `mysql+aiomysql://` 前缀，`mysql+pymysql://` 不被解析并静默回退到 `DB_*`/localhost:3306，易误连开发库）：
+
+```powershell
+$env:DATABASE_URL = "mysql://root:@127.0.0.1:3307/xuanshiai_ai_test"
+.\.venv\Scripts\python.exe database_setup_marriage.py
+$env:AI_TEST_DATABASE_URL = "mysql+aiomysql://root:@127.0.0.1:3307/xuanshiai_ai_test"
+.\.venv\Scripts\python.exe scripts/manage_ai_migration.py --target test up
+```
+
+**跑集成套件前停掉 worker-a/worker-b**：这两个容器与测试进程内驱动的 `ai_worker._run_round` 消费同一个 `ai_task_queue`，并发领取会让任务计数断言变成竞态（2026-09-13 干净卷复现 `_run_worker(4)` 实领 3）。`docker compose -f compose.ai-test.yml stop worker-a worker-b` 后再跑 `tests/integration`；跨进程并发 claim 的专项验证按 `test_ai_worker_real_db.py:34` 的 skip 说明在容器内执行。
+
 启动服务后，测试 fixture 会运行现有 `database_setup_marriage.initialize_database()`，然后从真实 MySQL 读取 `information_schema` 并启动真实子进程：
 
 ```powershell
@@ -206,6 +223,30 @@ docker compose -f compose.ai-test.yml down -v --remove-orphans
 如果服务停在 `Created` 或健康检查异常，先执行 `docker compose -f compose.ai-test.yml ps --all` 和 `docker compose -f compose.ai-test.yml logs mysql redis worker-a worker-b`；确认只涉及 `xuanshiai-ai-test-*` 后，再执行上面的 `down -v` 重新建立干净的测试卷。
 
 ## 五、测试与代码检查
+
+### 5.0 直播腾讯 Provider
+
+直播后端使用 `tencentcloud-sdk-python` 的服务端 SDK 访问腾讯云控制面；音视频媒体流仍由客户端 TRTC SDK 负责。开发/测试默认使用 `LIVE_PROVIDER=mock`，生产或 staging 必须使用 `LIVE_PROVIDER=tencent` 并配置 `TENCENT_LIVE_SDK_APP_ID`、`TENCENT_LIVE_SDK_SECRET_KEY`、`TENCENT_LIVE_SECRET_ID`、`TENCENT_LIVE_SECRET_KEY` 和 `TENCENT_LIVE_CALLBACK_SECRET`。`SDKSecretKey` 仅用于生成 UserSig，CAM `SecretId/SecretKey` 仅用于服务端控制面 API，禁止复用。不得提交 `.env` 或真实腾讯密钥。
+
+从旧配置升级时，从 TRTC 控制台读取 SDKSecretKey 并新增 `TENCENT_LIVE_SDK_SECRET_KEY`；原 `TENCENT_LIVE_SECRET_KEY` 改为填写 CAM 子账号 SecretKey。两种密钥没有兼容回退，不能把同一个值复制到两项。`LIVE_ENABLED=true` 且 `LIVE_PROVIDER=tencent` 时缺少任一凭据会在启动阶段 fail-closed；轮换顺序为先注入全部新变量并验证，再重启 API/Worker，最后撤销旧凭据。
+
+本地真实联调前先在腾讯控制台确认 TRTC 应用、CAM 最小权限和回调签名契约，再执行数据库初始化。未完成真实联调前，不得把 SDK 依赖安装成功等同于腾讯直播链路验收通过。
+
+直播可靠事件发布 Worker：
+
+```powershell
+# 单轮处理待发布事件
+uv run python -m app.workers.live_event_worker --once
+
+# 常驻处理；建议独立于 API 进程部署
+uv run python -m app.workers.live_event_worker --batch-size 50 --idle-seconds 2
+```
+
+生产升级前先运行 `no upload/直播相亲后端详细修改方案清单-2026-09-16.md` 中的重复席位检查，备份直播表后执行 `migrations/live/20260916_01_live_reliability_up.sql`。生产仍必须保持 `AUTO_INIT_DB=false`；回滚时先关闭直播和 Worker，再执行对应 down SQL。
+
+腾讯回调现在要求 `X-Tencent-Timestamp`、签名、时间窗口、体积上限和 `TENCENT_LIVE_CALLBACK_EVENT_TYPES_RAW` 白名单。该契约仍需使用实际开通产品的官方回调样例复核；白名单未配置时生产配置校验失败。
+
+直播 WebSocket 新客户端必须先调用 `POST /api/v1/live/sessions/{session_id}/ws-ticket`，再使用 60 秒单用途 `ticket` 建立连接；不得把长期 Access Token 放入 WebSocket URL。ticket 绑定登录会话和场次，Redis 不可用时生产环境拒绝签发/消费，连接期间会检查会话撤销和账号限制。详见 `docs/api/直播相亲.md`。
 
 运行全部测试：
 
@@ -392,6 +433,30 @@ uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 生产 `AUTO_INIT_DB` 必须为 `false`；未批准条件保持 `AI_FEATURE_DISABLED`。回滚：先关闭 `AI_MASTER_ENABLED` 和各模块开关，停止 Worker/消费者，旧 `/discovery/*` 接口与 `legacy-rule-v1` 字段保持可用。
+
+### 10.6 内嵌清理任务与运行指标（Task 17）
+
+业务 Worker 主循环内嵌三类节流清理任务（每类独立会话/事务，失败绝不影响业务轮次）：
+
+- **语音临时音频清理**：`ai_voice_audio_cleanup_interval_seconds` 节流，扫描
+  `upload_dir/voice/tts` 与 `upload_dir/tts`，删除超过 `ai_voice_audio_retention_hours`
+  的音频；越界路径拒绝并记 `voice_audio_cleanup_out_of_bounds_refused`。
+- **Memory State TTL 清理**：`ai_memory_state_ttl_cleanup_interval_seconds` 节流，
+  批次行数/批次数/墙钟三重上限；打点 `memory_state_ttl_cleanup_{success,failed,skipped}`。
+- **Retention 清理**：`ai_retention_cleanup_interval_seconds` 节流，清理过期
+  voice transcript、generation audit 与终态 outbox 行（成功/死信保留期分开配置）。
+
+**指标**：所有运行指标经 `emit_ai_metric` 输出结构化日志（`ai_metric name=... value=... tags=...`），
+生产以日志聚合为时序出口。指标清单、告警阈值与逐项处置步骤见运行手册
+`docs/runbooks/ai-retention-and-recovery.md`（含 queue_age、retry_backlog、
+provider_timeout、websocket_fallback、audit_lost、quota_refund_failure 等全部条目）。
+
+**审计写入**：`record_generation_audit` 走有界异步队列（上限 2048）+ 后台 flusher，
+队列满丢最旧并计 `audit_lost`；Worker 关闭时自动排空。审计失败绝不阻塞业务链路。
+
+**WebSocket 终态通知**：任务终态 commit 后经 Redis pub/sub 唤醒等待方
+（`app/services/ai/task_events.py`）；Redis 不可用自动退回轮询并计
+`websocket_fallback`；消息只作唤醒信号，权威状态始终以数据库重读为准。
 
 ## 11. G5 证据链脚手架（Task 10，2026-08-17 证据治理分支）
 

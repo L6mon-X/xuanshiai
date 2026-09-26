@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import os
 import shutil
@@ -21,7 +22,17 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.profile_tags import TAG_CATEGORIES
+from app.core.profile_tags import (
+    ALL_TAG_OPTIONS,
+    CUSTOM_TAG_CATEGORY_KEY,
+    CUSTOM_TAG_CATEGORY_MAP_KEY,
+    TAG_CATEGORIES,
+    TAG_CATALOG_REVISION,
+    normalize_custom_tag_categories,
+    personal_tags,
+    split_personal_tags,
+)
+from app.services.content_filter import moderate_text
 from app.services.regions import region_display
 from app.schemas.admin import MediaReviewRequest, MediaReviewResponse
 from app.schemas.auth import (
@@ -34,10 +45,13 @@ from app.schemas.auth import (
     ProfileOverviewResponse,
     ProfileUpdateRequest,
     NicknameUpdateResponse,
+    QA_QUESTION_TEXTS,
     TagCategoryResponse,
     TagOptionsResponse,
 )
 from app.services.revisions import RevisionKind, increment_revision_and_enqueue
+
+logger = logging.getLogger(__name__)
 
 IMAGE_MAX_BYTES = 5 * 1024 * 1024
 VIDEO_MAX_BYTES = 50 * 1024 * 1024
@@ -59,8 +73,7 @@ COMPLETION_RULES: tuple[tuple[str, str, int], ...] = (
     ("avatar", "头像", 15),
     ("intro", "自我介绍", 10),
     ("album", "相册", 8),
-    ("interest", "兴趣标签", 5),
-    ("personality", "性格标签", 3),
+    ("personal_tags", "兴趣标签", 8),
     ("mbti", "MBTI", 2),
     ("preference", "择偶要求", 3),
     ("realname", "实名认证", 5),
@@ -117,6 +130,68 @@ def _json_dict(value: Any) -> dict[str, list[str]]:
         for category, selected in value.items()
         if isinstance(selected, list)
     }
+
+
+def _json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _qa_answers_from_value(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(value, list):
+        return []
+    by_id: dict[int, dict[str, Any]] = {}
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        try:
+            question_id = int(item.get("question_id") or item.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if question_id not in QA_QUESTION_TEXTS:
+            continue
+        answer = str(item.get("answer") or "").strip()[:300]
+        question = str(item.get("question") or QA_QUESTION_TEXTS[question_id]).strip()[:64]
+        by_id[question_id] = {
+            "question_id": question_id,
+            "question": question or QA_QUESTION_TEXTS[question_id],
+            "answer": answer,
+        }
+    return [by_id[key] for key in sorted(by_id)]
+
+
+def _profile_tag_values(row: Any) -> list[str]:
+    values = _json_list(row.get("interest_tags")) + _json_list(row.get("personality_tags"))
+    values += _json_list(row.get("tags"))
+    for items in _json_dict(row.get("tags")).values():
+        values.extend(items)
+    return list(dict.fromkeys(values))
+
+
+def _profile_custom_tags(row: Any) -> list[str]:
+    return list(_profile_custom_tag_categories(row))
+
+
+def _profile_custom_tag_categories(row: Any) -> dict[str, str]:
+    stored = _json_object(row.get("tags"))
+    values = stored.get(CUSTOM_TAG_CATEGORY_KEY, [])
+    return normalize_custom_tag_categories(
+        [str(item) for item in values] if isinstance(values, list) else [],
+        stored.get(CUSTOM_TAG_CATEGORY_MAP_KEY),
+    )
 
 
 def _json_value(value: Any) -> str:
@@ -215,7 +290,7 @@ async def get_profile(db: AsyncSession, user_id: int, public: bool = False) -> d
                       p.house, p.car, p.ethnicity, p.ideal_partner,
                       p.hometown_province_code, p.hometown_city_code, p.hometown_district_code,
                       p.residence_province_code, p.residence_city_code, p.residence_district_code,
-                      p.self_intro, p.interest_tags, p.personality_tags, p.mbti, p.tags,
+                      p.self_intro, p.qa_answers, p.interest_tags, p.personality_tags, p.mbti, p.tags,
                       COALESCE(c.score, 0) AS completion_score,
                       COALESCE(pr.hide_school, 0) AS hide_school,
                       COALESCE(pr.hide_company, 0) AS hide_company,
@@ -237,7 +312,20 @@ async def get_profile(db: AsyncSession, user_id: int, public: bool = False) -> d
     data["age"] = _calculate_age(data["birthday"]) if data["birthday"] else None
     data["interest_tags"] = _json_list(data["interest_tags"])
     data["personality_tags"] = _json_list(data["personality_tags"])
-    data["tag_selections"] = _json_dict(data["tags"])
+    data["qa_answers"] = _qa_answers_from_value(data.get("qa_answers"))
+    raw_tags = _profile_tag_values(data)
+    data["custom_tag_categories"] = _profile_custom_tag_categories(data)
+    data["custom_tags"] = list(data["custom_tag_categories"])
+    data["personal_tags"] = personal_tags(raw_tags, data["custom_tags"])
+    data["legacy_tags"] = []
+    data["interest_tags"], data["personality_tags"] = split_personal_tags(raw_tags, data["custom_tags"])
+    data["tag_selections"] = {
+        key: [tag for tag in data["personal_tags"] if tag in options]
+        for key, _, options in TAG_CATEGORIES
+        if any(tag in options for tag in data["personal_tags"])
+    }
+    if data["custom_tags"]:
+        data["tag_selections"][CUSTOM_TAG_CATEGORY_KEY] = data["custom_tags"]
     data["photos"] = photos
     data["video"] = videos[0] if videos else None
     data["background_wall"] = backgrounds[0]["file_url"] if backgrounds else None
@@ -265,6 +353,9 @@ async def get_profile(db: AsyncSession, user_id: int, public: bool = False) -> d
         if data["only_vip_can_see_detail"]:
             for field in ("height", "occupation", "industry", "education_level", "is_married", "mbti"):
                 data[field] = None
+            data["personal_tags"] = []
+            data["custom_tags"] = []
+            data["custom_tag_categories"] = {}
             data["interest_tags"] = []
             data["personality_tags"] = []
             data["tag_selections"] = {}
@@ -283,6 +374,22 @@ async def update_profile(
     红娘需要纠正录入错误，因此代改路径放行。
     """
     values = request.model_dump(exclude_unset=True)
+    if "personal_tags" in values:
+        selected = values.pop("personal_tags")
+        selected_custom_categories = values.pop("custom_tag_categories", {})
+        selected_custom_tags = [tag for tag in selected if tag not in ALL_TAG_OPTIONS]
+        for tag in selected_custom_tags:
+            decision = await moderate_text(db, tag, field="自定义标签")
+            if decision.action != "allow":
+                raise HTTPException(422, detail="自定义标签内容不适合公开展示，请修改后重试")
+        values["interest_tags"], values["personality_tags"] = split_personal_tags(selected, selected_custom_tags)
+        values["tag_selections"] = {
+            key: [tag for tag in selected if tag in options]
+            for key, _, options in TAG_CATEGORIES if any(tag in options for tag in selected)
+        }
+        if selected_custom_tags:
+            values["tag_selections"][CUSTOM_TAG_CATEGORY_KEY] = selected_custom_tags
+        values["tag_selections"][CUSTOM_TAG_CATEGORY_MAP_KEY] = selected_custom_categories
     if "birthday" in values and values["birthday"] and _calculate_age(values["birthday"]) < 18:
         raise HTTPException(422, detail="用户必须年满18周岁")
     if "gender" in values and not allow_gender_change:
@@ -306,6 +413,18 @@ async def update_profile(
         values["personality_tags"] = _json_value(values["personality_tags"])
     if "tag_selections" in values:
         values["tags"] = _json_value(values.pop("tag_selections"))
+    if "qa_answers" in values:
+        raw_answers = values.get("qa_answers") or []
+        for item in raw_answers:
+            answer = str(item.get("answer") or "").strip() if isinstance(item, dict) else ""
+            if not answer:
+                continue
+            decision = await moderate_text(db, answer, field="关于我问答")
+            if decision.action == "reject":
+                raise HTTPException(422, detail="关于我问答内容不适合公开展示，请修改后重试")
+            if decision.action == "replace" and isinstance(item, dict):
+                item["answer"] = decision.display_content
+        values["qa_answers"] = _json_value(_qa_answers_from_value(raw_answers))
     if values:
         columns = ["user_id", *values]
         placeholders = ", ".join(f":{column}" for column in columns)
@@ -316,6 +435,10 @@ async def update_profile(
         )
     await recalculate_completion(db, user_id)
     changed_fields = tuple(request.model_dump(exclude_unset=True).keys())
+    if "personal_tags" in changed_fields:
+        changed_fields = tuple(
+            key for key in changed_fields if key not in {"personal_tags", "custom_tag_categories"}
+        ) + ("interest_tags", "personality_tags", "tags")
     if changed_fields:
         await increment_revision_and_enqueue(
             db,
@@ -392,8 +515,7 @@ async def recalculate_completion(db: AsyncSession, user_id: int) -> float:
         "avatar": bool(row["avatar"]),
         "intro": bool(row["self_intro"] and len(row["self_intro"].strip()) >= 20),
         "album": bool(row["album_done"]),
-        "interest": len(_json_list(row["interest_tags"])) >= 3 or sum(len(items) for items in _json_dict(row["tags"]).values()) >= 3,
-        "personality": len(_json_list(row["personality_tags"])) >= 3,
+        "personal_tags": len(personal_tags(_profile_tag_values(row), _profile_custom_tags(row))) >= 3,
         "mbti": bool(row["mbti"]),
         "preference": row["preference_age_min"] is not None and row["preference_age_max"] is not None,
         "realname": row["realname_status"] == 2,
@@ -414,7 +536,7 @@ async def recalculate_completion(db: AsyncSession, user_id: int) -> float:
         "avatar_completed": completed["avatar"],
         "intro_completed": completed["intro"],
         "album_completed": completed["album"],
-        "interest_completed": completed["interest"] and completed["personality"],
+        "interest_completed": completed["personal_tags"],
         "preference_completed": completed["preference"],
         "realname_completed": completed["realname"],
         "mbti_completed": completed["mbti"],
@@ -423,8 +545,8 @@ async def recalculate_completion(db: AsyncSession, user_id: int) -> float:
     assignments = ", ".join(f"{key} = :{key}" for key in (*columns, "score"))
     await db.execute(
         text(f"""INSERT INTO user_profile_completion (user_id, {', '.join(columns)}, score, algorithm_version, calculated_at)
-                   VALUES (:user_id, {', '.join(f':{key}' for key in columns)}, :score, 'profile-v3', UTC_TIMESTAMP())
-                   ON DUPLICATE KEY UPDATE {assignments}, algorithm_version = 'profile-v3', calculated_at = UTC_TIMESTAMP()"""),
+                   VALUES (:user_id, {', '.join(f':{key}' for key in columns)}, :score, 'profile-v4', UTC_TIMESTAMP())
+                   ON DUPLICATE KEY UPDATE {assignments}, algorithm_version = 'profile-v4', calculated_at = UTC_TIMESTAMP()"""),
         {"user_id": user_id, **{key: int(value) for key, value in columns.items()}, "score": score},
     )
     await db.execute(text("UPDATE users SET data_complete_rate = :score WHERE id = :id"), {"score": score, "id": user_id})
@@ -465,8 +587,7 @@ async def get_completion(db: AsyncSession, user_id: int) -> CompletionResponse:
         "avatar": bool(row["avatar"]),
         "intro": bool(row["self_intro"] and len(row["self_intro"].strip()) >= 20),
         "album": bool(row["album_done"]),
-        "interest": len(_json_list(row["interest_tags"])) >= 3 or sum(len(items) for items in _json_dict(row["tags"]).values()) >= 3,
-        "personality": len(_json_list(row["personality_tags"])) >= 3,
+        "personal_tags": len(personal_tags(_profile_tag_values(row), _profile_custom_tags(row))) >= 3,
         "mbti": bool(row["mbti"]),
         "preference": row["preference_age_min"] is not None and row["preference_age_max"] is not None,
         "realname": row["realname_status"] == 2,
@@ -813,7 +934,8 @@ async def get_intro_templates() -> list[IntroTemplateResponse]:
 
 async def get_tag_options() -> TagOptionsResponse:
     return TagOptionsResponse(
-        version="v1",
+        version="personal-v2",
+        catalog_revision=TAG_CATALOG_REVISION,
         categories=[
             TagCategoryResponse(key=key, label=label, options=list(options))
             for key, label, options in TAG_CATEGORIES

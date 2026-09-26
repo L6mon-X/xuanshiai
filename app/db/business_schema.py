@@ -112,6 +112,8 @@ BUSINESS_TABLES = {
             `active_wechat` varchar(128) GENERATED ALWAYS AS (CASE WHEN `status` IN ('LOST','CLOSED') THEN NULL ELSE NULLIF(TRIM(`wechat`), '') END) STORED COMMENT '有效微信（弃海/关闭为NULL，唯一）',
             `matchmaker_id` bigint unsigned DEFAULT NULL,
             `organization_id` bigint unsigned DEFAULT NULL,
+            `promoter_id` bigint unsigned DEFAULT NULL COMMENT '推广红娘用户ID',
+            `audit_status` varchar(16) NOT NULL DEFAULT 'active' COMMENT 'active有效/pending待核',
             `next_follow_at` datetime DEFAULT NULL,
             `converted_user_id` bigint unsigned DEFAULT NULL,
             `remark` varchar(2000) DEFAULT NULL,
@@ -121,6 +123,7 @@ BUSINESS_TABLES = {
             PRIMARY KEY (`id`),
             UNIQUE KEY `uk_customer_lead_active_phone` (`active_phone`),
             UNIQUE KEY `uk_customer_lead_active_wechat` (`active_wechat`),
+            KEY `idx_customer_lead_promoter` (`promoter_id`),
             KEY `idx_customer_lead_status` (`status`, `created_at`),
             KEY `idx_customer_lead_matchmaker` (`matchmaker_id`, `status`),
             KEY `idx_customer_lead_phone` (`phone`)
@@ -191,10 +194,57 @@ BUSINESS_TABLES = {
             `content` varchar(2000) NOT NULL,
             `next_follow_at` datetime DEFAULT NULL,
             `created_by` bigint unsigned NOT NULL,
+            `images` json DEFAULT NULL COMMENT '跟进图片URL列表',
+            `voice_url` varchar(500) DEFAULT NULL COMMENT '跟进录音地址',
+            `voice_duration_sec` int unsigned DEFAULT NULL COMMENT '录音时长秒',
             `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
             KEY `idx_member_follow_up_user` (`user_id`, `created_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='会员 CRM 跟进记录'
+    """,
+    "user_private_info": """
+        CREATE TABLE IF NOT EXISTS `user_private_info` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `user_id` bigint unsigned NOT NULL,
+            `body_type` varchar(32) DEFAULT NULL COMMENT '身材体型',
+            `face_type` varchar(32) DEFAULT NULL COMMENT '脸型',
+            `skin_type` varchar(32) DEFAULT NULL COMMENT '皮肤类型',
+            `eye_type` varchar(32) DEFAULT NULL COMMENT '眼睛类型',
+            `love_experience` varchar(32) DEFAULT NULL COMMENT '恋爱经历',
+            `longest_love` varchar(32) DEFAULT NULL COMMENT '最长恋爱',
+            `single_duration` varchar(32) DEFAULT NULL COMMENT '单身时长',
+            `work_status` varchar(32) DEFAULT NULL COMMENT '工作情况',
+            `rest_schedule` varchar(32) DEFAULT NULL COMMENT '休息时间',
+            `health_condition` varchar(64) DEFAULT NULL COMMENT '身体情况',
+            `infectious_disease` varchar(64) DEFAULT NULL COMMENT '传染病',
+            `genetic_disease` varchar(64) DEFAULT NULL COMMENT '遗传病史',
+            `bad_habits` varchar(64) DEFAULT NULL COMMENT '不良嗜好',
+            `criminal_record` varchar(64) DEFAULT NULL COMMENT '犯罪记录',
+            `emotional_status` varchar(32) DEFAULT NULL COMMENT '情感状态',
+            `children_status` varchar(32) DEFAULT NULL COMMENT '孩子情况',
+            `breakup_reason` varchar(200) DEFAULT NULL COMMENT '分手原因',
+            `love_bottom_line` varchar(200) DEFAULT NULL COMMENT '感情底线',
+            `divorce_reason` varchar(200) DEFAULT NULL COMMENT '离婚原因',
+            `parents_status` varchar(32) DEFAULT NULL COMMENT '父母情况',
+            `family_structure` varchar(32) DEFAULT NULL COMMENT '家庭结构',
+            `family_members` varchar(255) DEFAULT NULL COMMENT '家庭成员（可多选，逗号分隔）',
+            `sibling_rank` varchar(32) DEFAULT NULL COMMENT '家中排行',
+            `only_child` varchar(8) DEFAULT NULL COMMENT '独生子女：未知/独生/非独生',
+            `other_members` varchar(255) DEFAULT NULL COMMENT '其他成员描述',
+            `father_age` varchar(16) DEFAULT NULL COMMENT '父亲年龄',
+            `father_occupation` varchar(64) DEFAULT NULL COMMENT '父亲职业',
+            `father_health` varchar(32) DEFAULT NULL COMMENT '父亲健康',
+            `father_retirement` varchar(32) DEFAULT NULL COMMENT '父亲退休情况',
+            `mother_age` varchar(16) DEFAULT NULL COMMENT '母亲年龄',
+            `mother_occupation` varchar(64) DEFAULT NULL COMMENT '母亲职业',
+            `mother_health` varchar(32) DEFAULT NULL COMMENT '母亲健康',
+            `mother_retirement` varchar(32) DEFAULT NULL COMMENT '母亲退休情况',
+            `other_info` varchar(1000) DEFAULT NULL COMMENT '其它信息',
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_private_info_user` (`user_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='会员私密资料（默认不对外公开）'
     """,
     "member_call_record": """
         CREATE TABLE IF NOT EXISTS `member_call_record` (
@@ -338,6 +388,9 @@ BUSINESS_TABLES = {
             `name` varchar(128) NOT NULL,
             `display_name` varchar(128) DEFAULT NULL,
             `region_code` varchar(64) DEFAULT NULL,
+            `link_url` varchar(255) DEFAULT NULL COMMENT '分站访问链接',
+            `sort_order` int NOT NULL DEFAULT '0' COMMENT '显示排序，数字越大越靠前',
+            `qr_code` varchar(500) DEFAULT NULL COMMENT '分站链接/二维码图片地址',
             `status` tinyint NOT NULL DEFAULT '1' COMMENT '1正常 2关闭 3停用',
             `auto_redirect` tinyint NOT NULL DEFAULT '0',
             `created_by` bigint unsigned DEFAULT NULL,
@@ -415,19 +468,65 @@ BUSINESS_TABLES = {
             KEY `idx_promotion_attribution_promoter` (`promoter_id`, `status`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='会员推广归属'
     """,
+    "promotion_order": """
+        CREATE TABLE IF NOT EXISTS `promotion_order` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `order_no` varchar(64) NOT NULL COMMENT '支付订单号',
+            `user_id` bigint unsigned NOT NULL COMMENT '购买推广人',
+            `product_name` varchar(128) NOT NULL COMMENT '推广套餐名称',
+            `amount` decimal(12,2) NOT NULL DEFAULT '0.00' COMMENT '订单金额',
+            `pay_status` varchar(16) NOT NULL DEFAULT 'unpaid' COMMENT 'unpaid未支付/paid已支付/refunded已退款',
+            `pay_method` varchar(32) DEFAULT NULL COMMENT 'wechat/alipay/balance/offline',
+            `status` varchar(16) NOT NULL DEFAULT 'pending' COMMENT 'pending待处理/processing推广中/done已完成/cancelled已取消',
+            `remark` varchar(500) DEFAULT NULL,
+            `paid_at` datetime DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_promotion_order_no` (`order_no`),
+            KEY `idx_promotion_order_user` (`user_id`, `created_at`),
+            KEY `idx_promotion_order_status` (`status`, `pay_status`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='推广服务订单'
+    """,
     "partner_team": """
         CREATE TABLE IF NOT EXISTS `partner_team` (
             `id` bigint unsigned NOT NULL AUTO_INCREMENT,
             `owner_user_id` bigint unsigned NOT NULL,
             `name` varchar(128) NOT NULL,
+            `level_id` tinyint unsigned NOT NULL DEFAULT '1' COMMENT '合伙级别：1 初级 / 2 中级 / 3 战略合伙人（固定 3 种）',
             `status` tinyint NOT NULL DEFAULT '1' COMMENT '1正常 2关闭 3冻结',
             `open_mode` varchar(32) NOT NULL DEFAULT 'manual' COMMENT 'manual/paid',
             `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
             `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
             UNIQUE KEY `uk_partner_team_owner` (`owner_user_id`),
-            KEY `idx_partner_team_status` (`status`)
+            KEY `idx_partner_team_status` (`status`),
+            KEY `idx_partner_team_level` (`level_id`, `status`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='合伙人团队'
+    """,
+    "partner_level_config": """
+        CREATE TABLE IF NOT EXISTS `partner_level_config` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `level_id` tinyint unsigned NOT NULL COMMENT '业务级别：1 初级 / 2 中级 / 3 战略合伙人（固定 3 种）',
+            `level_name` varchar(32) NOT NULL COMMENT '级别名称',
+            `auto_split_mode` varchar(16) NOT NULL DEFAULT 'auto_rate' COMMENT 'fixed_amount 自定义固定金额 / auto_rate 按比例自动计算',
+            `auto_split_rate` decimal(7,4) DEFAULT NULL COMMENT '按比例自动计算的比例(%)，auto_split_mode=auto_rate 时生效',
+            `promote_performance_threshold` decimal(12,2) DEFAULT NULL COMMENT '自动升级条件：团队累计业绩阈值(元)',
+            `promote_member_threshold` int DEFAULT NULL COMMENT '自动升级条件：团队累计发展有效相亲会员数阈值',
+            `register_reward_male` decimal(12,2) NOT NULL DEFAULT 0 COMMENT '男会员注册奖励(元/人)',
+            `register_reward_female` decimal(12,2) NOT NULL DEFAULT 0 COMMENT '女会员注册奖励(元/人)',
+            `promoter_join_reward` decimal(12,2) NOT NULL DEFAULT 0 COMMENT '推广红娘纳入分成(元/人)',
+            `consume_commission_mode` varchar(16) NOT NULL DEFAULT 'none' COMMENT '会员消费分成模式：none 不分成 / auto_rate 按比例',
+            `consume_commission_rate` decimal(7,4) DEFAULT NULL COMMENT '会员消费分成比例(%)，consume_commission_mode=auto_rate 时生效',
+            `share_bonus` tinyint NOT NULL DEFAULT 1 COMMENT '合伙人同时是自己团队推广红娘时是否享有团队奖励/分成 1享有 0不享有',
+            `bonus_items` json DEFAULT NULL COMMENT '按事件的分成金额明细：[{name, amount}]',
+            `updated_by` bigint unsigned DEFAULT NULL,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_partner_level` (`level_id`),
+            KEY `idx_partner_level_created` (`created_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='合伙红娘分成级别配置（固定 3 种，不可新增/删除）'
     """,
     "partner_membership": """
         CREATE TABLE IF NOT EXISTS `partner_membership` (
@@ -581,6 +680,8 @@ BUSINESS_TABLES = {
             `location` varchar(255) NOT NULL,
             `status` varchar(32) NOT NULL DEFAULT 'SCHEDULED' COMMENT 'SCHEDULED/REMINDED/CHECKED_IN/COMPLETED/CANCELLED/NO_SHOW',
             `cancel_reason` varchar(255) DEFAULT NULL,
+            `member_visible` tinyint NOT NULL DEFAULT 1 COMMENT '会员端是否可见 1是 0隐藏',
+            `sms_remind` tinyint NOT NULL DEFAULT 1 COMMENT '是否发送约会短信提醒 1是 0否',
             `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
             `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
@@ -640,7 +741,7 @@ BUSINESS_TABLES = {
     "commission_entry": """
         CREATE TABLE IF NOT EXISTS `commission_entry` (
             `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-            `order_id` bigint unsigned NOT NULL,
+            `order_id` bigint unsigned DEFAULT NULL COMMENT '关联订单；后台手工录入时为空',
             `beneficiary_type` varchar(32) NOT NULL,
             `beneficiary_id` bigint unsigned NOT NULL,
             `rule_id` bigint unsigned DEFAULT NULL,
@@ -648,6 +749,8 @@ BUSINESS_TABLES = {
             `base_amount` decimal(12,2) NOT NULL,
             `amount` decimal(12,2) NOT NULL,
             `status` varchar(16) NOT NULL DEFAULT 'PENDING' COMMENT 'PENDING/AVAILABLE/FROZEN/REVERSED',
+            `source` varchar(16) NOT NULL DEFAULT 'order' COMMENT 'order 订单产生 / manual 后台手工录入',
+            `remark` varchar(255) DEFAULT NULL COMMENT '后台手工录入备注',
             `idempotency_key` varchar(160) NOT NULL,
             `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
             `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -733,6 +836,7 @@ BUSINESS_TABLES = {
             `rate_percent` decimal(7,4) NOT NULL DEFAULT 0 COMMENT '按比例分成比例(%)',
             `fixed_amount` decimal(12,2) DEFAULT NULL COMMENT '固定分成金额(元)，mode=fixed 时生效',
             `platform_extra_amount` decimal(12,2) NOT NULL DEFAULT 0 COMMENT '平台额外奖励(元)，每达成一次分成订单额外发放',
+            `platform_extra_pay_mode` varchar(16) NOT NULL DEFAULT 'manual' COMMENT '平台额外奖励支付方式 manual人工转账/balance转入余额',
             `promotion_condition` varchar(255) DEFAULT NULL COMMENT '自动升级到此级别的条件描述',
             `sort` int NOT NULL DEFAULT 0,
             `status` tinyint NOT NULL DEFAULT 1 COMMENT '1启用 2停用',
@@ -772,12 +876,18 @@ BUSINESS_TABLES = {
             `visible` tinyint NOT NULL DEFAULT 1 COMMENT '1前台展示 0隐藏',
             `locked` tinyint NOT NULL DEFAULT 0 COMMENT '1锁定禁止登录工作台',
             `description` varchar(2000) DEFAULT NULL,
+            `slogan` varchar(64) DEFAULT NULL COMMENT '红娘口号',
+            `sort` int NOT NULL DEFAULT 0 COMMENT '显示排序，数字越大越靠前',
+            `contact_editable` tinyint NOT NULL DEFAULT 1 COMMENT '是否允许红娘在其工作台修改客户手机号/微信 1允许 0不允许',
+            `lock_at` datetime DEFAULT NULL COMMENT '定时锁定时间，到点自动锁定账号',
+            `wechat_qr` varchar(500) DEFAULT NULL COMMENT '红娘微信二维码图片地址',
             `deleted_at` datetime DEFAULT NULL,
             `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
             `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (`user_id`),
             KEY `idx_matchmaker_profile_level` (`commission_level_id`, `visible`),
-            KEY `idx_matchmaker_profile_lock` (`locked`, `deleted_at`)
+            KEY `idx_matchmaker_profile_lock` (`locked`, `deleted_at`),
+            KEY `idx_matchmaker_profile_sort` (`sort`, `deleted_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='红娘管理档案'
     """,
     "admin_menu": """
@@ -817,5 +927,595 @@ BUSINESS_TABLES = {
             `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='红娘使用教程'
+    """,
+    # ============================================
+    # 运营工具/活动/商家/短视频等通用内容项（2026-09 对标补齐）
+    # ============================================
+    "admin_content_item": """
+        CREATE TABLE IF NOT EXISTS `admin_content_item` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `tenant_id` bigint unsigned NOT NULL DEFAULT 1,
+            `domain` varchar(64) NOT NULL,
+            `title` varchar(255) NOT NULL DEFAULT '',
+            `subtitle` varchar(500) DEFAULT NULL,
+            `image_url` varchar(500) DEFAULT NULL,
+            `amount` decimal(12,2) DEFAULT NULL,
+            `status` tinyint NOT NULL DEFAULT 1 COMMENT '1正常 2停用/隐藏',
+            `sort` int NOT NULL DEFAULT 0,
+            `extra_json` longtext NOT NULL,
+            `created_by` bigint unsigned DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_content_domain` (`tenant_id`, `domain`, `status`, `sort`),
+            KEY `idx_content_created` (`domain`, `created_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='活动/商家/短视频/礼品等通用内容项'
+    """,
+    "live_session": """
+        CREATE TABLE IF NOT EXISTS `live_session` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `title` varchar(128) NOT NULL,
+            `city_code` varchar(32) DEFAULT NULL,
+            `scheduled_at` datetime NOT NULL,
+            `status` varchar(32) NOT NULL DEFAULT 'DRAFT',
+            `state_version` int unsigned NOT NULL DEFAULT 1,
+            `host_user_id` bigint unsigned NOT NULL,
+            `max_stage_seats` tinyint unsigned NOT NULL DEFAULT 8,
+            `recording_enabled` tinyint NOT NULL DEFAULT 0,
+            `rules_text` text DEFAULT NULL,
+            `created_by` bigint unsigned NOT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            `closed_at` datetime DEFAULT NULL,
+            PRIMARY KEY (`id`), KEY `idx_live_session_status_time` (`status`, `scheduled_at`),
+            KEY `idx_live_session_host` (`host_user_id`, `status`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='直播相亲场次'
+    """,
+    "live_session_role": """
+        CREATE TABLE IF NOT EXISTS `live_session_role` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `session_id` bigint unsigned NOT NULL, `user_id` bigint unsigned NOT NULL,
+            `role_code` varchar(24) NOT NULL, `status` tinyint NOT NULL DEFAULT 1,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`), UNIQUE KEY `uk_live_role` (`session_id`, `user_id`, `role_code`),
+            KEY `idx_live_role_user` (`user_id`, `status`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='直播场次角色'
+    """,
+    "live_registration": """
+        CREATE TABLE IF NOT EXISTS `live_registration` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT, `session_id` bigint unsigned NOT NULL,
+            `user_id` bigint unsigned NOT NULL, `status` varchar(24) NOT NULL DEFAULT 'RESERVED',
+            `device_check_passed` tinyint NOT NULL DEFAULT 0, `checked_in_at` datetime DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`), UNIQUE KEY `uk_live_registration` (`session_id`, `user_id`),
+            KEY `idx_live_registration_status` (`session_id`, `status`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='直播预约签到'
+    """,
+    "live_stage_seat": """
+        CREATE TABLE IF NOT EXISTS `live_stage_seat` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT, `session_id` bigint unsigned NOT NULL,
+            `seat_no` tinyint unsigned NOT NULL, `user_id` bigint unsigned DEFAULT NULL,
+            `status` varchar(24) NOT NULL DEFAULT 'EMPTY', `invited_by` bigint unsigned DEFAULT NULL,
+            `invitation_token` char(32) DEFAULT NULL, `invitation_expires_at` datetime DEFAULT NULL,
+            `joined_at` datetime DEFAULT NULL, `left_at` datetime DEFAULT NULL,
+            `active_user_id` bigint unsigned GENERATED ALWAYS AS
+                (CASE WHEN `status` IN ('INVITED','ON_STAGE') THEN `user_id` ELSE NULL END) STORED,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`), UNIQUE KEY `uk_live_seat_no` (`session_id`, `seat_no`),
+            UNIQUE KEY `uk_live_invitation_token` (`invitation_token`),
+            UNIQUE KEY `uk_live_active_user` (`session_id`, `active_user_id`),
+            KEY `idx_live_seat_user` (`session_id`, `user_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='直播舞台席位'
+    """,
+    "live_state_transition": """
+        CREATE TABLE IF NOT EXISTS `live_state_transition` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT, `session_id` bigint unsigned NOT NULL,
+            `from_status` varchar(32) NOT NULL, `to_status` varchar(32) NOT NULL,
+            `state_version` int unsigned NOT NULL, `actor_user_id` bigint unsigned NOT NULL,
+            `reason` varchar(255) DEFAULT NULL, `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`), UNIQUE KEY `uk_live_transition_version` (`session_id`, `state_version`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='直播状态迁移'
+    """,
+    "live_interaction": """
+        CREATE TABLE IF NOT EXISTS `live_interaction` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT, `session_id` bigint unsigned NOT NULL,
+            `actor_user_id` bigint unsigned NOT NULL, `target_user_id` bigint unsigned NOT NULL,
+            `interaction_type` varchar(24) NOT NULL, `status` varchar(24) NOT NULL DEFAULT 'ACTIVE',
+            `idempotency_key` varchar(128) NOT NULL, `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`), UNIQUE KEY `uk_live_interaction_key` (`actor_user_id`, `idempotency_key`),
+            KEY `idx_live_interaction_pair` (`session_id`, `interaction_type`, `actor_user_id`, `target_user_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='直播亮灯选择确认'
+    """,
+    "live_match_result": """
+        CREATE TABLE IF NOT EXISTS `live_match_result` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `session_id` bigint unsigned NOT NULL,
+            `left_user_id` bigint unsigned NOT NULL,
+            `right_user_id` bigint unsigned NOT NULL,
+            `left_confirmed_at` datetime DEFAULT NULL,
+            `right_confirmed_at` datetime DEFAULT NULL,
+            `status` varchar(32) NOT NULL DEFAULT 'WAITING_CONFIRMATION',
+            `application_ref` varchar(128) DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_live_match_pair` (`session_id`, `left_user_id`, `right_user_id`),
+            KEY `idx_live_match_status` (`session_id`, `status`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='直播双确认结果'
+    """,
+    "live_report": """
+        CREATE TABLE IF NOT EXISTS `live_report` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT, `session_id` bigint unsigned NOT NULL,
+            `reporter_user_id` bigint unsigned NOT NULL, `target_user_id` bigint unsigned NOT NULL,
+            `category` varchar(32) NOT NULL, `description` varchar(500) DEFAULT NULL,
+            `status` varchar(24) NOT NULL DEFAULT 'PENDING', `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`), KEY `idx_live_report_session` (`session_id`, `status`, `created_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='直播举报'
+    """,
+    "live_provider_event": """
+        CREATE TABLE IF NOT EXISTS `live_provider_event` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `provider` varchar(24) NOT NULL,
+            `provider_event_id` varchar(128) NOT NULL,
+            `event_type` varchar(64) DEFAULT NULL,
+            `session_id` bigint unsigned DEFAULT NULL,
+            `payload_hash` char(64) NOT NULL,
+            `status` varchar(24) NOT NULL DEFAULT 'RECEIVED',
+            `event_time` datetime DEFAULT NULL,
+            `process_attempts` int unsigned NOT NULL DEFAULT 0,
+            `last_error_code` varchar(64) DEFAULT NULL,
+            `received_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `processed_at` datetime DEFAULT NULL,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_live_provider_event` (`provider`, `provider_event_id`),
+            KEY `idx_live_provider_session` (`session_id`, `received_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='直播云厂商回调事件'
+    """,
+    "live_provider_resource": """
+        CREATE TABLE IF NOT EXISTS `live_provider_resource` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `session_id` bigint unsigned NOT NULL,
+            `provider` varchar(24) NOT NULL,
+            `sdk_app_id` bigint unsigned NOT NULL,
+            `room_id` bigint unsigned NOT NULL,
+            `status` varchar(24) NOT NULL DEFAULT 'UNKNOWN',
+            `last_error_code` varchar(128) DEFAULT NULL,
+            `last_request_id` varchar(128) DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            `closed_at` datetime DEFAULT NULL,
+            PRIMARY KEY (`id`), UNIQUE KEY `uk_live_provider_resource_session` (`session_id`),
+            KEY `idx_live_provider_resource_status` (`provider`, `status`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='直播腾讯云房间资源状态'
+    """,
+    "live_moderation_action": """
+        CREATE TABLE IF NOT EXISTS `live_moderation_action` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `session_id` bigint unsigned NOT NULL,
+            `actor_user_id` bigint unsigned NOT NULL,
+            `target_user_id` bigint unsigned NOT NULL,
+            `action_type` varchar(32) NOT NULL,
+            `reason` varchar(255) DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_live_moderation_session` (`session_id`, `created_at`),
+            KEY `idx_live_moderation_target` (`target_user_id`, `created_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='直播人工处置记录'
+    """,
+    "live_participant_restriction": """
+        CREATE TABLE IF NOT EXISTS `live_participant_restriction` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `session_id` bigint unsigned NOT NULL,
+            `user_id` bigint unsigned NOT NULL,
+            `restriction_type` varchar(24) NOT NULL,
+            `status` tinyint NOT NULL DEFAULT 1,
+            `reason` varchar(255) NOT NULL,
+            `created_by` bigint unsigned NOT NULL,
+            `ended_by` bigint unsigned DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `ended_at` datetime DEFAULT NULL,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_live_participant_restriction` (`session_id`, `user_id`, `restriction_type`),
+            KEY `idx_live_participant_restriction_active` (`session_id`, `status`, `restriction_type`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='直播场内限制状态'
+    """,
+    "live_outbox_event": """
+        CREATE TABLE IF NOT EXISTS `live_outbox_event` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `event_id` char(32) NOT NULL,
+            `session_id` bigint unsigned NOT NULL,
+            `event_type` varchar(64) NOT NULL,
+            `state_version` int unsigned NOT NULL,
+            `payload_json` json NOT NULL,
+            `status` varchar(24) NOT NULL DEFAULT 'PENDING',
+            `publish_attempts` int unsigned NOT NULL DEFAULT 0,
+            `next_attempt_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `last_error_code` varchar(64) DEFAULT NULL,
+            `occurred_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `published_at` datetime DEFAULT NULL,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_live_outbox_event_id` (`event_id`),
+            KEY `idx_live_outbox_pending` (`status`, `next_attempt_at`, `id`),
+            KEY `idx_live_outbox_session` (`session_id`, `id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='直播可靠业务事件'
+    """,
+    # ── M7-A 互选活动 ──────────────────────────────────────────────
+    "mutual_selection_activity": """
+        CREATE TABLE IF NOT EXISTS `mutual_selection_activity` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `title` varchar(80) NOT NULL COMMENT '活动标题',
+            `cover` varchar(255) DEFAULT NULL COMMENT '封面图',
+            `start_time` datetime NOT NULL COMMENT '活动开始时间',
+            `end_time` datetime NOT NULL COMMENT '活动结束时间',
+            `pick_limit` int NOT NULL DEFAULT 5 COMMENT '每人可选心动嘉宾次数',
+            `virtual_signup` int NOT NULL DEFAULT 0 COMMENT '显示报名人数基数',
+            `price_male` decimal(10,2) NOT NULL DEFAULT 0.00 COMMENT '男生费用',
+            `price_female` decimal(10,2) NOT NULL DEFAULT 0.00 COMMENT '女生费用',
+            `price_vip` decimal(10,2) NOT NULL DEFAULT 0.00 COMMENT 'VIP会员费用',
+            `reward_promoter` decimal(10,2) NOT NULL DEFAULT 0.00 COMMENT '推广红娘奖励',
+            `reward_service` decimal(10,2) NOT NULL DEFAULT 0.00 COMMENT '服务红娘奖励',
+            `require_realname` tinyint NOT NULL DEFAULT 0 COMMENT '报名要求-实名认证',
+            `require_avatar` tinyint NOT NULL DEFAULT 0 COMMENT '报名要求-必须有头像',
+            `require_three_photo` tinyint NOT NULL DEFAULT 0 COMMENT '报名要求-至少3张照片',
+            `intro` text COMMENT '活动介绍',
+            `share_title` varchar(80) DEFAULT NULL COMMENT '分享标题',
+            `share_desc` varchar(500) DEFAULT NULL COMMENT '分享描述',
+            `share_icon` varchar(255) DEFAULT NULL COMMENT '分享图标',
+            `success_mode` varchar(24) NOT NULL DEFAULT 'show_wechat' COMMENT 'show_wechat 显示双方微信 / contact_matchmaker 联系红娘推送',
+            `notice_html` text COMMENT '进入嘉宾互选时弹出的须知',
+            `success_notice` text COMMENT '互选成功后添加微信页面的提示',
+            `status` tinyint NOT NULL DEFAULT 1 COMMENT '1报名中 2进行中 3已结束 4已取消',
+            `visible` tinyint NOT NULL DEFAULT 1 COMMENT '是否上线 1是 0否',
+            `sort` int NOT NULL DEFAULT 0 COMMENT '显示排序',
+            `created_by` bigint unsigned DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_msa_status` (`status`, `start_time`),
+            KEY `idx_msa_visible` (`visible`, `sort`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='互选活动'
+    """,
+    "mutual_selection_signup": """
+        CREATE TABLE IF NOT EXISTS `mutual_selection_signup` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `activity_id` bigint unsigned NOT NULL,
+            `user_id` bigint unsigned NOT NULL,
+            `status` tinyint NOT NULL DEFAULT 1 COMMENT '1已参与 2已退出',
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_ms_signup` (`activity_id`, `user_id`),
+            KEY `idx_ms_signup_user` (`user_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='互选活动参与嘉宾'
+    """,
+    "mutual_selection_pick": """
+        CREATE TABLE IF NOT EXISTS `mutual_selection_pick` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `activity_id` bigint unsigned NOT NULL,
+            `from_user_id` bigint unsigned NOT NULL COMMENT '行为方',
+            `to_user_id` bigint unsigned NOT NULL COMMENT '行为对象',
+            `action` varchar(16) NOT NULL DEFAULT 'pick' COMMENT 'pick 选择心动 / cancel 取消心动',
+            `is_success` tinyint NOT NULL DEFAULT 0 COMMENT '是否互选成功',
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_ms_pick` (`activity_id`, `from_user_id`, `to_user_id`),
+            KEY `idx_ms_pick_activity` (`activity_id`, `created_at`),
+            KEY `idx_ms_pick_from` (`from_user_id`),
+            KEY `idx_ms_pick_to` (`to_user_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='互选活动选择记录'
+    """,
+    # ── M7-B 商家联盟 ──────────────────────────────────────────────
+    "merchant_category": """
+        CREATE TABLE IF NOT EXISTS `merchant_category` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `name` varchar(64) NOT NULL COMMENT '分类名称',
+            `icon_url` varchar(255) DEFAULT NULL,
+            `sort` int NOT NULL DEFAULT 0,
+            `status` tinyint NOT NULL DEFAULT 1,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_merchant_category_name` (`name`),
+            KEY `idx_merchant_category_sort` (`status`, `sort`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='商家分类'
+    """,
+    "merchant": """
+        CREATE TABLE IF NOT EXISTS `merchant` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `name` varchar(128) NOT NULL COMMENT '商家名称',
+            `cover` varchar(255) DEFAULT NULL COMMENT '商家封面',
+            `gallery_json` text COMMENT '商家相册 JSON 数组',
+            `category_id` bigint unsigned DEFAULT NULL COMMENT '商家分类',
+            `tags` varchar(255) DEFAULT NULL COMMENT '特色标签，逗号分隔',
+            `province` varchar(64) DEFAULT NULL,
+            `city` varchar(64) DEFAULT NULL,
+            `address` varchar(255) DEFAULT NULL,
+            `contact_phone` varchar(32) DEFAULT NULL,
+            `business_hours` varchar(128) DEFAULT NULL,
+            `intro` text COMMENT '商家介绍',
+            `admin_user_id` bigint unsigned DEFAULT NULL COMMENT '管理账号（推广红娘 users.id）',
+            `sort` int NOT NULL DEFAULT 0 COMMENT '显示排序',
+            `visible` tinyint NOT NULL DEFAULT 1 COMMENT '展示 1是 0否',
+            `link_url` varchar(255) DEFAULT NULL,
+            `qr_code` varchar(255) DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            `deleted_at` datetime DEFAULT NULL,
+            PRIMARY KEY (`id`),
+            KEY `idx_merchant_category` (`category_id`),
+            KEY `idx_merchant_admin` (`admin_user_id`),
+            KEY `idx_merchant_visible` (`visible`, `sort`),
+            KEY `idx_merchant_deleted` (`deleted_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='联盟商家'
+    """,
+    "merchant_product": """
+        CREATE TABLE IF NOT EXISTS `merchant_product` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `merchant_id` bigint unsigned NOT NULL COMMENT '合作商家',
+            `name` varchar(128) NOT NULL COMMENT '商品名称',
+            `cover` varchar(255) DEFAULT NULL COMMENT '商品封面',
+            `original_price` decimal(10,2) NOT NULL DEFAULT 0.00 COMMENT '原价值',
+            `sale_price` decimal(10,2) NOT NULL DEFAULT 0.00 COMMENT '合作优惠价',
+            `settle_amount` decimal(10,2) NOT NULL DEFAULT 0.00 COMMENT '商家结算 元/份',
+            `promote_split_mode` varchar(16) NOT NULL DEFAULT 'fixed' COMMENT 'fixed 统一设置 / by_level 按级别',
+            `promote_amount` decimal(10,2) NOT NULL DEFAULT 0.00 COMMENT '推广红娘分成 元/份',
+            `partner_split_mode` varchar(16) NOT NULL DEFAULT 'fixed',
+            `partner_amount` decimal(10,2) NOT NULL DEFAULT 0.00 COMMENT '合伙红娘分成 元/份',
+            `service_amount` decimal(10,2) NOT NULL DEFAULT 0.00 COMMENT '服务红娘分成 元/份',
+            `buy_limit_mode` varchar(16) NOT NULL DEFAULT 'account' COMMENT 'account 每账号 / order 每订单',
+            `account_limit` int NOT NULL DEFAULT 0 COMMENT '每账号限购份数',
+            `order_limit` int NOT NULL DEFAULT 0 COMMENT '每订单限购份数',
+            `notice_mode` varchar(16) NOT NULL DEFAULT 'default' COMMENT 'default 使用默认 / custom 自定义',
+            `notice_text` text COMMENT '自定义购买须知',
+            `intro` text COMMENT '商品介绍',
+            `status` tinyint NOT NULL DEFAULT 1 COMMENT '1上架 2下架',
+            `link_url` varchar(255) DEFAULT NULL,
+            `qr_code` varchar(255) DEFAULT NULL,
+            `sort` int NOT NULL DEFAULT 0,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            `deleted_at` datetime DEFAULT NULL,
+            PRIMARY KEY (`id`),
+            KEY `idx_merchant_product_merchant` (`merchant_id`),
+            KEY `idx_merchant_product_status` (`status`, `sort`),
+            KEY `idx_merchant_product_deleted` (`deleted_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='联盟商家商品'
+    """,
+    "merchant_order": """
+        CREATE TABLE IF NOT EXISTS `merchant_order` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `order_no` varchar(64) NOT NULL COMMENT '订单号',
+            `product_id` bigint unsigned NOT NULL,
+            `merchant_id` bigint unsigned NOT NULL,
+            `buyer_user_id` bigint unsigned NOT NULL COMMENT '下单人',
+            `quantity` int NOT NULL DEFAULT 1,
+            `amount` decimal(12,2) NOT NULL DEFAULT 0.00 COMMENT '订单金额',
+            `pay_status` varchar(16) NOT NULL DEFAULT 'unpaid' COMMENT 'unpaid/paid/refunded',
+            `pay_method` varchar(32) DEFAULT NULL COMMENT '余额支付/微信支付等',
+            `paid_at` datetime DEFAULT NULL,
+            `verify_status` varchar(16) NOT NULL DEFAULT 'pending' COMMENT 'pending 未核销 / verified 已核销',
+            `verify_code` varchar(16) DEFAULT NULL COMMENT '5位消费码',
+            `verified_at` datetime DEFAULT NULL,
+            `status` varchar(16) NOT NULL DEFAULT 'pending' COMMENT 'pending 未支付 / paid 已支付 / used 已消费 / cancelled 已取消',
+            `remark` varchar(255) DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_merchant_order_no` (`order_no`),
+            KEY `idx_merchant_order_product` (`product_id`),
+            KEY `idx_merchant_order_merchant` (`merchant_id`, `created_at`),
+            KEY `idx_merchant_order_buyer` (`buyer_user_id`),
+            KEY `idx_merchant_order_status` (`status`, `verify_status`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='联盟商家订单'
+    """,
+    # ── M7-C 短视频 ────────────────────────────────────────────────
+    "short_video_category": """
+        CREATE TABLE IF NOT EXISTS `short_video_category` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `name` varchar(64) NOT NULL,
+            `sort` int NOT NULL DEFAULT 0,
+            `status` tinyint NOT NULL DEFAULT 1,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_short_video_category_name` (`name`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='短视频分类'
+    """,
+    "short_video": """
+        CREATE TABLE IF NOT EXISTS `short_video` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `publisher_user_id` bigint unsigned NOT NULL COMMENT '发布账号 users.id',
+            `cover` varchar(255) DEFAULT NULL,
+            `cover_mode` varchar(16) NOT NULL DEFAULT 'auto' COMMENT 'auto 系统自动截图 / custom 自定义上传',
+            `description` varchar(255) DEFAULT NULL COMMENT '视频描述',
+            `category_id` bigint unsigned DEFAULT NULL,
+            `duration_seconds` decimal(8,2) NOT NULL DEFAULT 0.00,
+            `video_url` varchar(500) DEFAULT NULL,
+            `link_type` varchar(24) NOT NULL DEFAULT 'none' COMMENT 'none/custom/member/activity/home',
+            `link_value` varchar(255) DEFAULT NULL,
+            `view_permission` varchar(16) NOT NULL DEFAULT 'login' COMMENT 'login 必须先登录 / all 不限 / member 仅会员',
+            `sort` int NOT NULL DEFAULT 0 COMMENT '显示排序',
+            `virtual_views` int NOT NULL DEFAULT 0 COMMENT '虚拟播放基数',
+            `comment_enabled` tinyint NOT NULL DEFAULT 1,
+            `tip_enabled` tinyint NOT NULL DEFAULT 1,
+            `published_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `visible` tinyint NOT NULL DEFAULT 1,
+            `audit_status` varchar(16) NOT NULL DEFAULT 'pending' COMMENT 'pending/approved/rejected',
+            `is_top` tinyint NOT NULL DEFAULT 0,
+            `is_recommend` tinyint NOT NULL DEFAULT 0,
+            `is_hot` tinyint NOT NULL DEFAULT 0,
+            `has_red_packet` tinyint NOT NULL DEFAULT 0,
+            `view_count` int NOT NULL DEFAULT 0,
+            `comment_count` int NOT NULL DEFAULT 0,
+            `like_count` int NOT NULL DEFAULT 0,
+            `tip_amount` decimal(12,2) NOT NULL DEFAULT 0.00,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            `deleted_at` datetime DEFAULT NULL,
+            PRIMARY KEY (`id`),
+            KEY `idx_short_video_publisher` (`publisher_user_id`),
+            KEY `idx_short_video_category` (`category_id`),
+            KEY `idx_short_video_audit` (`audit_status`, `published_at`),
+            KEY `idx_short_video_deleted` (`deleted_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='短视频'
+    """,
+    "short_video_comment": """
+        CREATE TABLE IF NOT EXISTS `short_video_comment` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `video_id` bigint unsigned NOT NULL,
+            `user_id` bigint unsigned NOT NULL,
+            `content` varchar(500) NOT NULL,
+            `like_count` int NOT NULL DEFAULT 0,
+            `ip` varchar(64) DEFAULT NULL,
+            `audit_status` varchar(16) NOT NULL DEFAULT 'pending' COMMENT 'pending/approved/rejected',
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_svc_video` (`video_id`, `created_at`),
+            KEY `idx_svc_audit` (`audit_status`, `created_at`),
+            KEY `idx_svc_user` (`user_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='短视频评论'
+    """,
+    "short_video_tip": """
+        CREATE TABLE IF NOT EXISTS `short_video_tip` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `video_id` bigint unsigned NOT NULL,
+            `tipper_user_id` bigint unsigned NOT NULL COMMENT '打赏用户',
+            `receiver_user_id` bigint unsigned NOT NULL COMMENT '受赏用户',
+            `message` varchar(200) DEFAULT NULL COMMENT '打赏附言',
+            `tip_form` varchar(32) NOT NULL DEFAULT 'cash' COMMENT 'cash 现金 / gift 礼物',
+            `amount` decimal(12,2) NOT NULL DEFAULT 0.00,
+            `pay_method` varchar(32) DEFAULT NULL,
+            `order_no` varchar(64) DEFAULT NULL,
+            `status` varchar(16) NOT NULL DEFAULT 'paid' COMMENT 'unpaid/paid/refunded',
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_svt_video` (`video_id`),
+            KEY `idx_svt_tipper` (`tipper_user_id`, `created_at`),
+            KEY `idx_svt_receiver` (`receiver_user_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='短视频打赏'
+    """,
+    "video_red_packet": """
+        CREATE TABLE IF NOT EXISTS `video_red_packet` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `video_id` bigint unsigned NOT NULL,
+            `sender_user_id` bigint unsigned DEFAULT NULL COMMENT '发红包用户，NULL 表示后台发放',
+            `sender_label` varchar(32) NOT NULL DEFAULT '后台发放',
+            `amount` decimal(12,2) NOT NULL DEFAULT 0.00,
+            `total_parts` int NOT NULL DEFAULT 1,
+            `is_equal` tinyint NOT NULL DEFAULT 0 COMMENT '是否均分',
+            `remain_parts` int NOT NULL DEFAULT 0,
+            `remain_amount` decimal(12,2) NOT NULL DEFAULT 0.00,
+            `pay_status` varchar(16) NOT NULL DEFAULT 'unpaid' COMMENT 'unpaid/paid/refunded',
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_vrp_video` (`video_id`),
+            KEY `idx_vrp_pay` (`pay_status`, `created_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='短视频红包'
+    """,
+    "video_red_packet_claim": """
+        CREATE TABLE IF NOT EXISTS `video_red_packet_claim` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `packet_id` bigint unsigned NOT NULL,
+            `user_id` bigint unsigned NOT NULL,
+            `amount` decimal(12,2) NOT NULL DEFAULT 0.00,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_vrpc_packet` (`packet_id`, `created_at`),
+            KEY `idx_vrpc_user` (`user_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='短视频红包领取明细'
+    """,
+    "short_video_homepage": """
+        CREATE TABLE IF NOT EXISTS `short_video_homepage` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `user_id` bigint unsigned NOT NULL COMMENT '会员 ID',
+            `wechat` varchar(64) DEFAULT NULL COMMENT '微信号',
+            `bio` varchar(255) DEFAULT NULL COMMENT '主页简介',
+            `follower_count` int NOT NULL DEFAULT 0 COMMENT '粉丝量',
+            `certified` tinyint NOT NULL DEFAULT 0 COMMENT '认证 1是 0否',
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            `deleted_at` datetime DEFAULT NULL,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_video_homepage_user` (`user_id`),
+            KEY `idx_video_homepage_deleted` (`deleted_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='短视频会员主页'
+    """,
+    # ============================================
+    # M10：账号注销申请 + 平台工单反馈
+    # ============================================
+    "user_cancellation": """
+        CREATE TABLE IF NOT EXISTS `user_cancellation` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `user_id` bigint unsigned NOT NULL COMMENT '申请注销的会员 ID',
+            `requested_ip` varchar(64) DEFAULT NULL COMMENT '申请时的 IP 地址',
+            `reason` varchar(500) DEFAULT NULL COMMENT '注销原因（前台展示）',
+            `status` varchar(16) NOT NULL DEFAULT 'pending' COMMENT 'pending 待处理 / approved 已批准（已注销）/ cancelled 已取消注销',
+            `has_member_profile` tinyint NOT NULL DEFAULT 0 COMMENT '是否关联会员资料 0否 1是',
+            `has_promoter_link` tinyint NOT NULL DEFAULT 0 COMMENT '是否关联推广红娘 0否 1是',
+            `has_partner_link` tinyint NOT NULL DEFAULT 0 COMMENT '是否关联合伙红娘 0否 1是',
+            `has_matchmaker_link` tinyint NOT NULL DEFAULT 0 COMMENT '是否关联服务红娘 0否 1是',
+            `reviewed_by` bigint unsigned DEFAULT NULL COMMENT '处理人（matchmaker_admin_account.id）',
+            `reviewed_at` datetime DEFAULT NULL COMMENT '处理时间',
+            `review_note` varchar(500) DEFAULT NULL COMMENT '后台批注',
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_user_cancellation_user_pending` (`user_id`, `status`),
+            KEY `idx_user_cancellation_status` (`status`, `created_at`),
+            KEY `idx_user_cancellation_reviewer` (`reviewed_by`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='会员账号注销申请'
+    """,
+    "admin_account_cancellation": """
+        CREATE TABLE IF NOT EXISTS `admin_account_cancellation` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `account_id` bigint unsigned NOT NULL COMMENT '申请注销的后台账号 matchmaker_admin_account.id',
+            `username` varchar(64) NOT NULL COMMENT '提交时的账号名快照',
+            `display_name` varchar(128) NOT NULL COMMENT '提交时的显示名快照',
+            `linked_user_id` bigint unsigned DEFAULT NULL COMMENT '提交时绑定的平台用户 ID 快照',
+            `requested_ip` varchar(64) DEFAULT NULL COMMENT '提交时的 IP 地址',
+            `reason` varchar(500) DEFAULT NULL COMMENT '注销原因',
+            `status` varchar(16) NOT NULL DEFAULT 'pending' COMMENT 'pending 待处理 / approved 已注销 / cancelled 已取消注销',
+            `previous_status` tinyint NOT NULL DEFAULT 1 COMMENT '提交时的账号状态快照，取消注销时恢复',
+            `has_member_profile` tinyint NOT NULL DEFAULT 0 COMMENT '是否关联会员资料 0否 1是',
+            `has_promoter_link` tinyint NOT NULL DEFAULT 0 COMMENT '是否关联推广红娘 0否 1是',
+            `has_partner_link` tinyint NOT NULL DEFAULT 0 COMMENT '是否关联合伙红娘 0否 1是',
+            `has_matchmaker_link` tinyint NOT NULL DEFAULT 0 COMMENT '是否关联服务红娘 0否 1是',
+            `reviewed_by` bigint unsigned DEFAULT NULL COMMENT '处理人（matchmaker_admin_account.id）',
+            `reviewed_at` datetime DEFAULT NULL COMMENT '处理时间',
+            `review_note` varchar(500) DEFAULT NULL COMMENT '审核批注',
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_admin_account_cancel_pending` (`account_id`, `status`),
+            KEY `idx_admin_account_cancel_status` (`status`, `created_at`),
+            KEY `idx_admin_account_cancel_reviewer` (`reviewed_by`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='后台账号注销申请'
+    """,
+    "admin_ticket": """
+        CREATE TABLE IF NOT EXISTS `admin_ticket` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `ticket_no` varchar(32) NOT NULL COMMENT '工单号（年月日+6位序号）',
+            `submitter_user_id` bigint unsigned DEFAULT NULL COMMENT '提交人 user_id（后台管理员）；空表示平台创建',
+            `submitter_name` varchar(64) DEFAULT NULL COMMENT '提交人姓名快照',
+            `feedback_type` varchar(16) NOT NULL DEFAULT '咨询' COMMENT 'BUG / 咨询 / 建议',
+            `title` varchar(128) NOT NULL COMMENT '工单标题',
+            `content` text NOT NULL COMMENT '工单内容',
+            `status` varchar(16) NOT NULL DEFAULT '待处理' COMMENT '待处理 / 处理中 / 已处理',
+            `reply_content` text DEFAULT NULL COMMENT '回复内容',
+            `replied_by` bigint unsigned DEFAULT NULL COMMENT '回复人 matchmaker_admin_account.id',
+            `replied_at` datetime DEFAULT NULL COMMENT '回复时间',
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_admin_ticket_no` (`ticket_no`),
+            KEY `idx_admin_ticket_status` (`status`, `created_at`),
+            KEY `idx_admin_ticket_submitter` (`submitter_user_id`, `created_at`),
+            KEY `idx_admin_ticket_type` (`feedback_type`, `status`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='平台管理端工单反馈'
     """,
 }

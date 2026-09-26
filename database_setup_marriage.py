@@ -149,6 +149,31 @@ class DatabaseManager:
             logger.error(f"❌ 数据库初始化失败: {e}")
             raise
 
+    @staticmethod
+    def _named_columns(columns: dict) -> dict:
+        """给 {字段名: 类型定义} 字典补上 `字段名` 前缀。
+
+        _ensure_table_columns 的 SQL 模板是 `ALTER TABLE ... ADD COLUMN {column_def}`，
+        要求定义自带 `字段名` 前缀；新式字典（键=字段名，值=纯类型定义）需先经过本方法。
+        """
+        return {name: f"`{name}` {definition}" for name, definition in columns.items()}
+
+    @staticmethod
+    def _assert_column_definition(table_name: str, column_name: str, column_def: str) -> None:
+        """校验列定义自带 `字段名` 前缀。
+
+        ``_ensure_table_columns`` 的 SQL 模板是 ``ALTER TABLE ... ADD COLUMN {column_def}``，
+        定义缺少前缀会生成语法错误语句（MySQL 1064）。历史事故：提交 ``8ec8ff1`` 为
+        M4/M5/M6/M7 传入的补列定义漏了前缀，异常又被下面的 ``except`` 降级成一条 WARNING，
+        于是这些列在旧库上一直没被创建，直到接口抛 ``1054 Unknown column`` 才暴露。
+        这里改为快速失败：写错的列定义在启动时就报错，不再静默通过。
+        """
+        if not column_def.lstrip().startswith(f"`{column_name}`"):
+            raise ValueError(
+                f"列定义缺少 `{column_name}` 前缀，无法生成 ALTER TABLE："
+                f"{table_name}.{column_name} = {column_def!r}"
+            )
+
     def _ensure_table_columns(self, cursor, table_name: str, required_columns: dict):
         """
         确保表的必需字段存在，如果不存在则添加
@@ -167,6 +192,7 @@ class DatabaseManager:
 
         for column_name, column_def in required_columns.items():
             if column_name not in existing_columns:
+                self._assert_column_definition(table_name, column_name, column_def)
                 try:
                     cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_def}")
                     logger.info(f"✅ 已添加字段 {table_name}.{column_name}")
@@ -219,6 +245,17 @@ class DatabaseManager:
                 "marriage_fail_reason": "`marriage_fail_reason` varchar(255) DEFAULT NULL",
                 "marriage_submitted_at": "`marriage_submitted_at` datetime DEFAULT NULL",
                 "marriage_reviewed_at": "`marriage_reviewed_at` datetime DEFAULT NULL",
+                "education_fail_reason": "`education_fail_reason` varchar(255) DEFAULT NULL",
+                "education_submitted_at": "`education_submitted_at` datetime DEFAULT NULL",
+                "education_reviewed_at": "`education_reviewed_at` datetime DEFAULT NULL",
+                "house_fail_reason": "`house_fail_reason` varchar(255) DEFAULT NULL",
+                "house_submitted_at": "`house_submitted_at` datetime DEFAULT NULL",
+                "house_reviewed_at": "`house_reviewed_at` datetime DEFAULT NULL",
+                # 会员认证审核字段（421ff28 引入；曾因重复键被静默丢失，现并入本条目）
+                "face_method": "`face_method` varchar(32) DEFAULT NULL COMMENT '验证方式 动作活检/照片比对'",
+                "face_vendor": "`face_vendor` varchar(64) DEFAULT NULL COMMENT '人脸服务商'",
+                "face_score": "`face_score` decimal(5,2) DEFAULT NULL COMMENT '人脸比对得分'",
+                "id_card_issued": "`id_card_issued` varchar(64) DEFAULT NULL COMMENT '身份证发证机关'",
             },
             "user_profile": {
                 "weight": "`weight` int DEFAULT NULL COMMENT '体重kg'",
@@ -228,6 +265,9 @@ class DatabaseManager:
                 "house": "`house` varchar(32) DEFAULT NULL COMMENT '购房情况'",
                 "car": "`car` varchar(32) DEFAULT NULL COMMENT '购车情况'",
                 "smoking": "`smoking` varchar(32) DEFAULT NULL COMMENT '吸烟情况'",
+                "drinking": "`drinking` varchar(32) DEFAULT NULL COMMENT '饮酒情况'",
+                "religion": "`religion` varchar(32) DEFAULT NULL COMMENT '宗教信仰'",
+                "marriage_plan": "`marriage_plan` varchar(64) DEFAULT NULL COMMENT '结婚计划'",
                 "hometown": "`hometown` varchar(128) DEFAULT NULL COMMENT '家乡展示名称'",
                 "residence": "`residence` varchar(128) DEFAULT NULL COMMENT '现居展示名称'",
                 "household_province_code": "`household_province_code` varchar(32) DEFAULT NULL",
@@ -253,13 +293,23 @@ class DatabaseManager:
                 "location_visible": "`location_visible` tinyint NOT NULL DEFAULT '0'",
                 "interest_tags": "`interest_tags` json DEFAULT NULL",
                 "personality_tags": "`personality_tags` json DEFAULT NULL",
+                "qa_answers": "`qa_answers` json DEFAULT NULL COMMENT '关于我问答 [{question_id,question,answer}]'",
                 "completion_algorithm_version": "`completion_algorithm_version` varchar(32) DEFAULT NULL",
                 "completion_calculated_at": "`completion_calculated_at` datetime DEFAULT NULL",
+                "matchmaker_note": "`matchmaker_note` varchar(2000) DEFAULT NULL COMMENT '红娘说（后台红娘对会员的备注）'",
             },
             "user_partner_preference": {
                 "dating_goal": "`dating_goal` varchar(32) DEFAULT NULL COMMENT '交友目标：倾向恋爱/倾向结婚'",
                 "meeting_pace": "`meeting_pace` varchar(64) DEFAULT NULL COMMENT '见面节奏'",
                 "children_intention": "`children_intention` varchar(64) DEFAULT NULL COMMENT '生育意愿'",
+                "preferred_occupation": "`preferred_occupation` varchar(128) DEFAULT NULL COMMENT '期望职业（择偶要求）'",
+                "income_range": "`income_range` varchar(32) DEFAULT NULL COMMENT '期望收入档位（后台UI单选）'",
+                "education_requirement": "`education_requirement` varchar(32) DEFAULT NULL COMMENT '期望学历（后台UI单选）'",
+                "marriage_requirement": "`marriage_requirement` varchar(32) DEFAULT NULL COMMENT '婚况要求（后台UI单选）'",
+                "housing_expectation": "`housing_expectation` varchar(32) DEFAULT NULL COMMENT '住房要求（后台UI单选）'",
+                "smoking_expectation": "`smoking_expectation` varchar(32) DEFAULT NULL COMMENT '吸烟要求（后台UI单选）'",
+                "drinking_expectation": "`drinking_expectation` varchar(32) DEFAULT NULL COMMENT '喝酒要求（后台UI单选）'",
+                "marriage_timeline": "`marriage_timeline` varchar(32) DEFAULT NULL COMMENT '结婚计划（后台UI单选）'",
             },
             "user_profile_completion": {
                 "weight_completed": "`weight_completed` tinyint NOT NULL DEFAULT '0'",
@@ -316,6 +366,8 @@ class DatabaseManager:
                 "action": "`action` varchar(32) NOT NULL DEFAULT 'none' COMMENT 'none|hide_content|restore_content|dismiss'",
                 "reviewed_by": "`reviewed_by` bigint unsigned DEFAULT NULL COMMENT '原举报审核人'",
                 "reviewed_at": "`reviewed_at` datetime DEFAULT NULL COMMENT '举报审核时间'",
+                # 举报页需要展示提交人 IP（曾因重复键被静默丢失，现并入本条目）
+                "submit_ip": "`submit_ip` varchar(64) DEFAULT NULL COMMENT '提交人IP'",
             },
             "paper_plane": {
                 "moderation_status": "`moderation_status` tinyint NOT NULL DEFAULT '1' COMMENT '1正常 2下架（与 lifecycle status 分离）'",
@@ -374,6 +426,7 @@ class DatabaseManager:
                 "can_view_lead_follow": "`can_view_lead_follow` tinyint NOT NULL DEFAULT 1 COMMENT '允许查看客源线索跟进记录（推广红娘用）'",
                 "can_write_lead_follow": "`can_write_lead_follow` tinyint NOT NULL DEFAULT 1 COMMENT '允许客源线索中写跟进（推广红娘用）'",
                 "can_view_member_crm_follow": "`can_view_member_crm_follow` tinyint NOT NULL DEFAULT 1 COMMENT '允许查看会员CRM跟进记录（推广红娘用）'",
+                "visible": "`visible` tinyint NOT NULL DEFAULT 1 COMMENT '推广红娘前台是否展示 1展示 0隐藏'",
             },
             "ai_advisor_message": {
                 "model_name": "`model_name` varchar(128) DEFAULT NULL",
@@ -403,6 +456,8 @@ class DatabaseManager:
                 "start_at": "`start_at` datetime DEFAULT CURRENT_TIMESTAMP",
                 "end_at": "`end_at` datetime DEFAULT NULL",
                 "status": "`status` tinyint NOT NULL DEFAULT '1' COMMENT '1生效中 2已过期 3已撤销'",
+                "pay_status": "`pay_status` tinyint NOT NULL DEFAULT '0' COMMENT '0未支付 1已支付'",
+                "pay_method": "`pay_method` varchar(32) DEFAULT NULL COMMENT '支付方式'",
             },
         }
 
@@ -587,7 +642,16 @@ class DatabaseManager:
             "mode": "`mode` varchar(16) NOT NULL DEFAULT 'rate' COMMENT 'rate按比例/fixed固定金额'",
             "fixed_amount": "`fixed_amount` decimal(12,2) DEFAULT NULL COMMENT '固定分成金额(元)，mode=fixed 时生效'",
             "platform_extra_amount": "`platform_extra_amount` decimal(12,2) NOT NULL DEFAULT 0 COMMENT '平台额外奖励(元)'",
+            "platform_extra_pay_mode": "`platform_extra_pay_mode` varchar(16) NOT NULL DEFAULT 'manual' COMMENT '平台额外奖励支付方式 manual人工转账/balance转入余额'",
             "promotion_condition": "`promotion_condition` varchar(255) DEFAULT NULL COMMENT '自动升级到此级别的条件描述'",
+        })
+        # 兼容已存在的旧库：补齐 matchmaker_profile 新增字段
+        self._ensure_table_columns(cursor, "matchmaker_profile", {
+            "slogan": "`slogan` varchar(64) DEFAULT NULL COMMENT '红娘口号'",
+            "sort": "`sort` int NOT NULL DEFAULT 0 COMMENT '显示排序，数字越大越靠前'",
+            "contact_editable": "`contact_editable` tinyint NOT NULL DEFAULT 1 COMMENT '是否允许红娘在其工作台修改客户手机号/微信 1允许 0不允许'",
+            "lock_at": "`lock_at` datetime DEFAULT NULL COMMENT '定时锁定时间，到点自动锁定账号'",
+            "wechat_qr": "`wechat_qr` varchar(500) DEFAULT NULL COMMENT '红娘微信二维码图片地址'",
         })
         cursor.execute("""
             INSERT IGNORE INTO commission_level (id, code, name, mode, rate_percent, fixed_amount, platform_extra_amount, promotion_condition, sort, status)
@@ -689,7 +753,7 @@ class DatabaseManager:
             "active_wechat": "ADD UNIQUE KEY `uk_customer_lead_active_wechat` (`active_wechat`)",
         }
         try:
-            cursor.execute(f"SHOW TABLES LIKE 'customer_lead'")
+            cursor.execute("SHOW TABLES LIKE 'customer_lead'")
             if not cursor.fetchone():
                 return
             for column, spec in column_specs.items():
@@ -1156,6 +1220,14 @@ class DatabaseManager:
                     `dating_goal` varchar(32) DEFAULT NULL COMMENT '交友目标：倾向恋爱/倾向结婚',
                     `meeting_pace` varchar(64) DEFAULT NULL COMMENT '见面节奏',
                     `children_intention` varchar(64) DEFAULT NULL COMMENT '生育意愿',
+                    `income_range` varchar(32) DEFAULT NULL COMMENT '期望收入档位（后台UI单选）',
+                    `education_requirement` varchar(32) DEFAULT NULL COMMENT '期望学历（后台UI单选）',
+                    `preferred_occupation` varchar(128) DEFAULT NULL COMMENT '期望职业（择偶要求）',
+                    `marriage_requirement` varchar(32) DEFAULT NULL COMMENT '婚况要求（后台UI单选）',
+                    `housing_expectation` varchar(32) DEFAULT NULL COMMENT '住房要求（后台UI单选）',
+                    `smoking_expectation` varchar(32) DEFAULT NULL COMMENT '吸烟要求（后台UI单选）',
+                    `drinking_expectation` varchar(32) DEFAULT NULL COMMENT '喝酒要求（后台UI单选）',
+                    `marriage_timeline` varchar(32) DEFAULT NULL COMMENT '结婚计划（后台UI单选）',
                     `extra_requirement` varchar(1000) DEFAULT NULL,
                     `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
                     `updated_at` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -1241,13 +1313,19 @@ class DatabaseManager:
                     `education` varchar(64) DEFAULT NULL COMMENT '学历',
                     `school` varchar(128) DEFAULT NULL COMMENT '学校',
                     `education_cert` varchar(255) DEFAULT NULL COMMENT '学历证书图片',
-                    `education_verified` tinyint DEFAULT '0' COMMENT '学历认证状态 0未 1通过 2失败',
+                    `education_verified` tinyint DEFAULT '0' COMMENT '学历认证状态 0未提交 1审核中 2通过 3失败',
+                    `education_fail_reason` varchar(255) DEFAULT NULL COMMENT '学历认证失败原因',
+                    `education_submitted_at` datetime DEFAULT NULL COMMENT '学历认证提交时间',
+                    `education_reviewed_at` datetime DEFAULT NULL COMMENT '学历认证审核时间',
                     `job` varchar(128) DEFAULT NULL COMMENT '职业',
                     `company` varchar(128) DEFAULT NULL COMMENT '公司',
                     `job_cert` varchar(255) DEFAULT NULL COMMENT '工作证明图片',
                     `job_verified` tinyint DEFAULT '0' COMMENT '工作认证状态 0未 1通过 2失败',
                     `house_cert` varchar(255) DEFAULT NULL COMMENT '房产证明',
-                    `house_verified` tinyint DEFAULT '0' COMMENT '房产认证状态',
+                    `house_verified` tinyint DEFAULT '0' COMMENT '房产认证状态 0未提交 1审核中 2通过 3失败',
+                    `house_fail_reason` varchar(255) DEFAULT NULL COMMENT '房产认证失败原因',
+                    `house_submitted_at` datetime DEFAULT NULL COMMENT '房产认证提交时间',
+                    `house_reviewed_at` datetime DEFAULT NULL COMMENT '房产认证审核时间',
                     `auth_status` tinyint DEFAULT '0' COMMENT '整体认证状态 0未提交 1审核中 2通过 3失败',
                     `auth_step` tinyint DEFAULT '0' COMMENT '认证步骤 0未提交 1资料已提交 2人脸待认证 3审核中 4已通过 5已失败',
                     `fail_reason` varchar(255) DEFAULT NULL COMMENT '失败原因',
@@ -1267,7 +1345,7 @@ class DatabaseManager:
                     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
                     `user_id` bigint unsigned NOT NULL,
                     `height` int DEFAULT NULL COMMENT '身高cm',
-                    `income` decimal(10,2) DEFAULT NULL COMMENT '月收入',
+                    `income` decimal(10,2) DEFAULT NULL COMMENT '年收入（元，编辑档位写入域）',
                     `intention_level` tinyint DEFAULT NULL COMMENT '客户意向：1低 2中 3高',
                     `hometown` varchar(64) DEFAULT NULL COMMENT '家乡',
                     `residence` varchar(64) DEFAULT NULL COMMENT '现居地',
@@ -1277,6 +1355,7 @@ class DatabaseManager:
                     `constellation` varchar(16) DEFAULT NULL COMMENT '星座',
                     `tags` json DEFAULT NULL COMMENT '个性标签 ["颜控","宠物"]',
                     `self_intro` text COMMENT '自我介绍',
+                    `qa_answers` json DEFAULT NULL COMMENT '关于我问答 [{question_id,question,answer}]',
                     `love_view` text COMMENT '爱情观',
                     `ideal_partner` text COMMENT '理想另一半',
                     `wechat` varchar(128) DEFAULT NULL COMMENT '会员微信号（后台受控展示）',
@@ -1684,6 +1763,7 @@ class DatabaseManager:
                     `can_view_lead_follow` tinyint NOT NULL DEFAULT 1 COMMENT '允许查看客源线索跟进记录（推广红娘用）',
                     `can_write_lead_follow` tinyint NOT NULL DEFAULT 1 COMMENT '允许客源线索中写跟进（推广红娘用）',
                     `can_view_member_crm_follow` tinyint NOT NULL DEFAULT 1 COMMENT '允许查看会员CRM跟进记录（推广红娘用）',
+                    `visible` tinyint NOT NULL DEFAULT 1 COMMENT '推广红娘前台是否展示 1展示 0隐藏',
                     `intro` text COMMENT '自我介绍/优势',
                     `cert_images` json DEFAULT NULL COMMENT '资质证书图片',
                     `application_details` json DEFAULT NULL COMMENT '红娘审核扩展资料',
@@ -1793,6 +1873,7 @@ class DatabaseManager:
                     `type` tinyint DEFAULT '1' COMMENT '1文本 2图片 3语音 4视频 5小程序卡片 6系统消息',
                     `content` text COMMENT '消息内容',
                     `media_url` varchar(500) DEFAULT NULL COMMENT '媒体文件URL',
+                    `client_message_id` varchar(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL COMMENT '客户端消息幂等键',
                     `is_read` tinyint DEFAULT '0' COMMENT '是否已读 0否 1是',
                     `read_at` datetime DEFAULT NULL,
                     `revoked_at` datetime DEFAULT NULL COMMENT '撤回时间（NULL表示未撤回）',
@@ -1801,7 +1882,8 @@ class DatabaseManager:
                     PRIMARY KEY (`id`),
                     KEY `idx_session` (`session_id`),
                     KEY `idx_from_to` (`from_user_id`,`to_user_id`),
-                    KEY `idx_created_at` (`created_at`)
+                    KEY `idx_created_at` (`created_at`),
+                    UNIQUE KEY `uq_chat_message_sender_session_client_message` (`from_user_id`, `session_id`, `client_message_id`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='聊天消息'
             """,
             # AI 分身会话与真人聊天完全隔离，不参与消息列表和未读计数。
@@ -2340,6 +2422,8 @@ class DatabaseManager:
                     `type` varchar(64) DEFAULT NULL COMMENT '活动类型 1v1情感咨询/线下脱单局/竞争力评分等',
                     `city` varchar(64) DEFAULT NULL COMMENT '城市',
                     `address` varchar(255) DEFAULT NULL COMMENT '详细地址（报名后可见）',
+                    `organizer` varchar(128) DEFAULT NULL COMMENT '活动发起（主办方）',
+                    `time_text` varchar(128) DEFAULT NULL COMMENT '活动时间显示文本（UI 自由文本）',
                     `start_time` datetime NOT NULL,
                     `end_time` datetime NOT NULL,
                     `signup_deadline` datetime DEFAULT NULL COMMENT '报名截止时间',
@@ -2638,6 +2722,146 @@ class DatabaseManager:
                     UNIQUE KEY `uk_word` (`word`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='敏感词库'
             """,
+            # ============================================
+            # 43.1 会员认证扩展（会员CRM / 会员认证页）
+            # ============================================
+            "user_commitment_sign": """
+                CREATE TABLE IF NOT EXISTS `user_commitment_sign` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `user_id` bigint unsigned NOT NULL,
+                    `title` varchar(128) NOT NULL DEFAULT '单身承诺' COMMENT '承诺书标题',
+                    `content` text COMMENT '签署时的承诺书内容快照',
+                    `file_url` varchar(512) DEFAULT NULL COMMENT '签名文件地址',
+                    `sign_times` int NOT NULL DEFAULT '1' COMMENT '第几次签署',
+                    `status` tinyint NOT NULL DEFAULT '0' COMMENT '0待审 1通过 2未通过',
+                    `remark` varchar(255) DEFAULT NULL COMMENT '审核备注',
+                    `reviewed_by` bigint unsigned DEFAULT NULL COMMENT '审核人',
+                    `reviewed_at` datetime DEFAULT NULL COMMENT '审核时间',
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_commit_user` (`user_id`,`created_at`),
+                    KEY `idx_commit_status` (`status`,`created_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='会员承诺书签署记录'
+            """,
+            "user_marriage_check": """
+                CREATE TABLE IF NOT EXISTS `user_marriage_check` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `user_id` bigint unsigned NOT NULL,
+                    `check_method` varchar(64) DEFAULT NULL COMMENT '核验方式 民政数据接口/线下核查',
+                    `declared_status` varchar(64) DEFAULT NULL COMMENT '客户资料中填写的婚姻状态',
+                    `result` varchar(32) DEFAULT NULL COMMENT '核验结果 married已婚/no_record无登记信息/divorced离异',
+                    `cost` decimal(10,2) NOT NULL DEFAULT '0.00' COMMENT '查询费用',
+                    `checked_at` datetime DEFAULT NULL COMMENT '核验时间',
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_marriage_user` (`user_id`),
+                    KEY `idx_marriage_result` (`result`,`created_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='婚姻状况核验记录'
+            """,
+            "config_auth_type": """
+                CREATE TABLE IF NOT EXISTS `config_auth_type` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `name` varchar(64) NOT NULL COMMENT '认证类型名称',
+                    `icon_url` varchar(512) DEFAULT NULL COMMENT '认证图标',
+                    `description` varchar(1000) DEFAULT NULL COMMENT '说明文案',
+                    `require_realname` tinyint NOT NULL DEFAULT '1' COMMENT '提交前是否要求先完成实名认证 1需要 0不需要',
+                    `sort` int NOT NULL DEFAULT '0' COMMENT '显示排序，数字越大越靠前',
+                    `status` tinyint NOT NULL DEFAULT '1' COMMENT '1启用 0关闭',
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_auth_type_name` (`name`),
+                    KEY `idx_auth_type_sort` (`status`,`sort`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='其他认证类型配置'
+            """,
+            "user_auth_extra": """
+                CREATE TABLE IF NOT EXISTS `user_auth_extra` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `user_id` bigint unsigned NOT NULL,
+                    `auth_type_id` bigint unsigned NOT NULL COMMENT '关联 config_auth_type.id',
+                    `auth_type_name` varchar(64) DEFAULT NULL COMMENT '认证类型名称快照',
+                    `file_url` varchar(512) DEFAULT NULL COMMENT '文件凭证',
+                    `status` tinyint NOT NULL DEFAULT '0' COMMENT '0待审 1通过 2未通过',
+                    `remark` varchar(255) DEFAULT NULL COMMENT '审核备注',
+                    `reviewed_by` bigint unsigned DEFAULT NULL,
+                    `reviewed_at` datetime DEFAULT NULL,
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_auth_extra_user` (`user_id`),
+                    KEY `idx_auth_extra_status` (`status`,`created_at`),
+                    KEY `idx_auth_extra_type` (`auth_type_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='会员其他认证提交记录'
+            """,
+            "user_gift_record": """
+                CREATE TABLE IF NOT EXISTS `user_gift_record` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `user_id` bigint unsigned NOT NULL COMMENT '赠送人',
+                    `target_user_id` bigint unsigned NOT NULL COMMENT '赠送对象',
+                    `gift_id` bigint unsigned DEFAULT NULL COMMENT '关联 config_point_product.id',
+                    `gift_name` varchar(128) DEFAULT NULL COMMENT '礼物名称',
+                    `gift_qty` int NOT NULL DEFAULT '1' COMMENT '赠送数量',
+                    `qty_unit` varchar(16) DEFAULT NULL COMMENT '数量单位 颗/发/个/架',
+                    `point_cost` int NOT NULL DEFAULT '0' COMMENT '消耗积分',
+                    `paid_amount` decimal(10,2) NOT NULL DEFAULT '0.00' COMMENT '实付金额',
+                    `reward_points` int NOT NULL DEFAULT '0' COMMENT '奖励积分',
+                    `order_no` varchar(64) DEFAULT NULL COMMENT '支付订单号',
+                    `pay_status` tinyint NOT NULL DEFAULT '0' COMMENT '0未支付 1已支付',
+                    `pay_method` varchar(32) DEFAULT NULL COMMENT '支付方式',
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_gift_user` (`user_id`,`created_at`),
+                    KEY `idx_gift_target` (`target_user_id`,`created_at`),
+                    KEY `idx_gift_pay` (`pay_status`,`created_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='会员赠送礼物记录'
+            """,
+            # ============================================
+            # 43.2 线下VIP服务（会员CRM / 线下VIP页）
+            # ============================================
+            "offline_vip": """
+                CREATE TABLE IF NOT EXISTS `offline_vip` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `user_id` bigint unsigned NOT NULL COMMENT '会员用户ID',
+                    `sales_matchmaker_id` bigint unsigned DEFAULT NULL COMMENT '销售红娘 users.id',
+                    `service_matchmaker_id` bigint unsigned DEFAULT NULL COMMENT '服务红娘 users.id',
+                    `promoter_id` bigint unsigned DEFAULT NULL COMMENT '推广红娘 users.id',
+                    `sign_date` date DEFAULT NULL COMMENT '签约日期',
+                    `service_start` date DEFAULT NULL COMMENT '服务开始日期',
+                    `service_end` date DEFAULT NULL COMMENT '服务结束日期',
+                    `package_name` varchar(128) DEFAULT NULL COMMENT '服务套餐',
+                    `contract_amount` decimal(12,2) NOT NULL DEFAULT '0.00' COMMENT '合同金额',
+                    `promise_meet_count` int NOT NULL DEFAULT '0' COMMENT '承诺约见人数',
+                    `success_meet_count` int NOT NULL DEFAULT '0' COMMENT '已成功约见人数',
+                    `progress` varchar(24) NOT NULL DEFAULT 'matching' COMMENT '服务进度 matching/dating/deep/in_love/met_parents/paused/breakup/married',
+                    `contract_status` varchar(24) NOT NULL DEFAULT 'none' COMMENT '电子合同状态 none/pending/signed/void',
+                    `contract_no` varchar(64) DEFAULT NULL COMMENT '电子合同编号',
+                    `remark` varchar(500) DEFAULT NULL COMMENT '备注信息',
+                    `attach_urls` json DEFAULT NULL COMMENT '图片附件URL列表',
+                    `created_by` bigint unsigned DEFAULT NULL COMMENT '创建人（后台账号ID）',
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    `deleted_at` datetime DEFAULT NULL,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_offline_vip_user` (`user_id`,`deleted_at`),
+                    KEY `idx_offline_vip_progress` (`progress`,`deleted_at`),
+                    KEY `idx_offline_vip_sign` (`sign_date`),
+                    KEY `idx_offline_vip_service` (`service_matchmaker_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='线下VIP会员服务记录'
+            """,
+            "offline_vip_meet_log": """
+                CREATE TABLE IF NOT EXISTS `offline_vip_meet_log` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `vip_id` bigint unsigned NOT NULL COMMENT '关联 offline_vip.id',
+                    `before_count` int NOT NULL DEFAULT '0' COMMENT '修改前成功约见数',
+                    `after_count` int NOT NULL DEFAULT '0' COMMENT '修改后成功约见数',
+                    `remark` varchar(255) DEFAULT NULL,
+                    `changed_by` bigint unsigned DEFAULT NULL COMMENT '修改人（后台账号ID）',
+                    `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_meet_log_vip` (`vip_id`,`created_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='线下VIP成功约见次数人工修改记录'
+            """,
             "community_moderation_task": """
                 CREATE TABLE IF NOT EXISTS `community_moderation_task` (
                     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -2672,7 +2896,7 @@ class DatabaseManager:
                     `gender` tinyint DEFAULT NULL,
                     `height` int DEFAULT NULL,
                     `income_level` tinyint DEFAULT NULL COMMENT '收入等级 1-5',
-                    `education_level` tinyint DEFAULT NULL COMMENT '学历等级 1博士 2硕士 3本科 4大专 5高中',
+                    `education_level` tinyint DEFAULT NULL COMMENT '学历等级 1高中及以下 2大专 3本科 4硕士 5博士（编辑写入域，education_min>=语义为及以上）',
                     `city_code` varchar(32) DEFAULT NULL COMMENT '城市编码',
                     `hometown_city` varchar(32) DEFAULT NULL COMMENT '家乡城市',
                     `mbti_ei` tinyint DEFAULT NULL COMMENT 'E/I 0-100',
@@ -2942,6 +3166,7 @@ class DatabaseManager:
         # AI 派生投影（revision/outbox/消费收据）与业务表同一入口。
         from app.db.derivation_schema import (
             DERIVATION_TABLES,
+            ensure_derivation_retention_indexes,
             ensure_derivation_task10_columns,
         )
 
@@ -2958,6 +3183,7 @@ class DatabaseManager:
             ensure_ai_profile_journey_columns,
             ensure_ai_profile_session_columns,
             ensure_ai_projection_columns,
+            ensure_ai_retention_indexes,
             ensure_ai_search_snapshot_columns,
             ensure_ai_task_columns,
         )
@@ -3023,8 +3249,21 @@ class DatabaseManager:
 
         # 兼容已存在的旧库：CREATE TABLE IF NOT EXISTS 不会补齐新增字段。
         self._ensure_required_columns(cursor)
+        self._ensure_chat_message_idempotency(cursor)
         self._ensure_admin_home_columns(cursor)
         self._ensure_member_crm_columns(cursor)
+        # M4 客源线索（promoter_id/audit_status）与会员服务（meeting_record.member_visible/sms_remind）
+        self._ensure_m4_columns(cursor)
+        # M5 分店管理：organization 分站字段 + organization_member 菜单权限
+        self._ensure_m5_columns(cursor)
+        # M6 合伙红娘（partner_team.level_id 补列 + partner_level_config 3 级种子）
+        self._ensure_m6_columns(cursor)
+        # M7 活动报名（offline_activity 补字段 + activity_signup 补字段）+ 商家/短视频分类种子
+        self._ensure_m7_columns(cursor)
+
+        # M10 账号注销申请 + 平台工单反馈（旧库幂等补齐）
+        # 两张表已由 BUSINESS_TABLES 中 CREATE TABLE IF NOT EXISTS 直接创建，
+        # 这里仅做兜底（库内已有表时跳过）。
 
         # 旧库的 ai_feature_projection 不会由 CREATE TABLE IF NOT EXISTS 补齐
         # Task 9 新增列（版本向量/可见性/失效原因等），与上面同模式幂等补列
@@ -3051,6 +3290,8 @@ class DatabaseManager:
         # constraint/index changes remain in the reviewed migration runner.
         ensure_ai_legacy_columns(cursor)
         ensure_derivation_task10_columns(cursor)
+        ensure_ai_retention_indexes(cursor)
+        ensure_derivation_retention_indexes(cursor)
 
         self._backfill_comment_roots(cursor)
 
@@ -3080,16 +3321,32 @@ class DatabaseManager:
     def _ensure_member_crm_columns(self, cursor) -> None:
         """Add CRM profile fields to already-existing installations."""
         columns = {
+            "member_follow_up": {
+                "images": "json DEFAULT NULL COMMENT '跟进图片URL列表'",
+                "voice_url": "varchar(500) DEFAULT NULL COMMENT '跟进录音地址'",
+                "voice_duration_sec": "int unsigned DEFAULT NULL COMMENT '录音时长秒'",
+            },
             "user_profile": {
                 "residence_city_code": "varchar(32) DEFAULT NULL",
                 "ideal_partner": "text DEFAULT NULL",
                 "wechat": "varchar(128) DEFAULT NULL COMMENT '会员微信号（后台受控展示）'",
                 "intention_level": "tinyint DEFAULT NULL COMMENT '客户意向：1低 2中 3高'",
+                "drinking": "varchar(32) DEFAULT NULL COMMENT '饮酒情况'",
+                "religion": "varchar(32) DEFAULT NULL COMMENT '宗教信仰'",
+                "marriage_plan": "varchar(64) DEFAULT NULL COMMENT '结婚计划'",
             },
             "user_auth": {
                 "education": "varchar(64) DEFAULT NULL COMMENT '学历'",
+                "school": "varchar(128) DEFAULT NULL COMMENT '学校'",
                 "job": "varchar(128) DEFAULT NULL COMMENT '职业'",
+                "company": "varchar(128) DEFAULT NULL COMMENT '公司'",
                 "auth_status": "tinyint DEFAULT 0 COMMENT '整体认证状态'",
+                "education_fail_reason": "varchar(255) DEFAULT NULL COMMENT '学历认证失败原因'",
+                "education_submitted_at": "datetime DEFAULT NULL COMMENT '学历认证提交时间'",
+                "education_reviewed_at": "datetime DEFAULT NULL COMMENT '学历认证审核时间'",
+                "house_fail_reason": "varchar(255) DEFAULT NULL COMMENT '房产认证失败原因'",
+                "house_submitted_at": "datetime DEFAULT NULL COMMENT '房产认证提交时间'",
+                "house_reviewed_at": "datetime DEFAULT NULL COMMENT '房产认证审核时间'",
             },
         }
         for table_name, required in columns.items():
@@ -3101,6 +3358,164 @@ class DatabaseManager:
                     f"ALTER TABLE `{table_name}` ADD COLUMN `{column_name}` {definition}"
                 )
                 logger.info("已为 %s 补充会员 CRM 字段 %s", table_name, column_name)
+
+    def _ensure_chat_message_idempotency(self, cursor) -> None:
+        """旧 chat_message 表添加可空客户端幂等键与复合唯一约束。"""
+        cursor.execute("SHOW FULL COLUMNS FROM `chat_message` LIKE %s", ("client_message_id",))
+        column = cursor.fetchone()
+        if not column:
+            cursor.execute(
+                "ALTER TABLE `chat_message` ADD COLUMN `client_message_id` "
+                "varchar(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL "
+                "COMMENT '客户端消息幂等键' AFTER `media_url`"
+            )
+        elif len(column) > 2 and column[2] != "utf8mb4_bin":
+            cursor.execute(
+                "ALTER TABLE `chat_message` MODIFY COLUMN `client_message_id` "
+                "varchar(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL "
+                "COMMENT '客户端消息幂等键' AFTER `media_url`"
+            )
+
+        index_name = "uq_chat_message_sender_session_client_message"
+        cursor.execute("SHOW INDEX FROM `chat_message` WHERE Key_name = %s", (index_name,))
+        if not cursor.fetchone():
+            cursor.execute(
+                "ALTER TABLE `chat_message` ADD UNIQUE KEY "
+                f"`{index_name}` (`from_user_id`, `session_id`, `client_message_id`)"
+            )
+
+    def _ensure_m4_columns(self, cursor) -> None:
+        """M4 客源线索 / 会员服务补充字段（旧库幂等补齐）。"""
+        columns = {
+            "customer_lead": {
+                "promoter_id": "`promoter_id` bigint unsigned DEFAULT NULL COMMENT '推广红娘用户ID'",
+                "audit_status": "`audit_status` varchar(16) NOT NULL DEFAULT 'active' COMMENT 'active有效/pending待核'",
+            },
+            "meeting_record": {
+                "member_visible": "`member_visible` tinyint NOT NULL DEFAULT 1 COMMENT '会员端是否可见 1是 0隐藏'",
+                "sms_remind": "`sms_remind` tinyint NOT NULL DEFAULT 1 COMMENT '是否发送约会短信提醒 1是 0否'",
+            },
+        }
+        for table_name, required in columns.items():
+            self._ensure_table_columns(cursor, f"`{table_name}`", self._named_columns(required))
+        self._ensure_optional_index(
+            cursor, "customer_lead", "idx_customer_lead_promoter", "(`promoter_id`)"
+        )
+
+    def _ensure_m5_columns(self, cursor) -> None:
+        """M5 分店管理补充字段（旧库幂等补齐）。"""
+        self._ensure_table_columns(cursor, "`organization`", self._named_columns({
+            "link_url": "varchar(255) DEFAULT NULL COMMENT '分站访问链接'",
+            "sort_order": "int NOT NULL DEFAULT 0 COMMENT '显示排序，数字越大越靠前'",
+            "qr_code": "varchar(500) DEFAULT NULL COMMENT '分站链接/二维码图片地址'",
+        }))
+
+    def _ensure_m6_columns(self, cursor) -> None:
+        """M6 合伙红娘补充字段与种子（旧库幂等补齐）。"""
+        self._ensure_table_columns(cursor, "`partner_team`", self._named_columns({
+            "level_id": "tinyint unsigned NOT NULL DEFAULT 1 COMMENT '合伙级别：1 初级 / 2 中级 / 3 战略合伙人（固定 3 种）'",
+        }))
+        # commission_entry 支持后台手工录入：order_id 放开为可空 + 补 source/remark
+        self._ensure_table_columns(cursor, "`commission_entry`", self._named_columns({
+            "source": "varchar(16) NOT NULL DEFAULT 'order' COMMENT 'order 订单产生 / manual 后台手工录入'",
+            "remark": "varchar(255) DEFAULT NULL COMMENT '后台手工录入备注'",
+        }))
+        try:
+            cursor.execute("ALTER TABLE `commission_entry` MODIFY COLUMN `order_id` bigint unsigned DEFAULT NULL")
+            logger.info("✅ commission_entry.order_id 已放开为可空（支持手工录入分成）")
+        except Exception as e:  # 已是可空或权限不足时静默跳过
+            logger.debug(f"commission_entry.order_id 调整跳过: {e}")
+        # 合伙红娘分成配置（固定 3 种级别：1 初级 / 2 中级 / 3 战略合伙人）
+        cursor.execute("""
+            INSERT IGNORE INTO partner_level_config
+            (level_id, level_name, auto_split_mode, auto_split_rate,
+             promote_performance_threshold, promote_member_threshold,
+             register_reward_male, register_reward_female, promoter_join_reward,
+             consume_commission_mode, consume_commission_rate, share_bonus)
+            VALUES
+                (1, '初级合伙人', 'auto_rate', 35.0000, NULL, NULL, 1.00, 1.00, 0.00, 'auto_rate', 35.0000, 1),
+                (2, '中级合伙人', 'auto_rate', 40.0000, 10000.00, 100, 1.00, 1.00, 0.00, 'auto_rate', 40.0000, 1),
+                (3, '战略合伙人', 'auto_rate', 45.0000, 30000.00, 500, 1.00, 1.00, 0.00, 'auto_rate', 45.0000, 1)
+        """)
+
+    def _ensure_m7_columns(self, cursor) -> None:
+        """M7 活动报名 / 商家联盟 / 短视频补充字段与种子（旧库幂等补齐）。"""
+        # 活动（offline_activity）按后台 UI 补字段
+        self._ensure_table_columns(cursor, "`offline_activity`", self._named_columns({
+            "organizer": "varchar(128) DEFAULT NULL COMMENT '活动发起（主办方）'",
+            "time_text": "varchar(128) DEFAULT NULL COMMENT '活动时间显示文本（UI 自由文本）'",
+            "cover_small": "varchar(255) DEFAULT NULL COMMENT '封面小图'",
+            "fee_name": "varchar(64) NOT NULL DEFAULT '报名费' COMMENT '费用名称'",
+            "price_male": "decimal(10,2) NOT NULL DEFAULT 0.00 COMMENT '男生费用'",
+            "price_female": "decimal(10,2) NOT NULL DEFAULT 0.00 COMMENT '女生费用'",
+            "signup_mode": "varchar(24) NOT NULL DEFAULT 'anyone' COMMENT 'anyone 任何人 / member 相亲会员'",
+            "require_realname": "tinyint NOT NULL DEFAULT 0 COMMENT '报名必须实名认证'",
+            "limit_mode": "varchar(24) NOT NULL DEFAULT 'gender' COMMENT 'gender 限制男女人数 / total 仅限制总人数'",
+            "max_male": "int NOT NULL DEFAULT 0 COMMENT '男生名额上限，0 不限'",
+            "max_female": "int NOT NULL DEFAULT 0 COMMENT '女生名额上限，0 不限'",
+            "virtual_people": "int NOT NULL DEFAULT 0 COMMENT '显示报名总数基数'",
+            "virtual_female": "int NOT NULL DEFAULT 0 COMMENT '显示报名女生数基数'",
+            "hide_signup_count": "tinyint NOT NULL DEFAULT 0 COMMENT '隐藏报名数'",
+            "reward_promoter": "decimal(10,2) NOT NULL DEFAULT 0.00 COMMENT '推广红娘奖励'",
+            "reward_service": "decimal(10,2) NOT NULL DEFAULT 0.00 COMMENT '服务红娘奖励'",
+            "reward_partner": "decimal(10,2) NOT NULL DEFAULT 0.00 COMMENT '合伙红娘奖励'",
+            "reminder_html": "text COMMENT '活动提醒（报名成功页展示）'",
+            "service_wechat": "varchar(64) DEFAULT NULL COMMENT '客服微信'",
+            "service_qr": "varchar(255) DEFAULT NULL COMMENT '客服二维码'",
+            "virtual_views": "int NOT NULL DEFAULT 0 COMMENT '浏览人气'",
+            "sort_order": "int NOT NULL DEFAULT 0 COMMENT '显示排序，数字越大越靠前'",
+            "custom_share": "tinyint NOT NULL DEFAULT 0 COMMENT '自定义分享'",
+            "manager_ids": "varchar(255) DEFAULT NULL COMMENT '管理红娘 users.id 逗号分隔'",
+            "notify_phones": "varchar(128) DEFAULT NULL COMMENT '报名短信通知手机号，逗号分隔'",
+            "online": "tinyint NOT NULL DEFAULT 1 COMMENT '上线 1是 0否'",
+            "audit_status": "varchar(16) NOT NULL DEFAULT 'approved' COMMENT 'pending待审/approved通过/rejected未通过'",
+        }))
+        # 活动报名（activity_signup）补会员资料快照与运营字段
+        self._ensure_table_columns(cursor, "`activity_signup`", self._named_columns({
+            "gender": "varchar(8) DEFAULT NULL COMMENT '男/女'",
+            "age": "int DEFAULT NULL",
+            "height": "int DEFAULT NULL COMMENT '身高cm'",
+            "education": "varchar(32) DEFAULT NULL COMMENT '学历'",
+            "income": "varchar(32) DEFAULT NULL COMMENT '收入'",
+            "marriage_status": "varchar(32) DEFAULT NULL COMMENT '婚况'",
+            "company": "varchar(128) DEFAULT NULL COMMENT '单位'",
+            "avatar": "varchar(255) DEFAULT NULL COMMENT '头像'",
+            "id_card": "varchar(32) DEFAULT NULL COMMENT '身份证号'",
+            "is_member": "tinyint NOT NULL DEFAULT 0 COMMENT '是否会员'",
+            "is_realname": "tinyint NOT NULL DEFAULT 0 COMMENT '是否已实名'",
+            "signup_times": "int NOT NULL DEFAULT 1 COMMENT '第几次报名'",
+            "pay_status": "varchar(16) NOT NULL DEFAULT 'free' COMMENT 'free免费/paid已支付/unpaid未支付'",
+            "pay_amount": "decimal(10,2) NOT NULL DEFAULT 0.00 COMMENT '报名费金额'",
+            "checked_in": "tinyint NOT NULL DEFAULT 0 COMMENT '是否已签到'",
+            "in_crm": "tinyint NOT NULL DEFAULT 0 COMMENT '是否已入库会员CRM'",
+            "promoter_id": "bigint unsigned DEFAULT NULL COMMENT '推广红娘 users.id'",
+        }))
+        self._ensure_optional_index(cursor, "activity_signup", "idx_activity_signup_promoter", "(`promoter_id`)")
+        self._ensure_optional_index(cursor, "offline_activity", "idx_offline_activity_online", "(`online`, `sort_order`)")
+        # 商家分类种子
+        cursor.execute("""
+            INSERT IGNORE INTO merchant_category (name, sort, status)
+            VALUES ('推荐餐饮', 1, 1), ('新奇体验', 2, 1), ('休闲娱乐', 3, 1), ('生活服务', 4, 1), ('结婚', 5, 1)
+        """)
+        # 短视频分类种子
+        cursor.execute("""
+            INSERT IGNORE INTO short_video_category (name, sort, status)
+            VALUES ('关于我们', 1, 1), ('脱单干货', 2, 1), ('活动瞬间', 3, 1), ('优质嘉宾', 4, 1), ('直播切片', 5, 1)
+        """)
+
+    def _ensure_optional_index(self, cursor, table_name: str, index_name: str, definition: str) -> None:
+        """幂等创建索引：表不存在或索引已存在时静默跳过。"""
+        try:
+            cursor.execute("SHOW TABLES LIKE %s", (table_name,))
+            if not cursor.fetchone():
+                return
+            cursor.execute(f"SHOW INDEX FROM `{table_name}` WHERE Key_name = %s", (index_name,))
+            if cursor.fetchone():
+                return
+            cursor.execute(f"ALTER TABLE `{table_name}` ADD KEY `{index_name}` {definition}")
+            logger.info(f"✅ 已添加索引 {table_name}.{index_name}")
+        except Exception as exc:  # 索引迁移失败不应阻断整体建表
+            logger.warning(f"⚠️ 添加索引 {table_name}.{index_name} 失败: {exc}")
 
     def _backfill_comment_roots(self, cursor) -> None:
         """Resolve legacy nested replies to their top-level root, one depth at a time."""

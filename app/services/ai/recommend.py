@@ -225,7 +225,6 @@ RECOMMEND_TASK_TYPE = "recommend_rebuild"
 RECOMMEND_ALGORITHM_VERSION = "recommend-rule-v1"
 RECOMMEND_ENGINE_RULE = "rule-v1"
 RECOMMEND_ENGINE_LLM = "llm-v1"
-VIEW_KINDS = ("i_like", "likes_me", "similar")
 
 _PROJECTION_KINDS = ("personal_compatibility", "ideal_partner_preference")
 
@@ -252,6 +251,21 @@ def _maybe_json(value: Any) -> Any:
     return value
 
 
+# 候选池资格的 FROM/WHERE 共享片段：物化（load_candidate_pool）与读取期复验
+# （_pool_eligible_candidate_ids）必须使用同一份条件——授权/投影/状态/过期门
+# 的口径只在这里定义一次，两处调用方不得各自内联，防止物化与读取口径漂移。
+# 授权 scope 的 JSON 判定在 Python 侧完成（load_candidate_pool 与复验同语义）。
+_POOL_PROJECTION_FROM = (
+    "FROM ai_feature_projection p "
+    "INNER JOIN ai_profile_projection_status ps "
+    "  ON ps.user_id = p.subject_user_id AND ps.kind = p.projection_kind "
+    "WHERE p.projection_kind IN ('personal_compatibility', 'ideal_partner_preference') "
+    "AND p.status = 'active' AND p.subject_user_id <> :viewer "
+    "AND (p.expires_at IS NULL OR p.expires_at > UTC_TIMESTAMP()) "
+    "AND ps.status = 'active' "
+)
+
+
 async def load_candidate_pool(
     db: AsyncSession, viewer_id: int, limit: int
 ) -> list[dict[str, Any]]:
@@ -266,11 +280,7 @@ async def load_candidate_pool(
     shadow 双读记录数量级 diff 后仍以旧链路为准。
     """
 
-    from app.services.ai.features import (
-        memory_projection_read_mode,
-        read_memory_fields_for_kind,
-    )
-    from app.schemas.ai_common import ProjectionKind
+    from app.services.ai.features import memory_projection_read_mode
 
     mode = memory_projection_read_mode()
     if mode == "memory":
@@ -280,14 +290,8 @@ async def load_candidate_pool(
         text(
             "SELECT p.id, p.subject_user_id, p.projection_kind, p.fields_json, p.source_hash, "
             "p.source_revision_json, p.consent_snapshot_json "
-            "FROM ai_feature_projection p "
-            "INNER JOIN ai_profile_projection_status ps "
-            "  ON ps.user_id = p.subject_user_id AND ps.kind = p.projection_kind "
-            "WHERE p.projection_kind IN ('personal_compatibility', 'ideal_partner_preference') "
-            "AND p.status = 'active' AND p.subject_user_id <> :viewer "
-            "AND (p.expires_at IS NULL OR p.expires_at > UTC_TIMESTAMP()) "
-            "AND ps.status = 'active' "
-            "ORDER BY p.id DESC LIMIT :limit"
+            + _POOL_PROJECTION_FROM
+            + "ORDER BY p.id DESC LIMIT :limit"
         ),
         {"viewer": int(viewer_id), "limit": int(limit) * 2},
     )
@@ -332,8 +336,15 @@ _MEMORY_POOL_DISCOVERY_SQL = (
 async def _load_memory_candidate_pool(
     db: AsyncSession, viewer_id: int, limit: int
 ) -> list[dict[str, Any]]:
+    """memory 模式候选池（Task 14 批量化）：双维度各一次批量读取。
+
+    授权纪律与旧路径一致：候选人资料只允许来自候选人本人的
+    compatibility_features 记忆投影；grant/consent 快照/policy revision
+    任一门失败（或无本人画像投影）的候选人不进入池（不扩大数据范围）。
+    """
     from app.schemas.ai_common import ProjectionKind
-    from app.services.ai.features import read_memory_fields_for_kind
+    from app.services.ai.features import memory_dimension_for_kind
+    from app.services.ai.memory.projections import MemoryProjectionService
 
     owners = (
         await db.execute(
@@ -347,24 +358,39 @@ async def _load_memory_candidate_pool(
             },
         )
     ).mappings().all()
+    owner_ids = [
+        int(row["user_id"])
+        for row in owners
+        if int(row["user_id"]) != int(viewer_id)
+    ]
+    if not owner_ids:
+        return []
+    service = MemoryProjectionService(db)
+    profiles = await service.read_active_batch(
+        owner_user_ids=owner_ids,
+        **memory_dimension_for_kind(ProjectionKind.PERSONAL_COMPATIBILITY),
+    )
+    preferences = await service.read_active_batch(
+        owner_user_ids=owner_ids,
+        **memory_dimension_for_kind(ProjectionKind.IDEAL_PARTNER_PREFERENCE),
+    )
     pool: list[dict[str, Any]] = []
-    for row in owners:
-        user_id = int(row["user_id"])
-        if user_id == int(viewer_id):
-            continue
-        profile = await read_memory_fields_for_kind(
-            db, user_id=user_id, projection_kind=ProjectionKind.PERSONAL_COMPATIBILITY
-        )
+    for user_id in owner_ids:
+        profile = profiles.get(user_id)
         if profile is None:
-            continue  # 无本人画像投影的候选人不进入池（不扩大数据范围）
-        preference = await read_memory_fields_for_kind(
-            db, user_id=user_id, projection_kind=ProjectionKind.IDEAL_PARTNER_PREFERENCE
-        )
+            continue  # 无本人画像投影（或门禁失败 fail closed）不进入池
+        preference = preferences.get(user_id)
         pool.append(
             {
                 "user_id": user_id,
-                "profile_fields": profile["fields"],
-                "preference_fields": (preference or {}).get("fields") or {},
+                "profile_fields": {
+                    str(entry["field_key"]): entry["value"]
+                    for entry in profile.get("entries") or ()
+                },
+                "preference_fields": {
+                    str(entry["field_key"]): entry["value"]
+                    for entry in (preference or {}).get("entries") or ()
+                },
                 "source_hash": profile["projection_input_hash"],
                 "source_revision": None,
                 "source": "memory_projection",
@@ -689,6 +715,10 @@ async def materialize_recommendations(
             )
         ).scalar_one()
         generation = int(generation_row)
+        # Task 15：批量 INSERT（executemany）。单事务失败整体回滚（调用方
+        # 持有事务）；generation 单调递增 + 随后的 supersede UPDATE 保证
+        # 重试不产生重复行、旧版本不覆盖新版本。
+        insert_params: list[dict[str, Any]] = []
         for rank_no, (candidate, card, engine) in enumerate(
             scored[: settings.ai_recommendation_top_n], start=1
         ):
@@ -708,8 +738,7 @@ async def materialize_recommendations(
                     if card.score_detail is not None
                     else None
                 )
-            await db.execute(
-                text(_RECOMMEND_INSERT),
+            insert_params.append(
                 {
                     "snapshot_id": snapshot_id,
                     "viewer": int(viewer_id),
@@ -726,8 +755,9 @@ async def materialize_recommendations(
                     "algorithm_version": RECOMMEND_ALGORITHM_VERSION,
                     "source_hash": inputs["source_hash"] or "",
                     "expires_at": expires_at,
-                },
+                }
             )
+        await db.execute(text(_RECOMMEND_INSERT), insert_params)
         await db.execute(
             text(
                 "UPDATE ai_recommendation_snapshot SET status = 'superseded', "
@@ -831,20 +861,105 @@ _RECOMMEND_READ_COLUMNS = (
 )
 
 
+_POOL_ELIGIBLE_PROJECTION_SQL = (
+    "SELECT p.subject_user_id, p.projection_kind, p.consent_snapshot_json "
+    + _POOL_PROJECTION_FROM
+    + "AND p.subject_user_id IN ({id_list})"
+)
+
+
+async def _pool_eligible_candidate_ids(
+    db: AsyncSession, viewer_id: int, candidate_ids: list[int]
+) -> set[int]:
+    """读取期候选资格复验：与 ``load_candidate_pool`` 同一套门条件。
+
+    物化时刻的候选有效性由 load_candidate_pool 保证；本函数在**读取时刻**
+    按相同语义重验（授权 scope、投影 active、状态 active、未过期、personal
+    必备），使授权撤回/投影失效在快照 TTL 内即时生效。仅复用同一规则口径，
+    不引入第二套权限判定。memory 模式与 _load_memory_candidate_pool 同语义：
+    候选人必须有本人的 compatibility_features 活跃记忆投影（fail closed）。
+    """
+    if not candidate_ids:
+        return set()
+    compat = _compat()
+    unique_ids = sorted({int(i) for i in candidate_ids})
+    from app.services.ai.features import (
+        memory_dimension_for_kind,
+        memory_projection_read_mode,
+    )
+    from app.schemas.ai_common import ProjectionKind
+
+    if memory_projection_read_mode() == "memory":
+        from app.services.ai.memory.projections import MemoryProjectionService
+
+        service = MemoryProjectionService(db)
+        profiles = await service.read_active_batch(
+            owner_user_ids=unique_ids,
+            **memory_dimension_for_kind(ProjectionKind.PERSONAL_COMPATIBILITY),
+        )
+        return {int(uid) for uid in unique_ids if profiles.get(uid) is not None}
+
+    id_list = ",".join(str(i) for i in unique_ids)
+    rows = (
+        await db.execute(
+            text(_POOL_ELIGIBLE_PROJECTION_SQL.format(id_list=id_list)),
+            {"viewer": int(viewer_id)},
+        )
+    ).mappings().all()
+    personal_seen: set[int] = set()
+    for row in rows:
+        user_id = int(row["subject_user_id"])
+        consent = _maybe_json(row.get("consent_snapshot_json"))
+        if not isinstance(consent, dict) or consent.get("scope") != compat.PROJECTION_CONSENT_SCOPE:
+            continue
+        if str(row["projection_kind"]) == "personal_compatibility":
+            personal_seen.add(user_id)
+    return personal_seen
+
+
 async def read_recommendations(
     db: AsyncSession, viewer_id: int, view_kind: str, limit: int
 ) -> list[dict[str, Any]]:
-    """读取某视图的 ready 快照（过期视为 miss），按 rank_no 升序。"""
+    """读取某视图的 ready 快照（过期视为 miss），按 rank_no 升序。
+
+    读取期逐候选复检（在构造任何卡片与解释之前）：可见性
+    ``CandidateVisibilityService.decide(PROFILE)``（与物化 _visible_pool
+    同场景：账号/审核/隐私/双向拉黑/封禁）+ 候选池资格（授权/投影/状态，
+    ``_pool_eligible_candidate_ids``）。被过滤的候选保留其原 rank_no（其余
+    行 rank 连续性以物化代为准），可能产生短页——读取契约是"当前可展示的
+    推荐卡"，不是"固定行数的快照切片"。候选资料改版（revision 前进但投影
+    仍在）不改变可展示性，仅由快照 TTL 与同日重建兜底其新鲜度。
+    """
+    # 快照每视图至多 ai_recommendation_top_n 行；多取只为过滤后仍能填满
+    # limit 页，不改变物化上限。
+    fetch_limit = max(int(limit), int(settings.ai_recommendation_top_n))
     result = await db.execute(
         text(_RECOMMEND_READ_COLUMNS),
-        {"viewer": int(viewer_id), "view_kind": str(view_kind), "limit": int(limit)},
+        {"viewer": int(viewer_id), "view_kind": str(view_kind), "limit": fetch_limit},
+    )
+    rows = list(result.mappings().all())
+    candidate_ids = sorted({int(row["target_user_id"]) for row in rows})
+    visible_ids: set[int] = set()
+    if candidate_ids:
+        decide = _compat().candidate_visibility_service.decide
+        for candidate_id in candidate_ids:
+            decision = await decide(
+                db, viewer_id, candidate_id, VisibilityScene.PROFILE
+            )
+            if decision.allowed:
+                visible_ids.add(candidate_id)
+    eligible_ids = await _pool_eligible_candidate_ids(
+        db, viewer_id, sorted(visible_ids)
     )
     items: list[dict[str, Any]] = []
-    for row in result.mappings().all():
+    for row in rows:
+        candidate_id = int(row["target_user_id"])
+        if candidate_id not in visible_ids or candidate_id not in eligible_ids:
+            continue
         direction = _maybe_json(row.get("direction_json")) or {}
         items.append(
             {
-                "target_user_id": int(row["target_user_id"]),
+                "target_user_id": candidate_id,
                 "score": float(row["score"]) if row.get("score") is not None else None,
                 "coverage": (
                     float(row["coverage"]) if row.get("coverage") is not None else None
@@ -855,6 +970,8 @@ async def read_recommendations(
                 "reason_texts": list(direction.get("reason_texts") or []),
             }
         )
+        if len(items) >= int(limit):
+            break
     return items
 
 

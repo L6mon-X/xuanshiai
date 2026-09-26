@@ -7,12 +7,14 @@
 
 from __future__ import annotations
 
+from app.services.ai.prompts.structured_skeleton import wrap_structured_prompt
+
 # 每个字段允许的 operator，与 FIELD_OPERATOR_ALLOWLIST 一致。
 _FIELD_OPERATOR_GUIDE = {
     "age": "between（{\"min\": 最小, \"max\": 最大}）/ gte（最小）/ lte（最大）",
     "city_code": "eq（单个 6 位行政区划代码）/ in（6 位代码数组）。必须用数字代码，不要用拼音或中文城市名。常见城市：330100=杭州, 110100=北京, 440100=广州, 310100=上海, 440300=深圳, 330200=宁波, 320100=南京, 510100=成都, 420100=武汉, 370100=济南",
     "marriage_status": "eq（单个状态）/ in（状态数组）",
-    "education_level": "gte（最低学历等级，整数 1-8。中文映射：1=初中及以下，2=高中/中专，3=大专，4=本科，5=硕士，6=博士。用户说“本科以上/本科及以上”时 value=4）",
+    "education_level": "gte（最低学历等级，整数 1-6。中文映射：1=初中及以下，2=高中/中专，3=大专，4=本科，5=硕士，6=博士。用户说“本科以上/本科及以上”时 value=4）",
     "height_cm": "between / gte / lte，数值为厘米数",
     "income_band": "between / gte / lte，数值为收入档位。中文映射：1=一档/第一档，2=二档/第二档，以此类推。用户说“收入至少第二档”时 value=2",
     "occupation_group": "eq（单个行业值）",
@@ -65,7 +67,7 @@ def build_search_parse_prompt(query_text: str) -> str:
         for key, values in _ENUM_VALUES.items()
     )
 
-    return (
+    return wrap_structured_prompt(
         f"{_SYSTEM_HEADER}\n\n"
         f"可用字段及其操作符：\n{field_lines}\n\n"
         f"枚举字段的合法取值：\n{enum_lines}\n\n"

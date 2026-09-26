@@ -7,14 +7,19 @@ from app.api.routes import (
     ai_consents,
     ai_recommend,
     ai_profile,
+    ai_profile_card,
     ai_search,
     ai_tasks,
     ai_moxiang,
     ai_memory,
     activity_admin,
+    merchant_admin,
+    mutual_selection_admin,
+    short_video_admin,
     admin,
     admin_home,
     admin_config,
+    admin_content,
     ai_avatar,
     auth,
     ai,
@@ -25,11 +30,17 @@ from app.api.routes import (
     community_admin,
     message_admin,
     customer_leads_admin,
+    promotion_order_admin,
     discovery,
     finance,
     health,
     identity,
     location,
+    live,
+    live_admin,
+    live_callbacks,
+    live_host,
+    live_ws,
     matchmaker_workspace,
     matchmaker,
     matchmaker_admin,
@@ -38,11 +49,15 @@ from app.api.routes import (
     matchmaker_crm_admin,
     matchmaker_dashboard_admin,
     matchmaker_member_admin,
+    member_auth_admin,
+    member_behavior_admin,
+    member_media_admin,
     media,
     meeting,
     member_follow_up_admin,
     member_records_admin,
     member_vip_admin,
+    offline_vip_admin,
     membership,
     organization,
     organization_admin,
@@ -58,8 +73,12 @@ from app.api.routes import (
     commission_level_admin,
     promoter_staff_admin,
     promoter_level_admin,
+    partner_admin,
+    partner_level_admin,
     social,
     users,
+    user_cancellation_admin as user_cancellation_router,
+    admin_ticket as admin_ticket_router,
     voice,
     voice_moxiang,
     voice_ws,
@@ -67,8 +86,13 @@ from app.api.routes import (
 
 
 api_router = APIRouter()
+api_router.include_router(live_callbacks.router, tags=["live-callback"])
 api_router.include_router(location.router, tags=["位置服务"])
 api_router.include_router(location.users_router, tags=["位置服务"])
+api_router.include_router(live.router, tags=["直播相亲"])
+api_router.include_router(live_host.router, tags=["直播相亲"])
+api_router.include_router(live_admin.router, tags=["直播相亲管理"])
+api_router.include_router(live_ws.router, tags=["直播相亲"])
 api_router.include_router(health.router, tags=["系统"])
 api_router.include_router(app_version.router, tags=["系统"])
 api_router.include_router(auth.router, tags=["账号与认证"])
@@ -102,6 +126,7 @@ api_router.include_router(message_admin.router, tags=["\u7ba1\u7406\u540e\u53f0"
 api_router.include_router(admin.router, tags=["管理后台"])
 api_router.include_router(admin_home.router, tags=["管理端首页"])
 api_router.include_router(admin_config.router, tags=["管理后台配置"])
+api_router.include_router(admin_content.router, tags=["管理后台通用内容"])
 api_router.include_router(admin_home.legacy_router, tags=["管理端首页兼容"])
 api_router.include_router(matchmaker_admin.router, tags=["红娘后台"])
 api_router.include_router(matchmaker_admin_account.router, tags=["红娘后台"])
@@ -113,16 +138,37 @@ api_router.include_router(member_records_admin.router, tags=["红娘后台"])
 api_router.include_router(customer_leads_admin.router, tags=["管理后台"])
 api_router.include_router(matchmaker_dashboard_admin.router, tags=["红娘后台"])
 api_router.include_router(member_vip_admin.router, tags=["管理后台"])
+api_router.include_router(member_auth_admin.router, tags=["管理后台"])
+api_router.include_router(member_media_admin.router, tags=["管理后台"])
+api_router.include_router(member_behavior_admin.router, tags=["管理后台"])
 api_router.include_router(activity_admin.router, tags=["管理后台"])
 api_router.include_router(activity_admin.signup_router, tags=["管理后台"])
+api_router.include_router(mutual_selection_admin.router, tags=["管理后台"])
+api_router.include_router(mutual_selection_admin.record_router, tags=["管理后台"])
+api_router.include_router(merchant_admin.router, tags=["管理后台"])
+api_router.include_router(merchant_admin.category_router, tags=["管理后台"])
+api_router.include_router(merchant_admin.product_router, tags=["管理后台"])
+api_router.include_router(merchant_admin.order_router, tags=["管理后台"])
+api_router.include_router(short_video_admin.video_router, tags=["管理后台"])
+api_router.include_router(short_video_admin.category_router, tags=["管理后台"])
+api_router.include_router(short_video_admin.comment_router, tags=["管理后台"])
+api_router.include_router(short_video_admin.tip_router, tags=["管理后台"])
+api_router.include_router(short_video_admin.packet_router, tags=["管理后台"])
+api_router.include_router(short_video_admin.homepage_router, tags=["管理后台"])
 api_router.include_router(member_follow_up_admin.router, tags=["管理后台"])
+api_router.include_router(offline_vip_admin.router, tags=["管理后台"])
 api_router.include_router(reward_rule_admin.router, tags=["红娘后台"])
 api_router.include_router(apportion_config_admin.router, tags=["红娘后台"])
 api_router.include_router(commission_level_admin.router, tags=["红娘后台"])
 api_router.include_router(promoter_staff_admin.router, tags=["红娘后台"])
 api_router.include_router(promoter_level_admin.router, tags=["红娘后台"])
-api_router.include_router(matchmaker.admin_router, tags=["管理后台"])
+api_router.include_router(partner_admin.router, tags=["红娘后台"])
+api_router.include_router(partner_admin.relation_router, tags=["红娘后台"])
+api_router.include_router(partner_level_admin.router, tags=["红娘后台"])
 api_router.include_router(meeting.admin_router, tags=["管理后台"])
+api_router.include_router(promotion_order_admin.router, tags=["管理后台"])
+api_router.include_router(user_cancellation_router.router, tags=["管理后台"])
+api_router.include_router(admin_ticket_router.router, tags=["管理后台"])
 api_router.include_router(finance.admin_router, tags=["管理后台"])
 api_router.include_router(organization.router, tags=["组织与归属"])
 api_router.include_router(organization.promotion_router, tags=["组织与归属"])
@@ -131,6 +177,7 @@ api_router.include_router(finance.router, tags=["财务与结算"])
 api_router.include_router(ai_tasks.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_consents.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_profile.router, prefix="/ai", tags=["AI"])
+api_router.include_router(ai_profile_card.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_search.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_compatibility.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_recommend.router, prefix="/ai", tags=["AI"])
@@ -161,5 +208,7 @@ OPENAPI_TAGS = [
     {"name": "系统", "description": "健康检查和系统发现信息。"},
     {"name": "AI", "description": "AI 画像、搜索与匹配度通用任务查询、取消和状态轮询。"},
     {"name": "语音", "description": "语音转写（STT）与语音合成（TTS）。"},
+    {"name": "直播相亲", "description": "直播场次、预约签到、上台和互动。"},
+    {"name": "直播相亲管理", "description": "直播场次创建和运营管理。"},
     {"name": "AI 分身", "description": "基于目标用户公开资料的独立 AI 对话能力。"},
 ]

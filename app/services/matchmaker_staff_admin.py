@@ -13,6 +13,7 @@ from app.api.dependencies import CurrentMatchmakerAdmin
 from app.core.security import hash_password
 from app.schemas.matchmaker_admin import MatchmakerAdminAccount
 from app.services.matchmaker_admin_auth import _issue_session
+from app.services import user_candidates
 from app.schemas.matchmaker_staff_admin import (
     AdminMenuNode,
     CommissionLevelItem,
@@ -59,6 +60,7 @@ def _item(row: dict) -> MatchmakerStaffItem:
         role_label="超级红娘" if row.get("role_tag") == "super" else "普通红娘",
         phone=row.get("phone"),
         wechat=row.get("wechat"),
+        wechat_qr=row.get("wechat_qr"),
         commission_level_id=int(row["commission_level_id"])
         if row.get("commission_level_id")
         else None,
@@ -71,17 +73,25 @@ def _item(row: dict) -> MatchmakerStaffItem:
         locked=bool(row.get("locked")),
         visible=bool(row.get("visible", 1)),
         description=row.get("description"),
+        slogan=row.get("slogan"),
+        sort=int(row.get("sort") or 0),
+        # 旧库行可能为 NULL，缺省按允许（1）处理
+        contact_editable=bool(row["contact_editable"])
+        if row.get("contact_editable") is not None
+        else True,
+        lock_at=_dt(row.get("lock_at")),
         created_at=_dt(row.get("created_at")),
         updated_at=_dt(row.get("updated_at")),
     )
 
 
 SELECT_STAFF = """SELECT u.id, u.avatar, u.nickname, u.phone, u.created_at, u.updated_at,
-    p.wechat, p.role_tag, p.visible, p.locked, p.description, p.commission_level_id,
+    p.wechat, p.wechat_qr, p.role_tag, p.visible, p.locked, p.description, p.slogan, p.sort, p.contact_editable, p.lock_at, p.commission_level_id,
     l.name commission_level_name, l.rate_percent,
     a.id account_id, a.username,
     o.id store_id, COALESCE(o.display_name, o.name) store_name,
     (SELECT COUNT(*) FROM matchmaker_service s WHERE s.matchmaker_id = u.id AND s.status = 2) success_count,
+    (SELECT COUNT(*) FROM matchmaker_menu_permission mmp WHERE mmp.matchmaker_user_id = u.id) menu_permission_count,
     (SELECT COALESCE(SUM(e.amount), 0) FROM commission_entry e WHERE e.beneficiary_type = 'service_matchmaker' AND e.beneficiary_id = u.id AND e.status <> 'REVERSED') commission_amount
     FROM users u JOIN user_matchmaker_apply ma ON ma.user_id = u.id AND ma.application_type = 'service_matchmaker' AND ma.status = 1
     LEFT JOIN matchmaker_profile p ON p.user_id = u.id
@@ -93,21 +103,9 @@ SELECT_STAFF = """SELECT u.id, u.avatar, u.nickname, u.phone, u.created_at, u.up
 
 
 async def search_user_candidates(db: AsyncSession, keyword: str, limit: int = 10) -> list[MatchmakerUserCandidate]:
-    rows = await db.execute(
-        text(
-            """SELECT u.id, u.nickname, u.phone, u.avatar
-            FROM users u
-            WHERE u.status=1
-              AND (u.nickname LIKE CONCAT('%', :keyword, '%') OR u.phone LIKE CONCAT('%', :keyword, '%'))
-              AND NOT EXISTS (
-                SELECT 1 FROM user_matchmaker_apply ma
-                WHERE ma.user_id=u.id AND ma.application_type='service_matchmaker' AND ma.status=1
-              )
-            ORDER BY u.id DESC LIMIT :limit"""
-        ),
-        {"keyword": keyword, "limit": limit},
-    )
-    return [MatchmakerUserCandidate(**dict(row)) for row in rows.mappings().all()]
+    """服务红娘候选人：排除已是服务红娘的用户（统一走 user_candidates 实现）。"""
+    rows = await user_candidates.search_user_candidates(db, keyword, "service_matchmaker", limit)
+    return [MatchmakerUserCandidate(**row) for row in rows]
 
 
 async def list_staff(
@@ -119,6 +117,7 @@ async def list_staff(
     store_id: int | None,
     level_id: int | None,
     locked: bool | None,
+    in_store: bool | None = None,
 ) -> MatchmakerStaffPage:
     conditions = ["1=1"]
     params: dict[str, object] = {"limit": page_size, "offset": (page - 1) * page_size}
@@ -136,6 +135,9 @@ async def list_staff(
     if locked is not None:
         conditions.append("p.locked = :locked")
         params["locked"] = int(locked)
+    if in_store is not None:
+        # in_store=True 只返回已挂靠门店的分店红娘；False 只返回未挂门店的总店红娘
+        conditions.append("om.id IS NOT NULL" if in_store else "om.id IS NULL")
     scope = admin.scope_condition(organization_column="o.id", params=params, user_column="u.id")
     conditions.append(scope)
     where = " AND ".join(conditions)
@@ -156,7 +158,35 @@ async def list_staff(
     )
 
 
-async def get_staff(db: AsyncSession, matchmaker_id: int) -> MatchmakerStaffDetail:
+async def _assert_staff_scope(
+    db: AsyncSession, matchmaker_id: int, admin: CurrentMatchmakerAdmin
+) -> None:
+    params: dict[str, object] = {"id": matchmaker_id}
+    scope = admin.scope_condition(
+        organization_column="o.id", params=params, user_column="u.id"
+    )
+    exists = await db.execute(
+        text(
+            """SELECT 1
+            FROM users u
+            LEFT JOIN matchmaker_profile p ON p.user_id = u.id
+            LEFT JOIN organization_member om
+              ON om.user_id = u.id AND om.role_code = 'store_matchmaker' AND om.status = 1
+            LEFT JOIN organization o ON o.id = om.organization_id AND o.org_type = 'store'
+            WHERE u.id = :id AND p.deleted_at IS NULL AND """
+            + scope
+        ),
+        params,
+    )
+    if not exists.scalar():
+        raise HTTPException(404, detail="红娘不存在")
+
+
+async def get_staff(
+    db: AsyncSession, matchmaker_id: int, admin: CurrentMatchmakerAdmin | None = None
+) -> MatchmakerStaffDetail:
+    if admin is not None:
+        await _assert_staff_scope(db, matchmaker_id, admin)
     row = (
         (await db.execute(text(f"{SELECT_STAFF} AND u.id = :id"), {"id": matchmaker_id}))
         .mappings()
@@ -204,10 +234,12 @@ async def create_staff(
     await _validate_refs(db, body)
     user_id = body.user_id
     if user_id is None and body.lookup:
-        column = "nickname" if body.lookup_by == "nickname" else "phone"
-        user_id = (await db.execute(text(f"SELECT id FROM users WHERE {column}=:lookup AND status=1 ORDER BY id DESC LIMIT 1"), {"lookup": body.lookup.strip()})).scalar()
-        if user_id is None:
-            raise HTTPException(404, detail="未找到可绑定的普通用户")
+        user_id = await user_candidates.resolve_user_id(
+            db,
+            body.lookup,
+            body.lookup_by or "nickname",
+            not_found_detail="未找到匹配的普通用户，请从下拉列表中选择",
+        )
     if user_id is not None:
         user = (await db.execute(text("SELECT id FROM users WHERE id=:id AND status=1 FOR UPDATE"), {"id": user_id})).mappings().first()
         if not user:
@@ -258,24 +290,20 @@ async def create_staff(
     )
     await db.execute(
         text(
-            """INSERT INTO matchmaker_profile
-            (user_id, wechat, commission_level_id, role_tag, visible, description)
-            VALUES (:id, :wechat, :level, :role, :visible, :description)
-            ON DUPLICATE KEY UPDATE
-                wechat = :wechat,
-                commission_level_id = :level,
-                role_tag = :role,
-                visible = :visible,
-                description = :description,
-                deleted_at = NULL"""
+            "INSERT INTO matchmaker_profile (user_id,wechat,wechat_qr,commission_level_id,role_tag,visible,description,slogan,sort,contact_editable,lock_at) VALUES (:id,:wechat,:wechat_qr,:level,:role,:visible,:description,:slogan,:sort,:contact_editable,:lock_at)"
         ),
         {
             "id": user_id,
             "wechat": body.wechat,
+            "wechat_qr": body.wechat_qr,
             "level": body.commission_level_id,
             "role": body.role_tag,
             "visible": int(body.visible),
             "description": body.description,
+            "slogan": body.slogan,
+            "sort": body.sort,
+            "contact_editable": int(body.contact_editable),
+            "lock_at": body.lock_at,
         },
     )
     if body.store_id:
@@ -308,19 +336,25 @@ async def update_staff(
             )
     profile_map = {
         "wechat": "wechat",
+        "wechat_qr": "wechat_qr",
         "commission_level_id": "commission_level_id",
         "role_tag": "role_tag",
         "visible": "visible",
         "description": "description",
+        "slogan": "slogan",
+        "sort": "sort",
+        "contact_editable": "contact_editable",
+        "lock_at": "lock_at",
     }
     for source, target in profile_map.items():
         if source in values:
+            value = values[source]
+            # visible / contact_editable 为布尔开关，入库统一转 tinyint；显式置空时保持 NULL
+            if source in ("visible", "contact_editable"):
+                value = None if value is None else int(value)
             await db.execute(
                 text(f"UPDATE matchmaker_profile SET {target}=:value WHERE user_id=:id"),
-                {
-                    "value": int(values[source]) if source == "visible" else values[source],
-                    "id": matchmaker_id,
-                },
+                {"value": value, "id": matchmaker_id},
             )
     if "password" in values:
         await db.execute(
@@ -480,16 +514,35 @@ async def save_permissions(
 
 
 async def work_report(
-    db: AsyncSession, matchmaker_id: int, from_date: date, to_date: date
+    db: AsyncSession,
+    matchmaker_id: int,
+    from_date: date,
+    to_date: date,
+    admin: CurrentMatchmakerAdmin | None = None,
 ) -> MatchmakerWorkReport:
     if to_date < from_date or (to_date - from_date).days > 366:
         raise HTTPException(422, detail="日期范围必须为1至366天")
+    if admin is not None:
+        await _assert_staff_scope(db, matchmaker_id, admin)
     params = {"id": matchmaker_id, "from_date": from_date, "to_date": to_date + timedelta(days=1)}
     row = (
         (
             await db.execute(
                 text(
-                    """SELECT (SELECT COUNT(*) FROM customer_lead WHERE matchmaker_id=:id AND created_at>=:from_date AND created_at<:to_date) new_lead_count, (SELECT COUNT(*) FROM matchmaker_service WHERE matchmaker_id=:id AND created_at>=:from_date AND created_at<:to_date) matchmaking_count, (SELECT COUNT(*) FROM matchmaker_service WHERE matchmaker_id=:id AND status=2 AND updated_at>=:from_date AND updated_at<:to_date) success_count, (SELECT COALESCE(SUM(amount),0) FROM commission_entry WHERE beneficiary_type='service_matchmaker' AND beneficiary_id=:id AND created_at>=:from_date AND created_at<:to_date AND status<>'REVERSED') commission_amount, (SELECT COUNT(*) FROM member_follow_up f JOIN resource_assignment a ON a.user_id=f.user_id AND a.matchmaker_id=:id AND a.status=1 WHERE f.created_at>=:from_date AND f.created_at<:to_date) follow_up_count, (SELECT COUNT(*) FROM resource_assignment WHERE matchmaker_id=:id AND status=1 AND effective_at<:to_date) assigned_member_count"""
+                    """SELECT (SELECT COUNT(*) FROM customer_lead WHERE matchmaker_id=:id AND created_at>=:from_date AND created_at<:to_date) new_lead_count, (SELECT COUNT(*) FROM matchmaker_service WHERE matchmaker_id=:id AND created_at>=:from_date AND created_at<:to_date) matchmaking_count, (SELECT COUNT(*) FROM matchmaker_service WHERE matchmaker_id=:id AND status=2 AND updated_at>=:from_date AND updated_at<:to_date) success_count, (SELECT COALESCE(SUM(amount),0) FROM commission_entry WHERE beneficiary_type='service_matchmaker' AND beneficiary_id=:id AND created_at>=:from_date AND created_at<:to_date AND status<>'REVERSED') commission_amount, (SELECT COUNT(*) FROM member_follow_up f JOIN resource_assignment a ON a.user_id=f.user_id AND a.matchmaker_id=:id AND a.status=1 WHERE f.created_at>=:from_date AND f.created_at<:to_date) follow_up_count, (SELECT COUNT(*) FROM resource_assignment WHERE matchmaker_id=:id AND status=1 AND effective_at<:to_date) assigned_member_count,
+                    -- 以下为本次新增的 5 个工作量指标
+                    -- 新增会员资料：会员归属红娘通过 resource_assignment(matchmaker_id,user_id) 记录，按生效时间落在区间内的条数；
+                    -- 项目无独立 user_profile 表，会员归属以 resource_assignment 为准（与既有 assigned_member_count 同口径，仅改为区间计数）
+                    (SELECT COUNT(*) FROM resource_assignment WHERE matchmaker_id=:id AND status=1 AND effective_at>=:from_date AND effective_at<:to_date) new_member_count,
+                    -- 线索跟进：customer_lead_follow_up 经 lead_id 关联 customer_lead，按归属红娘与跟进创建时间计数
+                    (SELECT COUNT(*) FROM customer_lead_follow_up f JOIN customer_lead c ON c.id=f.lead_id WHERE c.matchmaker_id=:id AND f.created_at>=:from_date AND f.created_at<:to_date) lead_follow_up_count,
+                    -- 预约申请：meeting_request.matchmaker_id 直接关联
+                    (SELECT COUNT(*) FROM meeting_request WHERE matchmaker_id=:id AND created_at>=:from_date AND created_at<:to_date) meeting_request_count,
+                    -- 约会安排：meeting_record 经 request_id 关联 meeting_request，按归属红娘与约会记录创建时间计数
+                    (SELECT COUNT(*) FROM meeting_record r JOIN meeting_request q ON q.id=r.request_id WHERE q.matchmaker_id=:id AND r.created_at>=:from_date AND r.created_at<:to_date) meeting_arranged_count,
+                    -- 线下业绩：payment_order 已含 matchmaker_id，按 product_type='offline_vip'（平台既有线下业绩口径，见 admin_home.py）与支付成功状态、支付时间区间聚合；
+                    -- 若后续下线该商品编码，需同步调整此口径
+                    (SELECT COALESCE(SUM(amount),0) FROM payment_order WHERE matchmaker_id=:id AND status=1 AND product_type='offline_vip' AND pay_time>=:from_date AND pay_time<:to_date) offline_income"""
                 ),
                 params,
             )
@@ -503,9 +556,13 @@ async def work_report(
 
 
 async def report(
-    db: AsyncSession, matchmaker_id: int, from_date: date, to_date: date
+    db: AsyncSession,
+    matchmaker_id: int,
+    from_date: date,
+    to_date: date,
+    admin: CurrentMatchmakerAdmin | None = None,
 ) -> MatchmakerDetailReport:
-    work = await work_report(db, matchmaker_id, from_date, to_date)
+    work = await work_report(db, matchmaker_id, from_date, to_date, admin)
     return MatchmakerDetailReport(
         matchmaker_id=matchmaker_id,
         from_date=from_date,

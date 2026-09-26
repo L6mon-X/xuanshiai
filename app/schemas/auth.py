@@ -8,13 +8,42 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.core.profile_tags import ALL_TAG_OPTIONS, TAG_OPTIONS_BY_CATEGORY
+from app.core.profile_tags import ALL_TAG_OPTIONS, TAG_OPTIONS_BY_CATEGORY, LEGACY_TAG_OPTIONS_BY_CATEGORY, PERSONALITY_OPTIONS, MAX_PERSONAL_TAGS, MAX_CUSTOM_TAGS, CUSTOM_TAG_MIN_LENGTH, CUSTOM_TAG_MAX_LENGTH, normalize_custom_tag, validate_personal_tag_selection
 
 
 MbtiType = Literal[
     "INTJ", "INTP", "ENTJ", "ENTP", "INFJ", "INFP", "ENFJ", "ENFP",
     "ISTJ", "ISFJ", "ESTJ", "ESFJ", "ISTP", "ISFP", "ESTP", "ESFP",
 ]
+
+
+QA_QUESTION_TEXTS: dict[int, str] = {
+    1: "你理想中的另一半是什么样的",
+    2: "喜欢什么运动",
+    3: "你期待的爱情是什么样子的",
+}
+
+
+class ProfileQaAnswer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question_id: Literal[1, 2, 3]
+    question: str | None = Field(default=None, max_length=64)
+    answer: str = Field(default="", max_length=300)
+
+    @field_validator("answer", mode="before")
+    @classmethod
+    def normalize_answer(cls, value: object) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    @model_validator(mode="after")
+    def fill_question_text(self) -> ProfileQaAnswer:
+        if not self.question:
+            self.question = QA_QUESTION_TEXTS[int(self.question_id)]
+        return self
+
 
 
 class SmsSendRequest(BaseModel):
@@ -112,33 +141,84 @@ class ProfileUpdateRequest(BaseModel):
     residence_city_code: str | None = Field(default=None, max_length=32)
     residence_district_code: str | None = Field(default=None, max_length=32)
     self_intro: str | None = Field(default=None, max_length=500)
+    personal_tags: list[str] | None = Field(
+        default=None, max_length=MAX_PERSONAL_TAGS,
+        description="兴趣标签，0～10 个不重复的系统或自定义选项；空数组清空，不可与旧标签字段混传",
+    )
+    custom_tag_categories: dict[str, str] | None = Field(
+        default=None,
+        description="自定义标签到当前兴趣分区 key 的映射；提交自定义标签时必填",
+    )
     interest_tags: list[str] | None = Field(
         default=None,
-        min_length=3,
+        min_length=0,
         max_length=5,
-        description="兴趣标签，传值时必须选择 3~5 个系统标签",
+        description="兼容字段：0～5 个兴趣选项，新客户端使用 personal_tags",
     )
     personality_tags: list[str] | None = Field(
         default=None,
-        min_length=3,
+        min_length=0,
         max_length=5,
-        description="性格标签，传值时必须选择 3~5 个系统标签",
+        description="兼容字段：0～5 个性格选项，新客户端使用 personal_tags",
+    )
+    qa_answers: list[ProfileQaAnswer] | None = Field(
+        default=None,
+        max_length=3,
+        description="关于我问答，question_id 仅允许 1–3，answer 最多 300 字；空数组清空",
     )
     mbti: MbtiType | None = None
     tag_selections: dict[str, list[str]] | None = Field(
         default=None,
         description="扩展标签分类映射，不替代兴趣标签和性格标签",
     )
-
-    @field_validator("interest_tags", "personality_tags")
+    @field_validator("personal_tags", "interest_tags", "personality_tags")
     @classmethod
-    def validate_tags(cls, value: list[str] | None) -> list[str] | None:
+    def validate_tags(cls, value: list[str] | None, info) -> list[str] | None:
         if value is not None:
-            if not 3 <= len(value) <= 5:
-                raise ValueError("标签数量必须为3到5个")
+            if info.field_name == "personal_tags":
+                return validate_personal_tag_selection(value)
+            if len(value) != len(set(value)):
+                raise ValueError("标签不能重复")
             if any(tag not in ALL_TAG_OPTIONS for tag in value):
-                raise ValueError("只能选择系统提供的标签")
+                raise ValueError("只能选择当前目录中的兴趣标签")
         return value
+
+    @model_validator(mode="after")
+    def validate_tag_fields(self) -> ProfileUpdateRequest:
+        if "personal_tags" in self.model_fields_set:
+            if self.personal_tags is None:
+                raise ValueError("personal_tags 不能为 null，清空请传 []")
+            if self.model_fields_set & {"interest_tags", "personality_tags", "tag_selections"}:
+                raise ValueError("personal_tags 不能与旧标签字段同时提交")
+            custom = [tag for tag in self.personal_tags if tag not in ALL_TAG_OPTIONS]
+            raw_categories = self.custom_tag_categories or {}
+            normalized_categories: dict[str, str] = {}
+            for raw_label, category in raw_categories.items():
+                label = normalize_custom_tag(raw_label)
+                if label in ALL_TAG_OPTIONS:
+                    raise ValueError("系统标签无需提交自定义分区")
+                if category not in TAG_OPTIONS_BY_CATEGORY:
+                    raise ValueError(f"不支持的自定义标签分区: {category}")
+                if label.casefold() in {item.casefold() for item in normalized_categories}:
+                    raise ValueError("自定义标签分区不能重复")
+                normalized_categories[label] = category
+            if {tag.casefold() for tag in custom} != {tag.casefold() for tag in normalized_categories}:
+                raise ValueError("每个自定义标签都必须选择所属分区，且不能提交多余分区")
+            self.custom_tag_categories = {
+                tag: next(category for label, category in normalized_categories.items() if label.casefold() == tag.casefold())
+                for tag in custom
+            }
+        elif "custom_tag_categories" in self.model_fields_set:
+            raise ValueError("custom_tag_categories 必须与 personal_tags 同时提交")
+        if any(tag in PERSONALITY_OPTIONS for tag in self.interest_tags or []):
+            raise ValueError("性格标签请通过 personal_tags 或 personality_tags 提交")
+        if any(tag not in PERSONALITY_OPTIONS for tag in self.personality_tags or []):
+            raise ValueError("personality_tags 只能包含性格标签")
+        if self.qa_answers is not None:
+            ids = [item.question_id for item in self.qa_answers]
+            if len(ids) != len(set(ids)):
+                raise ValueError("qa_answers 的 question_id 不能重复")
+        return self
 
     @field_validator("tag_selections")
     @classmethod
@@ -146,9 +226,11 @@ class ProfileUpdateRequest(BaseModel):
         if value is None:
             return value
         for category, selected in value.items():
-            options = TAG_OPTIONS_BY_CATEGORY.get(category)
-            if options is None:
+            current = TAG_OPTIONS_BY_CATEGORY.get(category, frozenset())
+            legacy = LEGACY_TAG_OPTIONS_BY_CATEGORY.get(category, frozenset())
+            if not current and not legacy:
                 raise ValueError(f"不支持的标签分类: {category}")
+            options = current | legacy
             if not selected or len(selected) > 5:
                 raise ValueError("每个标签分类最多选择5项")
             if len(selected) != len(set(selected)) or any(item not in options for item in selected):
@@ -214,6 +296,11 @@ class ProfileResponse(BaseModel):
     residence_district_code: str | None
     residence_display: str | None = None
     self_intro: str | None
+    qa_answers: list[ProfileQaAnswer] = Field(default_factory=list, description="关于我问答，不计资料完整度")
+    personal_tags: list[str] = Field(default_factory=list, description="合并去重后的有效兴趣标签")
+    custom_tags: list[str] = Field(default_factory=list, description="本人创建并通过校验的自定义标签")
+    custom_tag_categories: dict[str, str] = Field(default_factory=dict, description="自定义标签到兴趣分区 key 的映射")
+    legacy_tags: list[str] = Field(default_factory=list, description="仅本人可见的待整理旧标签，公开响应为空")
     interest_tags: list[str]
     personality_tags: list[str]
     mbti: MbtiType | None
@@ -292,8 +379,20 @@ class TagCategoryResponse(BaseModel):
     options: list[str]
 
 
+class CustomTagPolicyResponse(BaseModel):
+    enabled: bool = True
+    max_tags: int = MAX_CUSTOM_TAGS
+    min_length: int = CUSTOM_TAG_MIN_LENGTH
+    max_length: int = CUSTOM_TAG_MAX_LENGTH
+    category_required: bool = True
+
+
 class TagOptionsResponse(BaseModel):
+    max_tags: int = MAX_PERSONAL_TAGS
+    recommended_min: int = 3
     version: str
+    catalog_revision: str
+    custom: CustomTagPolicyResponse = Field(default_factory=CustomTagPolicyResponse)
     categories: list[TagCategoryResponse]
 
 

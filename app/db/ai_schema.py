@@ -137,7 +137,8 @@ AI_TABLES = {
             PRIMARY KEY (`id`),
             UNIQUE KEY `uk_ai_generation_audit_request_id` (`request_id`),
             KEY `idx_ai_generation_audit_task` (`task_id`, `created_at`),
-            KEY `idx_ai_generation_audit_scene` (`scene`, `created_at`)
+            KEY `idx_ai_generation_audit_scene` (`scene`, `created_at`),
+            KEY `idx_ai_generation_audit_retention_batch` (`created_at`, `id`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI Provider 调用最小审计，不存原始 prompt/response'
     """,
     # ============ M04 AI 画像（§10.2）============
@@ -181,6 +182,7 @@ AI_TABLES = {
             `answer_text` text NOT NULL COMMENT '原始回答，不入普通日志',
             `status` varchar(24) NOT NULL DEFAULT 'saved',
             `source_type` varchar(24) DEFAULT NULL,
+            `voice_reply_metadata` json DEFAULT NULL COMMENT '实时语音 v2 回复元数据（生成/播放状态），非语音行为 NULL',
             `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
             `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
@@ -406,6 +408,55 @@ AI_TABLES = {
             KEY `idx_ai_search_result_snapshot_generation` (`snapshot_id`, `generation`, `stale`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI 搜索结果卡片引用、满足数与证据'
     """,
+    "ai_search_suggest_publish": """
+        CREATE TABLE IF NOT EXISTS `ai_search_suggest_publish` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `user_id` bigint unsigned NOT NULL,
+            `task_id` varchar(64) NOT NULL,
+            `generation` char(64) NOT NULL COMMENT '发布代际：与读取端当前代际不一致时不得发布/读取',
+            `suggestions_json` json NOT NULL COMMENT '已归纳搜索词（≤5 条），不含原文与条目摘要',
+            `consent_snapshot_json` json DEFAULT NULL COMMENT '发布时的 search_parse 授权快照',
+            `source_revision_json` json DEFAULT NULL COMMENT '发布时的五维版本向量快照',
+            `status` varchar(24) NOT NULL DEFAULT 'staged' COMMENT 'staged/published/superseded',
+            `staged_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `published_at` datetime DEFAULT NULL,
+            `expires_at` datetime NOT NULL COMMENT '发布后 TTL（staged 行由清理按期回收）',
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_ai_search_suggest_publish_task` (`task_id`),
+            KEY `idx_ai_search_suggest_publish_user` (`user_id`, `status`),
+            KEY `idx_ai_search_suggest_publish_expires` (`expires_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI 猜你喜欢建议的待发布暂存与发布证据'
+    """,
+    "ai_profile_card_draft": """
+        CREATE TABLE IF NOT EXISTS `ai_profile_card_draft` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `draft_id` varchar(64) NOT NULL,
+            `user_id` bigint unsigned NOT NULL,
+            `task_id` varchar(64) DEFAULT NULL,
+            `source_revision_id` bigint unsigned DEFAULT NULL,
+            `status` varchar(24) NOT NULL DEFAULT 'queued' COMMENT 'queued/running/ready/partial/applied/discarded/failed',
+            `expected_revision` int unsigned NOT NULL DEFAULT '1' COMMENT '乐观锁，单调递增',
+            `fields_json` json DEFAULT NULL COMMENT '受控草稿字段，不含事实栏与原文 prompt',
+            `prompt_version` varchar(32) DEFAULT NULL,
+            `schema_version` varchar(32) NOT NULL DEFAULT 'profile-card-summarize-v1',
+            `model_name` varchar(64) DEFAULT NULL,
+            `token_cost` decimal(10,6) DEFAULT NULL,
+            `applied_meta` json DEFAULT NULL COMMENT '采用痕迹：AI 生成 / 经用户修改，不 ALTER user_profile',
+            `last_operation_idempotency_key` varchar(128) DEFAULT NULL,
+            `last_operation_request_digest` char(64) DEFAULT NULL,
+            `last_operation_response_json` json DEFAULT NULL,
+            `generated_at` datetime DEFAULT NULL,
+            `applied_at` datetime DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_ai_profile_card_draft_id` (`draft_id`),
+            KEY `idx_ai_profile_card_draft_user_status` (`user_id`, `status`, `updated_at`),
+            KEY `idx_ai_profile_card_draft_task` (`task_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='成稿反哺资料卡开放文本草稿'
+    """,
     "ai_feature_projection": """
         CREATE TABLE IF NOT EXISTS `ai_feature_projection` (
             `id` bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -443,7 +494,7 @@ AI_TABLES = {
             `snapshot_id` varchar(64) NOT NULL,
             `viewer_user_id` bigint unsigned NOT NULL,
             `target_user_id` bigint unsigned NOT NULL,
-            `algorithm_version` varchar(32) NOT NULL DEFAULT 'compatibility-rule-v1',
+            `algorithm_version` varchar(32) NOT NULL DEFAULT 'compatibility-rule-v2',
             `snapshot_hash` char(64) NOT NULL,
             `status` varchar(24) NOT NULL DEFAULT 'ready' COMMENT 'ready/stale/blocked/coverage_insufficient',
             `score_semantics` varchar(48) NOT NULL DEFAULT 'rule_based_reference_shadow',
@@ -523,7 +574,8 @@ AI_TABLES = {
             `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
             UNIQUE KEY `uk_voice_transcript_task` (`task_id`),
-            KEY `idx_voice_transcript_owner` (`owner_user_id`, `created_at`)
+            KEY `idx_voice_transcript_owner` (`owner_user_id`, `created_at`),
+            KEY `idx_voice_transcript_retention` (`created_at`, `id`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='语音转写结果'
     """,
     # ============ Phase 4 P4-01：投影准入位（search/compat/recommend 硬过滤）============
@@ -646,6 +698,169 @@ AI_TABLES = {
             KEY `idx_ai_profile_preview_user_subject` (`user_id`, `subject`, `status`),
             KEY `idx_ai_profile_preview_draft_status` (`draft_id`, `status`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='墨相师独立画像预览(Phase 3 P3-01)'
+    """,
+    # Memory Kernel Core：账本与当前视图必须与 API 一起初始化。旧库在
+    # CREATE TABLE IF NOT EXISTS 下会补齐缺失表；现有表的增量字段仍由迁移处理。
+    "ai_memory_owner_sequence": """
+        CREATE TABLE IF NOT EXISTS `ai_memory_owner_sequence` (
+            `owner_user_id` bigint unsigned NOT NULL,
+            `next_seq` bigint unsigned NOT NULL DEFAULT '1',
+            PRIMARY KEY (`owner_user_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI记忆所有者序列'
+    """,
+    "ai_memory_event": """
+        CREATE TABLE IF NOT EXISTS `ai_memory_event` (
+            `event_id` varchar(64) NOT NULL,
+            `owner_user_id` bigint unsigned NOT NULL,
+            `server_seq` bigint unsigned NOT NULL,
+            `subject` varchar(24) NOT NULL,
+            `namespace` varchar(64) NOT NULL,
+            `node_type` varchar(24) NOT NULL,
+            `event_type` varchar(64) NOT NULL,
+            `payload_json` json NOT NULL,
+            `source_kind` varchar(32) NOT NULL,
+            `source_turn_id` varchar(128) DEFAULT NULL,
+            `source_ref` varchar(512) DEFAULT NULL,
+            `source_quote` varchar(512) DEFAULT NULL,
+            `causal_event_ids_json` json NOT NULL,
+            `consent_scope` varchar(64) NOT NULL,
+            `idempotency_key` varchar(128) NOT NULL,
+            `occurred_at` datetime NOT NULL,
+            PRIMARY KEY (`event_id`),
+            UNIQUE KEY `uk_ai_memory_event_owner_seq` (`owner_user_id`, `server_seq`),
+            UNIQUE KEY `uk_ai_memory_event_owner_idempotency` (`owner_user_id`, `idempotency_key`),
+            KEY `idx_ai_memory_event_owner_seq` (`owner_user_id`, `server_seq`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI记忆事件账本'
+    """,
+    "ai_memory_observation": """
+        CREATE TABLE IF NOT EXISTS `ai_memory_observation` (
+            `observation_id` varchar(80) NOT NULL,
+            `owner_user_id` bigint unsigned NOT NULL,
+            `subject` varchar(24) NOT NULL,
+            `namespace` varchar(64) NOT NULL,
+            `canonical_key` varchar(255) NOT NULL,
+            `dimension` varchar(64) DEFAULT NULL,
+            `value_json` json DEFAULT NULL,
+            `confidence` decimal(5,4) DEFAULT NULL,
+            `fact_kind` varchar(32) DEFAULT NULL,
+            `status` varchar(24) NOT NULL,
+            `source_kind` varchar(32) NOT NULL,
+            `source_quote` varchar(512) DEFAULT NULL,
+            `last_event_id` varchar(64) NOT NULL,
+            `last_event_seq` bigint unsigned NOT NULL,
+            PRIMARY KEY (`observation_id`),
+            KEY `idx_ai_memory_observation_owner_key` (`owner_user_id`, `subject`, `namespace`, `canonical_key`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI记忆观察视图'
+    """,
+    "ai_memory_claim": """
+        CREATE TABLE IF NOT EXISTS `ai_memory_claim` (
+            `claim_id` varchar(80) NOT NULL,
+            `owner_user_id` bigint unsigned NOT NULL,
+            `subject` varchar(24) NOT NULL,
+            `namespace` varchar(64) NOT NULL,
+            `canonical_key` varchar(255) NOT NULL,
+            `dimension` varchar(64) DEFAULT NULL,
+            `value_json` json DEFAULT NULL,
+            `confidence` decimal(5,4) DEFAULT NULL,
+            `stability` decimal(5,4) DEFAULT NULL,
+            `importance` decimal(5,4) DEFAULT NULL,
+            `constraint_type` varchar(32) DEFAULT NULL,
+            `importance_confirmed` tinyint NOT NULL DEFAULT '0',
+            `fact_kind` varchar(32) DEFAULT NULL,
+            `status` varchar(24) NOT NULL,
+            `source_kind` varchar(32) NOT NULL,
+            `last_event_id` varchar(64) NOT NULL,
+            `last_event_seq` bigint unsigned NOT NULL,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`claim_id`),
+            UNIQUE KEY `uk_ai_memory_claim_canonical` (`owner_user_id`, `subject`, `namespace`, `canonical_key`),
+            KEY `idx_ai_memory_claim_owner_seq` (`owner_user_id`, `last_event_seq`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI记忆主张视图'
+    """,
+    "ai_memory_insight": """
+        CREATE TABLE IF NOT EXISTS `ai_memory_insight` (
+            `insight_id` varchar(80) NOT NULL,
+            `owner_user_id` bigint unsigned NOT NULL,
+            `subject` varchar(24) NOT NULL,
+            `namespace` varchar(64) NOT NULL,
+            `summary` varchar(200) NOT NULL,
+            `claim_ids_json` json NOT NULL,
+            `confidence` decimal(5,4) DEFAULT NULL,
+            `status` varchar(24) NOT NULL,
+            `last_event_id` varchar(64) NOT NULL,
+            `last_event_seq` bigint unsigned NOT NULL,
+            PRIMARY KEY (`insight_id`),
+            KEY `idx_ai_memory_insight_owner_seq` (`owner_user_id`, `last_event_seq`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI记忆洞察视图'
+    """,
+    "ai_memory_state": """
+        CREATE TABLE IF NOT EXISTS `ai_memory_state` (
+            `state_id` varchar(80) NOT NULL,
+            `owner_user_id` bigint unsigned NOT NULL,
+            `subject` varchar(24) NOT NULL,
+            `namespace` varchar(64) NOT NULL,
+            `canonical_key` varchar(255) NOT NULL,
+            `value_json` json DEFAULT NULL,
+            `valid_until` datetime NOT NULL,
+            `confidence` decimal(5,4) DEFAULT NULL,
+            `status` varchar(24) NOT NULL,
+            `last_event_id` varchar(64) NOT NULL,
+            `last_event_seq` bigint unsigned NOT NULL,
+            PRIMARY KEY (`state_id`),
+            KEY `idx_ai_memory_state_owner_valid` (`owner_user_id`, `valid_until`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI记忆状态视图'
+    """,
+    "ai_memory_suppression": """
+        CREATE TABLE IF NOT EXISTS `ai_memory_suppression` (
+            `suppression_id` varchar(80) NOT NULL,
+            `owner_user_id` bigint unsigned NOT NULL,
+            `subject` varchar(24) NOT NULL,
+            `namespace` varchar(64) NOT NULL,
+            `canonical_key` varchar(255) NOT NULL,
+            `reason` varchar(255) DEFAULT NULL,
+            `status` varchar(24) NOT NULL,
+            `last_event_id` varchar(64) NOT NULL,
+            `last_event_seq` bigint unsigned NOT NULL,
+            PRIMARY KEY (`suppression_id`),
+            UNIQUE KEY `uk_ai_memory_suppression_canonical` (`owner_user_id`, `subject`, `namespace`, `canonical_key`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI记忆屏蔽视图'
+    """,
+    "ai_memory_projection_grant": """
+        CREATE TABLE IF NOT EXISTS `ai_memory_projection_grant` (
+            `grant_id` varchar(96) NOT NULL,
+            `owner_user_id` bigint unsigned NOT NULL,
+            `function_key` varchar(64) NOT NULL,
+            `purpose` varchar(64) NOT NULL,
+            `data_category` varchar(64) NOT NULL,
+            `status` varchar(24) NOT NULL,
+            `consent_snapshot_id` varchar(96) NOT NULL,
+            `policy_revision` varchar(96) NOT NULL,
+            `granted_at` datetime NOT NULL,
+            `revoked_at` datetime DEFAULT NULL,
+            PRIMARY KEY (`grant_id`),
+            UNIQUE KEY `uk_ai_memory_projection_grant_scope` (`owner_user_id`, `function_key`, `purpose`, `data_category`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI记忆投影授权'
+    """,
+    "ai_memory_projection": """
+        CREATE TABLE IF NOT EXISTS `ai_memory_projection` (
+            `projection_id` varchar(96) NOT NULL,
+            `owner_user_id` bigint unsigned NOT NULL,
+            `function_key` varchar(64) NOT NULL,
+            `purpose` varchar(64) NOT NULL,
+            `data_category` varchar(64) NOT NULL,
+            `subject` varchar(24) NOT NULL,
+            `projection_version` bigint unsigned NOT NULL,
+            `projection_input_hash` char(64) NOT NULL,
+            `status` varchar(24) NOT NULL,
+            `invalidated_at` datetime DEFAULT NULL,
+            `invalidated_reason` varchar(128) DEFAULT NULL,
+            `entries_json` json NOT NULL,
+            `policy_revision` varchar(96) NOT NULL,
+            `consent_snapshot_id` varchar(96) NOT NULL,
+            `built_at` datetime NOT NULL,
+            PRIMARY KEY (`projection_id`),
+            KEY `idx_ai_memory_projection_owner_scope` (`owner_user_id`, `function_key`, `purpose`, `data_category`, `status`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='AI记忆投影'
     """,
 }
 
@@ -1020,6 +1235,17 @@ AI_TASK10_REQUIRED_COLUMNS: dict[str, dict[str, str]] = {
     },
 }
 
+# Retention scans filter and order by these columns.  The id/event_id suffix
+# makes each bounded batch deterministic while retaining index-order reads.
+AI_RETENTION_INDEXES: dict[str, dict[str, tuple[str, ...]]] = {
+    "voice_transcript": {
+        "idx_voice_transcript_retention": ("created_at", "id"),
+    },
+    "ai_generation_audit": {
+        "idx_ai_generation_audit_retention_batch": ("created_at", "id"),
+    },
+}
+
 
 def ensure_ai_legacy_columns(cursor: Any) -> None:
     """Add Task 2's additive AI columns during legacy bootstrap.
@@ -1039,6 +1265,7 @@ def ensure_ai_legacy_columns(cursor: Any) -> None:
                 cursor.execute(
                     f"ALTER TABLE `{table_name}` ADD COLUMN {column_def}"
                 )
+
 
     for table_name, required_columns in AI_TASK10_REQUIRED_COLUMNS.items():
         try:
@@ -1091,6 +1318,22 @@ def ensure_ai_legacy_columns(cursor: Any) -> None:
     except Exception:  # noqa: BLE001 - legacy bootstrap is best effort
         # The reviewed migration reports and classifies any incompatible data.
         return
+
+
+def ensure_ai_retention_indexes(cursor: Any) -> None:
+    """Idempotently add Task9 cleanup indexes to databases created before them."""
+    for table_name, required_indexes in AI_RETENTION_INDEXES.items():
+        try:
+            cursor.execute(f"SHOW INDEX FROM `{table_name}`")
+            existing = {str(row["Key_name"]) for row in cursor.fetchall()}
+        except Exception:  # noqa: BLE001, S112 - legacy bootstrap is best effort
+            continue
+        for index_name, columns in required_indexes.items():
+            if index_name not in existing:
+                column_sql = ", ".join(f"`{column}`" for column in columns)
+                cursor.execute(
+                    f"ALTER TABLE `{table_name}` ADD KEY `{index_name}` ({column_sql})"
+                )
 
 
 def ensure_ai_consent_unique_key(cursor: Any) -> None:

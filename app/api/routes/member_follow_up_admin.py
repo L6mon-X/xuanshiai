@@ -1,33 +1,77 @@
 """Member CRM follow-up and behavior routes."""
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Path, Query, Response, UploadFile
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import CurrentMatchmakerAdmin, get_current_matchmaker_admin
 from app.db.session import get_db
-from app.schemas.member_follow_up_admin import MemberBehaviorItem, MemberBehaviorPage, MemberFollowUp, MemberFollowUpCreate, MemberFollowUpPage
+from app.schemas.member_follow_up_admin import (
+    MemberBehaviorItem,
+    MemberBehaviorPage,
+    MemberFollowUp,
+    MemberFollowUpCreate,
+    MemberFollowUpImportResult,
+    MemberFollowUpListPage,
+    MemberFollowUpPage,
+    MemberFollowUpSummary,
+)
+from app.services import member_follow_up_admin as service
 
 router = APIRouter(prefix="/admin/members")
 
+# 「历史跟进」导入模板 MIME
+_XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
-@router.get("/follow-ups")
+
+@router.get("/follow-ups", response_model=MemberFollowUpListPage, summary="跟进全览")
 async def all_follow_ups(
     page: int = Query(1, ge=1, le=1000),
     page_size: int = Query(20, ge=1, le=100),
-    search: str | None = Query(None, max_length=64),
+    keyword: str | None = Query(None, max_length=64, description="会员昵称/姓名/手机号/会员编号"),
+    intention_level: int | None = Query(None, ge=1, le=3, description="客户意向 1低 2中 3高"),
+    start_date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="跟进时间起（含）"),
+    end_date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="跟进时间止（含）"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
-) -> dict:
-    params = {"limit": page_size, "offset": (page - 1) * page_size}
-    where = "1=1"
-    if search:
-        where += " AND (u.nickname LIKE CONCAT('%', :search, '%') OR u.phone LIKE CONCAT('%', :search, '%'))"
-        params["search"] = search
-    base = "FROM member_follow_up f JOIN users u ON u.id = f.user_id"
-    rows = await db.execute(text(f"SELECT f.id, f.user_id, u.nickname, f.method, f.content, f.next_follow_at, f.created_by, f.created_at {base} WHERE {where} ORDER BY f.id DESC LIMIT :limit OFFSET :offset"), params)
-    total = int((await db.scalar(text(f"SELECT COUNT(*) {base} WHERE {where}"), {k: v for k, v in params.items() if k not in ('limit', 'offset')})) or 0)
-    return {"items": [dict(row) for row in rows.mappings().all()], "page": page, "page_size": page_size, "total": total, "has_more": page * page_size < total}
+) -> MemberFollowUpListPage:
+    current.require("matchmaker.member.read")
+    return await service.list_follow_ups(
+        db, page, page_size, keyword, intention_level, start_date, end_date
+    )
+
+
+@router.get("/follow-ups/summary", response_model=MemberFollowUpSummary, summary="跟进全览时间统计")
+async def follow_up_summary(
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MemberFollowUpSummary:
+    current.require("matchmaker.member.read")
+    return await service.follow_up_summary(db)
+
+
+@router.get("/follow-ups/import-template", summary="下载历史跟进导入模板")
+async def follow_up_import_template(
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+) -> Response:
+    current.require("matchmaker.member.read")
+    return Response(
+        content=service.build_import_template(),
+        media_type=_XLSX_MEDIA_TYPE,
+        headers={"Content-Disposition": 'attachment; filename="follow-up-import-template.xlsx"'},
+    )
+
+
+@router.post("/follow-ups/import", response_model=MemberFollowUpImportResult, summary="批量导入历史跟进")
+async def follow_up_import(
+    file: UploadFile = File(..., description="按模板填写的 .xlsx 文件"),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MemberFollowUpImportResult:
+    current.require("matchmaker.member.manage")
+    return await service.import_follow_ups(db, current.account.id, await file.read(), file.filename or "")
 
 
 async def _ensure_member(db: AsyncSession, user_id: int) -> None:
@@ -37,15 +81,13 @@ async def _ensure_member(db: AsyncSession, user_id: int) -> None:
 
 @router.get("/{member_id}/follow-ups", response_model=MemberFollowUpPage, summary="查询会员跟进记录")
 async def list_follow_ups(member_id: int = Path(..., ge=1), page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=100), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> MemberFollowUpPage:
-    await _ensure_member(db, member_id)
-    params = {"user_id": member_id, "limit": page_size, "offset": (page - 1) * page_size}
-    rows = await db.execute(text("SELECT id, user_id, method, content, next_follow_at, created_by, created_at FROM member_follow_up WHERE user_id = :user_id ORDER BY id DESC LIMIT :limit OFFSET :offset"), params)
-    total = int((await db.scalar(text("SELECT COUNT(*) FROM member_follow_up WHERE user_id = :user_id"), {"user_id": member_id})) or 0)
-    return MemberFollowUpPage(items=[MemberFollowUp(**dict(row)) for row in rows.mappings().all()], page=page, page_size=page_size, total=total, has_more=page * page_size < total)
+    current.require("matchmaker.member.read")
+    return await service.get_member_follow_ups(db, member_id, page, page_size)
 
 
 @router.post("/{member_id}/follow-ups", response_model=MemberFollowUp, status_code=201, summary="新增会员跟进记录")
 async def create_follow_up(member_id: int = Path(..., ge=1), body: MemberFollowUpCreate = ..., current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> MemberFollowUp:
+    current.require("matchmaker.member.manage")
     await _ensure_member(db, member_id)
     result = await db.execute(text("INSERT INTO member_follow_up (user_id, method, content, next_follow_at, created_by) VALUES (:user_id, :method, :content, :next_follow_at, :created_by)"), {**body.model_dump(), "user_id": member_id, "created_by": current.account.id})
     follow_id = int(result.lastrowid)
@@ -53,6 +95,45 @@ async def create_follow_up(member_id: int = Path(..., ge=1), body: MemberFollowU
     await db.commit()
     row = (await db.execute(text("SELECT id, user_id, method, content, next_follow_at, created_by, created_at FROM member_follow_up WHERE id = :id"), {"id": follow_id})).mappings().one()
     return MemberFollowUp(**dict(row))
+
+
+@router.post("/{member_id}/follow-ups/media", response_model=MemberFollowUp, status_code=201, summary="新增跟进记录（文字+图片+录音）")
+async def create_follow_up_with_media(
+    member_id: int = Path(..., ge=1),
+    method: str = Form(..., description="跟进方式 PHONE/WECHAT/VISIT/OTHER"),
+    content: str = Form("", description="跟进文字，≤2000 字；与图片/录音至少提供一项"),
+    next_follow_at: str | None = Form(None, description="下次跟进时间 ISO 格式，可选"),
+    matchmaker_id: int | None = Form(None, ge=1, description="跟进红娘的后台账号ID；缺省记录当前操作账号"),
+    voice_duration_sec: int | None = Form(None, ge=0, le=3600, description="录音时长秒，可选"),
+    images: list[UploadFile] | None = File(None, description="跟进图片，JPG/PNG，最多9张，单张≤5MB"),
+    voice: UploadFile | None = File(None, description="跟进录音，mp3/wav/m4a/aac/ogg/amr/webm，≤20MB"),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MemberFollowUp:
+    """支持文字与图片、录音附件的新增跟进；红娘归属可指定后台账号，缺省为当前操作人。"""
+    current.require("matchmaker.member.manage")
+    if method not in {"PHONE", "WECHAT", "VISIT", "OTHER"}:
+        raise HTTPException(422, detail="跟进方式必须为 PHONE/WECHAT/VISIT/OTHER")
+    if len(content) > 2000:
+        raise HTTPException(422, detail="跟进内容不能超过 2000 字")
+    parsed_next: datetime | None = None
+    if next_follow_at:
+        try:
+            parsed_next = datetime.fromisoformat(next_follow_at)
+        except ValueError:
+            raise HTTPException(422, detail="下次跟进时间格式不正确，应为 ISO 日期时间")
+    return await service.create_follow_up_with_media(
+        db,
+        member_id,
+        method,
+        content,
+        parsed_next,
+        matchmaker_id,
+        images,
+        voice,
+        voice_duration_sec,
+        current.account.id,
+    )
 
 
 @router.get("/{member_id}/behavior", response_model=MemberBehaviorPage, summary="查询会员行为流水")

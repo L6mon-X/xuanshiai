@@ -14,8 +14,19 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.profile_tags import TAG_OPTIONS_BY_CATEGORY
+from app.core.profile_tags import (
+    CUSTOM_TAG_CATEGORY_KEY,
+    CUSTOM_TAG_CATEGORY_MAP_KEY,
+    DISCOVERY_CITY_OPTIONS,
+    normalize_custom_tag_categories,
+    personal_tags,
+)
 from app.core.redis import consume_daily, get_daily_used, refund_daily
+from app.services.membership import (
+    active_membership_exists_for_column_sql,
+    get_active_membership_row,
+    has_active_membership,
+)
 from app.schemas.discovery import (
     ApplicationCreateRequest,
     ApplicationPage,
@@ -55,17 +66,22 @@ from app.services.candidate_visibility import (
     VisibilityScene,
 )
 from app.services.notifications import emit_notification
-from app.services.profile import _calculate_age, _json_dict, _json_list, get_profile
+from app.services.profile import _calculate_age, _json_dict, _json_list, _json_object, get_profile
 from app.services.quotas import consume_extra
 from app.services.admin_config import get_runtime_value
 from app.services.restrictions import ensure_user_allowed
+from app.services.runtime_config import (
+    match_line_permissions,
+    platform_browse_open,
+    platform_maintenance_message,
+)
 
 logger = logging.getLogger(__name__)
 candidate_visibility_service = CandidateVisibilityService()
 candidate_query_service = CandidateQueryService(secret_key=settings.secret_key)
 
 # 旧 match_score/match_reason 的算法版本（统一方案 §9.1/§10.4）：语义恒为
-# legacy-rule-v1；新兼容度（compatibility-rule-v1）只写 ai_compatibility_snapshot，
+# legacy-rule-v1；新兼容度（compatibility-rule-v2）只写 ai_compatibility_snapshot，
 # 不触碰旧字段或推荐排序。
 LEGACY_MATCH_ALGORITHM_VERSION = "legacy-rule-v1"
 
@@ -94,10 +110,9 @@ CARD_SELECT = """
            COALESCE(pr.show_profile, 1) AS show_profile,
            COALESCE(pr.who_can_see_me, 1) AS who_can_see_me,
            COALESCE(pr.match_status, 1) AS match_status,
-           EXISTS (SELECT 1 FROM user_membership m
-                   WHERE m.user_id = u.id AND m.status = 1
-                     AND (m.start_at IS NULL OR m.start_at <= UTC_TIMESTAMP())
-                     AND (m.end_at IS NULL OR m.end_at > UTC_TIMESTAMP())) AS is_vip,
+           """ + active_membership_exists_for_column_sql(
+               membership_alias="m", user_id_column="u.id"
+           ) + """ AS is_vip,
            EXISTS (SELECT 1 FROM user_boost b
                    WHERE b.target_user_id = u.id AND b.status = 1
                      AND (b.start_at IS NULL OR b.start_at <= UTC_TIMESTAMP())
@@ -141,14 +156,7 @@ async def _viewer_context(db: AsyncSession, user_id: int) -> dict[str, Any]:
 
 
 async def _is_vip(db: AsyncSession, user_id: int) -> bool:
-    result = await db.execute(
-        text("""SELECT EXISTS (SELECT 1 FROM user_membership
-                   WHERE user_id = :user_id AND status = 1
-                     AND (start_at IS NULL OR start_at <= UTC_TIMESTAMP())
-                     AND (end_at IS NULL OR end_at > UTC_TIMESTAMP()))"""),
-        {"user_id": user_id},
-    )
-    return bool(result.scalar())
+    return await has_active_membership(db, user_id)
 
 
 def _visibility_predicate(
@@ -216,7 +224,18 @@ def _all_tags(row: dict[str, Any]) -> set[str]:
     tags = set(_json_list(row.get("interest_tags"))) | set(_json_list(row.get("personality_tags")))
     for values in _json_dict(row.get("tags")).values():
         tags.update(values)
-    return tags
+    stored_custom = _stored_custom_tags(row)
+    return set(personal_tags(list(tags), stored_custom))
+
+
+def _stored_custom_tags(row: dict[str, Any]) -> list[str]:
+    stored = _json_object(row.get("tags"))
+    values = stored.get(CUSTOM_TAG_CATEGORY_KEY, [])
+    mapping = normalize_custom_tag_categories(
+        [str(item) for item in values] if isinstance(values, list) else [],
+        stored.get(CUSTOM_TAG_CATEGORY_MAP_KEY),
+    )
+    return list(mapping)
 
 
 def _candidate_score(viewer: dict[str, Any], candidate: dict[str, Any]) -> tuple[float, str]:
@@ -286,7 +305,8 @@ def _card(row: dict[str, Any], score: float, reason: str, detail_locked: bool = 
         is_married=row.get("is_married") if not detail_locked else None,
         online_status=0 if row.get("hide_online_status") else int(row.get("online_status") or 0),
         mbti=row.get("mbti") if not detail_locked else None,
-        interest_tags=_json_list(row.get("interest_tags"))[:5] if not detail_locked else [],
+        personal_tags=personal_tags(_json_list(row.get("interest_tags")) + _json_list(row.get("personality_tags")), _stored_custom_tags(row))[:10] if not detail_locked else [],
+        interest_tags=personal_tags(_json_list(row.get("interest_tags")), _stored_custom_tags(row))[:5] if not detail_locked else [],
         certification_tags=certification_tags,
         match_score=score,
         match_reason=reason,
@@ -337,7 +357,12 @@ def _filter_sql(filters: DiscoveryFilters, params: dict[str, Any]) -> list[str]:
         clauses.append("p.income <= :filter_income_max")
         params["filter_income_max"] = filters.income_max
     if filters.pure_free:
-        clauses.append("NOT EXISTS (SELECT 1 FROM user_membership m2 WHERE m2.user_id = u.id AND m2.status = 1 AND (m2.end_at IS NULL OR m2.end_at > UTC_TIMESTAMP()))")
+        clauses.append(
+            "NOT "
+            + active_membership_exists_for_column_sql(
+                membership_alias="m2", user_id_column="u.id"
+            )
+        )
         clauses.append("NOT EXISTS (SELECT 1 FROM user_boost b2 WHERE b2.target_user_id = u.id AND b2.status = 1 AND (b2.end_at IS NULL OR b2.end_at > UTC_TIMESTAMP()))")
     return clauses
 
@@ -511,6 +536,8 @@ async def _fetch_rows(
 
 
 async def get_discovery_page(db: AsyncSession, viewer_id: int, filters: DiscoveryFilters, *, plaza: bool) -> DiscoveryPage:
+    if not await platform_browse_open(db):
+        raise HTTPException(403, detail=await platform_maintenance_message(db))
     viewer = await _viewer_context(db, viewer_id)
     if viewer["completion_score"] < 100:
         raise HTTPException(403, detail="请先完善资料后再进入推荐")
@@ -538,6 +565,8 @@ async def get_discovery_page(db: AsyncSession, viewer_id: int, filters: Discover
 
 
 async def search_discovery(db: AsyncSession, viewer_id: int, query: DiscoverySearch) -> DiscoveryPage:
+    if not await platform_browse_open(db):
+        raise HTTPException(403, detail=await platform_maintenance_message(db))
     filters = DiscoveryFilters(
         cursor=query.cursor,
         page=query.page,
@@ -576,11 +605,22 @@ async def search_discovery(db: AsyncSession, viewer_id: int, query: DiscoverySea
 
 
 async def get_filter_options() -> FilterOptionsResponse:
+    # education_levels 必须与 user_profile.education_level 的存储域一致：
+    # 1=高中及以下 … 5=博士（档案编辑写入域，utils 编号即 educationOptions
+    # 数组下标；_AI_SYNC_EDU_MAP 目标域同）。此前 1=博士…5=高中 与存储域
+    # 方向相反——education_min 的 SQL 语义是 `education_level >= :min`，
+    # 反向字典会让"本科及以上"实际筛出"本科及以下"。
     return FilterOptionsResponse(
         genders=[{"value": 1, "label": "男"}, {"value": 2, "label": "女"}],
         marriage_statuses=[{"value": 1, "label": "未婚"}, {"value": 2, "label": "离异"}, {"value": 3, "label": "丧偶"}],
-        education_levels=[{"value": 1, "label": "博士"}, {"value": 2, "label": "硕士"}, {"value": 3, "label": "本科"}, {"value": 4, "label": "大专"}, {"value": 5, "label": "高中"}],
-        cities=sorted(TAG_OPTIONS_BY_CATEGORY["city"]),
+        education_levels=[
+            {"value": 1, "label": "高中及以下"},
+            {"value": 2, "label": "大专"},
+            {"value": 3, "label": "本科"},
+            {"value": 4, "label": "硕士"},
+            {"value": 5, "label": "博士"},
+        ],
+        cities=sorted(DISCOVERY_CITY_OPTIONS),
     )
 
 
@@ -623,9 +663,10 @@ async def _quota_key(prefix: str, user_id: int) -> str:
 async def _quota_limit(db: AsyncSession, user_id: int, is_vip: bool) -> int:
     if not is_vip:
         return int(await get_runtime_value(db, "platform_permissions", "free_browse_daily_limit", settings.browse_daily_limit))
-    result = await db.execute(text("SELECT p.rights FROM user_membership m LEFT JOIN config_membership_package p ON p.code=m.package_type WHERE m.user_id=:user_id AND m.status=1 AND (m.start_at IS NULL OR m.start_at<=UTC_TIMESTAMP()) AND (m.end_at IS NULL OR m.end_at>UTC_TIMESTAMP()) ORDER BY m.end_at DESC LIMIT 1"), {"user_id": user_id})
-    row = result.first()
-    value = row[0] if row else None
+    row = await get_active_membership_row(db, user_id)
+    if not row:
+        return int(await get_runtime_value(db, "platform_permissions", "free_browse_daily_limit", settings.browse_daily_limit))
+    value = row["rights"]
     if isinstance(value, str):
         try:
             value = json.loads(value)
@@ -665,6 +706,8 @@ async def _record_browse(db: AsyncSession, viewer_id: int, target_id: int) -> No
 
 
 async def view_profile(db: AsyncSession, viewer_id: int, target_id: int) -> PublicProfileResponse:
+    if not await platform_browse_open(db):
+        raise HTTPException(403, detail=await platform_maintenance_message(db))
     if viewer_id == target_id:
         raise HTTPException(422, detail="不能浏览自己的名片")
     await _ensure_target(db, viewer_id, target_id)
@@ -929,13 +972,26 @@ async def _notify(db: AsyncSession, user_id: int, notification_type: str, title:
 
 
 async def _consume_apply_quota(db: AsyncSession, viewer_id: int, vip: bool) -> bool:
+    key = await _quota_key("apply", viewer_id)
+    # 权限配置(卡片4) line.times > 0 时为全局统一每日上限，覆盖 VIP/免费两套旧限额
+    line_perm = await match_line_permissions(db)
+    unified = line_perm.get("apply_daily")
+    if unified and int(unified) > 0:
+        if not await consume_daily(key, int(unified)):
+            if await consume_extra(db, viewer_id, "apply", "积分兑换申请次数"):
+                return False
+            raise HTTPException(429, detail="今日认识申请次数已用完")
+        return True
     free_limit = int(await get_runtime_value(db, "platform_permissions", "free_apply_daily_limit", settings.apply_daily_free_limit))
     vip_limit = int(await get_runtime_value(db, "platform_permissions", "vip_apply_daily_limit", settings.apply_daily_vip_limit))
     limit = vip_limit if vip else free_limit
     if vip:
-        result = await db.execute(text("SELECT p.rights FROM user_membership m LEFT JOIN config_membership_package p ON p.code=m.package_type WHERE m.user_id=:user_id AND m.status=1 AND (m.start_at IS NULL OR m.start_at<=UTC_TIMESTAMP()) AND (m.end_at IS NULL OR m.end_at>UTC_TIMESTAMP()) ORDER BY m.end_at DESC LIMIT 1"), {"user_id": viewer_id})
-        value = result.first()
-        rights = value[0] if value else None
+        membership = await get_active_membership_row(db, viewer_id)
+        if membership is None:
+            limit = free_limit
+            rights = None
+        else:
+            rights = membership["rights"]
         if isinstance(rights, str):
             try:
                 rights = json.loads(rights)
@@ -944,7 +1000,7 @@ async def _consume_apply_quota(db: AsyncSession, viewer_id: int, vip: bool) -> b
         if isinstance(rights, dict):
             limit = free_limit + int(rights.get("apply_bonus") or 0)
 
-    if not await consume_daily(await _quota_key("apply", viewer_id), limit):
+    if not await consume_daily(key, limit):
         if await consume_extra(db, viewer_id, "apply", "积分兑换申请次数"):
             return False
         raise HTTPException(429, detail="今日认识申请次数已用完")
@@ -968,8 +1024,16 @@ async def create_application(db: AsyncSession, viewer_id: int, target_id: int, r
         raise HTTPException(403, detail="请先完善资料后再申请认识")
     if not viewer.get("phone"):
         raise HTTPException(403, detail="请先绑定手机号")
-    if viewer.get("realname_status") != 2:
+    line_perm = await match_line_permissions(db)
+    # 卡片4「没有实名认证是否允许发起牵线」：no/未配置 = 禁止（与旧行为一致）
+    if viewer.get("realname_status") != 2 and line_perm.get("realname_allowed") is not True:
         raise HTTPException(403, detail="请先完成实名认证")
+    # 卡片4「没有实名认证的是否允许被牵线」：no = 禁止向未实名对象发起；未配置 = 沿用旧行为(允许)
+    if line_perm.get("be_linked_allowed") is False:
+        target_auth = await db.execute(text("SELECT COALESCE(realname_status, 0) AS realname_status FROM user_auth WHERE user_id = :target_id"), {"target_id": target_id})
+        target_status = int((target_auth.mappings().first() or {}).get("realname_status") or 0)
+        if target_status != 2:
+            raise HTTPException(403, detail="对方尚未完成实名认证，暂时无法发起认识申请")
     existing = await db.execute(text("SELECT id, status FROM match_apply WHERE ((from_user_id = :from_id AND to_user_id = :to_id) OR (from_user_id = :to_id AND to_user_id = :from_id)) AND status IN (0, 1) LIMIT 1"), {"from_id": viewer_id, "to_id": target_id})
     if existing.first():
         raise HTTPException(409, detail="双方已有进行中的认识申请或匹配")
@@ -1041,8 +1105,14 @@ async def list_applications(db: AsyncSession, viewer_id: int, incoming: bool, pa
     items = []
     for row in result.mappings().all():
         data = dict(row)
-        data["from_user"] = RelationUserSummary(user_id=data.pop("from_user_id"), nickname=data.pop("from_nickname"), avatar=data.pop("from_avatar"), age=_calculate_age(data.pop("from_birthday")) if data.get("from_birthday") else None, city_code=data.pop("from_city_code"))
-        data["to_user"] = RelationUserSummary(user_id=data.pop("to_user_id"), nickname=data.pop("to_nickname"), avatar=data.pop("to_avatar"), age=_calculate_age(data.pop("to_birthday")) if data.get("to_birthday") else None, city_code=data.pop("to_city_code"))
+        # 响应契约同时要求顶层 from_user_id/to_user_id 与嵌套 from_user/to_user，
+        # 因此先取出 ID 再构造嵌套对象，避免 pop 之后顶层字段缺失导致校验失败。
+        from_user_id = data.pop("from_user_id")
+        to_user_id = data.pop("to_user_id")
+        data["from_user"] = RelationUserSummary(user_id=from_user_id, nickname=data.pop("from_nickname"), avatar=data.pop("from_avatar"), age=_calculate_age(data.pop("from_birthday")) if data.get("from_birthday") else None, city_code=data.pop("from_city_code"))
+        data["to_user"] = RelationUserSummary(user_id=to_user_id, nickname=data.pop("to_nickname"), avatar=data.pop("to_avatar"), age=_calculate_age(data.pop("to_birthday")) if data.get("to_birthday") else None, city_code=data.pop("to_city_code"))
+        data["from_user_id"] = from_user_id
+        data["to_user_id"] = to_user_id
         items.append(ApplicationResponse(**data))
     return ApplicationPage(items=items, page=page, page_size=page_size, total=total, has_more=page * page_size < total)
 

@@ -15,6 +15,13 @@ from app.schemas.admin_home import (
 )
 
 
+# 会员意向统计固定 9 类（与客源线索意向标签字典口径一致），无数据的类别补 0。
+MEMBER_INTENTION_CATALOG = [
+    "A类未接", "B类初步沟通", "C类深入沟通未缔结", "D类待确定到店时间",
+    "E类已确定到店", "F类预约需二邀", "G类已到店未签约", "I类已签单", "J类放弃资源",
+]
+
+
 def _money(value: object) -> Decimal:
     return Decimal(str(value or 0)).quantize(Decimal("0.01"))
 
@@ -199,11 +206,13 @@ async def member_statistics(db: AsyncSession, admin: CurrentMatchmakerAdmin, fro
         "gender": gender,
         "marriage": await users_group("CASE users.is_married WHEN 0 THEN '未婚' WHEN 1 THEN '已婚' WHEN 2 THEN '离异' WHEN 3 THEN '丧偶' ELSE '未填写' END"),
         "age": await users_group("CASE WHEN users.birthday IS NULL THEN '未填写' WHEN TIMESTAMPDIFF(YEAR, users.birthday, CURDATE()) < 26 THEN '25岁以下' WHEN TIMESTAMPDIFF(YEAR, users.birthday, CURDATE()) <= 30 THEN '26岁-30岁' WHEN TIMESTAMPDIFF(YEAR, users.birthday, CURDATE()) <= 35 THEN '31岁-35岁' WHEN TIMESTAMPDIFF(YEAR, users.birthday, CURDATE()) <= 40 THEN '36岁-40岁' WHEN TIMESTAMPDIFF(YEAR, users.birthday, CURDATE()) <= 45 THEN '41岁-45岁' ELSE '46岁以上' END"),
-        "education": await users_group("CASE profile.education_level WHEN 1 THEN '初中' WHEN 2 THEN '技校' WHEN 3 THEN '高中' WHEN 4 THEN '大专' WHEN 5 THEN '本科' WHEN 6 THEN '硕士' WHEN 7 THEN '博士' ELSE '不限' END", "LEFT JOIN user_profile profile ON profile.user_id = users.id"),
+        "education": await users_group("CASE profile.education_level WHEN 1 THEN '高中及以下' WHEN 2 THEN '大专' WHEN 3 THEN '本科' WHEN 4 THEN '硕士' WHEN 5 THEN '博士' ELSE '未填写' END", "LEFT JOIN user_profile profile ON profile.user_id = users.id"),
         "house": await users_group("COALESCE(NULLIF(profile.house, ''), '未填写')", "LEFT JOIN user_profile profile ON profile.user_id = users.id"),
         "car": await users_group("COALESCE(NULLIF(profile.car, ''), '未填写')", "LEFT JOIN user_profile profile ON profile.user_id = users.id"),
-        "income": await users_group("CASE WHEN profile.income IS NULL THEN '不限' WHEN profile.income < 3000 THEN '3千元以下' WHEN profile.income < 5000 THEN '3-5千元' WHEN profile.income < 8000 THEN '5-8千元' WHEN profile.income < 10000 THEN '8千-1万元' ELSE '1万元以上' END", "LEFT JOIN user_profile profile ON profile.user_id = users.id"),
-        "realname": await users_group("CASE WHEN users.is_real_name = 1 OR auth.realname_status = 1 THEN '已实名' ELSE '未实名' END", "LEFT JOIN user_auth auth ON auth.user_id = users.id"),
+        # p.income 是年收入（元）（编辑写入域），按年口径分桶展示。
+        "income": await users_group("CASE WHEN profile.income IS NULL THEN '不限' WHEN profile.income < 100000 THEN '10万以下' WHEN profile.income < 200000 THEN '10-20万' WHEN profile.income < 500000 THEN '20-50万' WHEN profile.income < 1000000 THEN '50-100万' ELSE '100万以上' END", "LEFT JOIN user_profile profile ON profile.user_id = users.id"),
+        # user_auth.realname_status: 0未认证 1认证中 2通过 3失败 4人工复核 5撤销 → 仅 2 记为已实名
+        "realname": await users_group("CASE WHEN users.is_real_name = 1 OR auth.realname_status = 2 THEN '已实名' ELSE '未实名' END", "LEFT JOIN user_auth auth ON auth.user_id = users.id"),
         "occupation": await users_group("COALESCE(NULLIF(profile.occupation, ''), '不限')", "LEFT JOIN user_profile profile ON profile.user_id = users.id"),
         "hometown": await users_group("COALESCE(NULLIF(profile.hometown, ''), '未填写')", "LEFT JOIN user_profile profile ON profile.user_id = users.id"),
         "residence": await users_group("COALESCE(NULLIF(profile.residence, ''), '未填写')", "LEFT JOIN user_profile profile ON profile.user_id = users.id"),
@@ -266,6 +275,8 @@ async def member_statistics(db: AsyncSession, admin: CurrentMatchmakerAdmin, fro
 
     growth_rows = (await db.execute(text(f"""SELECT calendar.date,
         COALESCE(registered.member_count, 0) member_count,
+        COALESCE(registered.male_count, 0) male_count,
+        COALESCE(registered.female_count, 0) female_count,
         COALESCE(vip.vip_count, 0) vip_count,
         COALESCE(applied.apply_count, 0) apply_count,
         COALESCE(applied.failed_count, 0) failed_count,
@@ -276,7 +287,10 @@ async def member_statistics(db: AsyncSession, admin: CurrentMatchmakerAdmin, fro
           UNION SELECT DATE(created_at) date FROM match_apply WHERE created_at >= :start AND created_at < :end
         ) calendar
         LEFT JOIN (
-          SELECT DATE(users.created_at) date, COUNT(*) member_count FROM users
+          SELECT DATE(users.created_at) date, COUNT(*) member_count,
+            COALESCE(SUM(users.gender = 1), 0) male_count,
+            COALESCE(SUM(users.gender = 2), 0) female_count
+          FROM users
           WHERE users.created_at >= :start AND users.created_at < :end AND users.status = 1
             AND {ordinary_users} AND {user_scope} GROUP BY DATE(users.created_at)
         ) registered ON registered.date = calendar.date
@@ -297,6 +311,7 @@ async def member_statistics(db: AsyncSession, admin: CurrentMatchmakerAdmin, fro
         ORDER BY calendar.date DESC"""), {**scope_params, "start": start, "end": end})).mappings().all()
     growth = [{
         "date": str(row["date"]), "member_count": int(row["member_count"] or 0),
+        "male_count": int(row["male_count"] or 0), "female_count": int(row["female_count"] or 0),
         "vip_count": int(row["vip_count"] or 0), "apply_count": int(row["apply_count"] or 0),
         "failed_count": int(row["failed_count"] or 0), "success_count": int(row["success_count"] or 0),
     } for row in growth_rows]
@@ -327,6 +342,7 @@ async def member_statistics(db: AsyncSession, admin: CurrentMatchmakerAdmin, fro
     preference_labels = {
         "age": "年龄", "marriage": "婚况", "height": "身高", "education": "学历",
         "housing": "住房", "smoking": "抽烟", "drinking": "喝酒", "goal": "结婚要求",
+        "occupation": "职业",
     }
     async def preference_report(gender_value: int) -> dict[str, list[dict]]:
         conditions = f"users.status = 1 AND users.gender = {gender_value} AND {ordinary_users} AND {user_scope}"
@@ -334,11 +350,12 @@ async def member_statistics(db: AsyncSession, admin: CurrentMatchmakerAdmin, fro
             "age": "CASE WHEN preference.age_min IS NULL AND preference.age_max IS NULL THEN '不限' WHEN preference.age_max IS NULL THEN CONCAT(preference.age_min, '岁以上') WHEN preference.age_min IS NULL THEN CONCAT(preference.age_max, '岁以下') ELSE CONCAT(preference.age_min, '-', preference.age_max, '岁') END",
             "marriage": "CASE preference.marriage_status WHEN 1 THEN '未婚' WHEN 2 THEN '离异' WHEN 3 THEN '丧偶' ELSE '不限' END",
             "height": "CASE WHEN preference.height_min IS NULL AND preference.height_max IS NULL THEN '不限' WHEN preference.height_max IS NULL THEN CONCAT(preference.height_min, 'cm以上') WHEN preference.height_min IS NULL THEN CONCAT(preference.height_max, 'cm以下') ELSE CONCAT(preference.height_min, '-', preference.height_max, 'cm') END",
-            "education": "CASE preference.education_min WHEN 1 THEN '初中' WHEN 2 THEN '技校' WHEN 3 THEN '高中' WHEN 4 THEN '大专' WHEN 5 THEN '本科' WHEN 6 THEN '硕士' WHEN 7 THEN '博士' ELSE '不限' END",
+            "education": "CASE preference.education_min WHEN 1 THEN '高中及以下' WHEN 2 THEN '大专' WHEN 3 THEN '本科' WHEN 4 THEN '硕士' WHEN 5 THEN '博士' ELSE '不限' END",
             "housing": "CASE preference.housing_requirement WHEN 1 THEN '有房' WHEN 2 THEN '无房可接受' ELSE '不限' END",
             "smoking": "CASE preference.smoking_requirement WHEN 1 THEN '不抽烟' WHEN 2 THEN '可接受' ELSE '不限' END",
             "drinking": "CASE preference.drinking_requirement WHEN 1 THEN '不喝酒' WHEN 2 THEN '可接受' ELSE '不限' END",
             "goal": "COALESCE(NULLIF(preference.dating_goal, ''), '不限')",
+            "occupation": "COALESCE(NULLIF(preference.preferred_occupation, ''), '不限')",
         }
         return {key: await grouped(f"""SELECT {expression} label, COUNT(*) value
             FROM users LEFT JOIN user_partner_preference preference ON preference.user_id = users.id
@@ -350,6 +367,21 @@ async def member_statistics(db: AsyncSession, admin: CurrentMatchmakerAdmin, fro
         FROM users WHERE users.status = 1 AND {ordinary_users} AND {user_scope}"""), {
             **scope_params, "to_date": to_date,
         })).mappings().one()
+    # 单日/单月新增峰值取全量口径（不受查询区间限制），与前端排名卡一致。
+    peak_daily = (await db.execute(text(f"""SELECT DATE(users.created_at) label, COUNT(*) value
+        FROM users WHERE users.status = 1 AND {ordinary_users} AND {user_scope}
+        GROUP BY DATE(users.created_at) ORDER BY value DESC, label DESC LIMIT 1"""), scope_params)).mappings().first()
+    peak_monthly = (await db.execute(text(f"""SELECT DATE_FORMAT(users.created_at, '%Y-%m') label, COUNT(*) value
+        FROM users WHERE users.status = 1 AND {ordinary_users} AND {user_scope}
+        GROUP BY DATE_FORMAT(users.created_at, '%Y-%m') ORDER BY value DESC, label DESC LIMIT 1"""), scope_params)).mappings().first()
+    # 客户意向统计：客源线索的意向标签分布。标签字典存于 customer_lead_tag，
+    # 通过 customer_lead_tag_relation 关联客源；返回固定 9 类，缺失计 0。
+    tag_rows = (await db.execute(text("""SELECT tag.name label, COUNT(*) value
+        FROM customer_lead_tag_relation relation
+        JOIN customer_lead_tag tag ON tag.id = relation.tag_id
+        GROUP BY tag.name"""))).mappings().all()
+    tag_counts = {str(row["label"]).replace(" ", ""): int(row["value"] or 0) for row in tag_rows}
+    intention_report = [{"label": label, "count": tag_counts.get(label.replace(" ", ""), 0)} for label in MEMBER_INTENTION_CATALOG]
     return {
         "from_date": str(from_date), "to_date": str(to_date),
         "groups": {"follow": follow, "intention": intention, "basic": gender, "requirement": requirement, "browse": browse, "popularity": popularity,
@@ -358,9 +390,16 @@ async def member_statistics(db: AsyncSession, admin: CurrentMatchmakerAdmin, fro
                     "apply_female": apply_female, "apply_male": apply_male,
                     "growth": growth, "follow_report": follow_report,
                     "browse_report": browse_report, "requirements": requirements,
-                    "preference_labels": preference_labels},
+                    "preference_labels": preference_labels, "intention_report": intention_report},
         "totals": {"follow": sum(item["value"] for item in follow), "intention": sum(item["value"] for item in intention), "basic": sum(item["value"] for item in gender), "requirement": sum(item["value"] for item in requirement), "browse": total_browse, "popularity": sum(item["value"] for item in popularity)},
-        "metrics": {"total_members": int(top_metrics["total_members"] or 0), "today_members": int(top_metrics["today_members"] or 0)},
+        "metrics": {
+            "total_members": int(top_metrics["total_members"] or 0),
+            "today_members": int(top_metrics["today_members"] or 0),
+            "max_daily_members": int(peak_daily["value"] or 0) if peak_daily else 0,
+            "max_daily_date": str(peak_daily["label"]) if peak_daily else "",
+            "max_monthly_members": int(peak_monthly["value"] or 0) if peak_monthly else 0,
+            "max_monthly_month": str(peak_monthly["label"]) if peak_monthly else "",
+        },
     }
 
 

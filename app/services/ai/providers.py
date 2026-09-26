@@ -39,6 +39,9 @@ from app.services.ai.base import (
     NarrativeRecentChange,
     NarrativeRequest,
     NarrativeResult,
+    ProfileCardSummarizeRequest,
+    ProfileCardSummarizeResult,
+    ProfileCardDraftFieldResult,
     ProviderError,
     ProviderErrorKind,
     ReplyRequest,
@@ -56,6 +59,11 @@ from app.services.ai.prompts.profile_extract import (
 )
 from app.services.ai.prompts.compatibility_compare import build_compatibility_compare_prompt
 from app.services.ai.prompts.profile_narrative import build_profile_narrative_prompt
+from app.services.ai.prompts.profile_card_summarize import (
+    PROFILE_CARD_PROMPT_VERSION,
+    PROFILE_CARD_SCHEMA_VERSION,
+    build_profile_card_summarize_prompt,
+)
 from app.services.ai.prompts.search_parse import build_search_parse_prompt
 from app.services.ai.prompts.voice_reply import build_voice_reply_messages
 
@@ -69,20 +77,44 @@ logger = logging.getLogger(__name__)
 # 模式辅助与 AsyncOpenAI 异步客户端，裸 httpx 需要手写这些能力且易出错。openai
 # 是 MIT 许可、活跃维护的成熟库，与现有 httpx 共存（openai 内部亦依赖 httpx），
 # 无版本冲突风险。替代方案 httpx 已评估但不采用，理由如上。
-from openai import (  # noqa: E402
-    APIConnectionError as _APIConnectionError,
-    APIError as _APIError,
-    APITimeoutError as _APITimeoutError,
-    AsyncOpenAI,
-    RateLimitError as _RateLimitError,
-)
 # 4xx 状态码异常子类，用于区分可重试与不可重试。
-from openai import (  # noqa: E402
-    APIStatusError as _APIStatusError,
-    AuthenticationError as _AuthenticationError,
-    BadRequestError as _BadRequestError,
-    PermissionDeniedError as _PermissionDeniedError,
-)
+#
+# 可选导入（graceful degradation）：openai 只在真实 provider 发起调用时才需要。
+# 部署环境（如生产服务器）未安装该包时，服务仍可正常启动——其余全部功能
+# 不受影响；真实 AI provider 调用会在 _ensure_client 处抛出明确的
+# NON_RETRYABLE ProviderError（"AI_SDK_NOT_INSTALLED"），而不是让整个
+# 进程在 import 阶段崩溃。
+try:  # pragma: no cover - 分支取决于部署环境是否安装 openai
+    from openai import (  # noqa: E402
+        APIConnectionError as _APIConnectionError,
+        APIError as _APIError,
+        APITimeoutError as _APITimeoutError,
+        AsyncOpenAI,
+        RateLimitError as _RateLimitError,
+        APIStatusError as _APIStatusError,
+        AuthenticationError as _AuthenticationError,
+        BadRequestError as _BadRequestError,
+        PermissionDeniedError as _PermissionDeniedError,
+    )
+
+    OPENAI_SDK_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    OPENAI_SDK_AVAILABLE = False
+    AsyncOpenAI = None  # type: ignore[assignment, misc]
+
+    # 占位异常基类：保证下方 isinstance 映射代码在未安装 SDK 时语法与运行
+    # 皆成立（永远不会命中，统一落到兜底 ProviderError 分支）。
+    class _OpenAIStubError(Exception):
+        pass
+
+    _APIConnectionError = _OpenAIStubError  # type: ignore[assignment,misc]
+    _APIError = _OpenAIStubError  # type: ignore[assignment,misc]
+    _APITimeoutError = _OpenAIStubError  # type: ignore[assignment,misc]
+    _RateLimitError = _OpenAIStubError  # type: ignore[assignment,misc]
+    _APIStatusError = _OpenAIStubError  # type: ignore[assignment,misc]
+    _AuthenticationError = _OpenAIStubError  # type: ignore[assignment,misc]
+    _BadRequestError = _OpenAIStubError  # type: ignore[assignment,misc]
+    _PermissionDeniedError = _OpenAIStubError  # type: ignore[assignment,misc]
 
 
 def _build_openai_compat_client(
@@ -94,6 +126,15 @@ def _build_openai_compat_client(
     "合法死锁"（挂起调用占住 worker 10 分钟）。由 settings.ai_gateway_timeout_seconds
     提供（默认 30.0，范围 0-120）。
     """
+    if not OPENAI_SDK_AVAILABLE:
+        raise ProviderError(
+            code="AI_SDK_NOT_INSTALLED",
+            message=(
+                "服务器未安装 openai Python 包（pip install 'openai>=1.50,<2.0'），"
+                "真实 AI provider 不可用；服务其余功能正常"
+            ),
+            kind=ProviderErrorKind.NON_RETRYABLE,
+        )
     return AsyncOpenAI(
         api_key=api_key.get_secret_value() if hasattr(api_key, "get_secret_value") else api_key,
         base_url=base_url,
@@ -123,7 +164,10 @@ _IDEAL_PARTNER_FIXTURE_FIELDS: dict[str, tuple[Any, str | None, float]] = {
     "marriage_status": (("single",), "希望未婚", 0.90),
     "education_level": ({"min": 3, "max": None}, "本科及以上", 0.89),
     "height_cm": ({"min": 160, "max": 180}, "身高160到180", 0.96),
-    "income_band": ({"min": 10000, "max": None}, "月收入至少一万", 0.83),
+    # 收入档位区间：与个人同口径（0-6 月收入档），「至少一万」对应档位 3
+    # （PRODUCT.md 收入档位表：3=1万-2万）。此前误写金额 10000，与个人
+    # 档位 0-6 混算后被评分器判为不满足。
+    "income_band": ({"min": 3, "max": None}, "月收入至少一万", 0.83),
     "occupation_group": (("technology", "education"), "技术或教育行业", 0.76),
     "interest_tags": (("旅行", "音乐"), "喜欢旅行和音乐", 0.81),
     "lifestyle_tags": (("户外",), "愿意周末户外", 0.74),
@@ -372,6 +416,40 @@ class MockAIProvider:
         self._check_failure("compare_compatibility")
         return _COMPARE_FIXTURE
 
+    async def generate_profile_card_draft(
+        self, request: ProfileCardSummarizeRequest
+    ) -> ProfileCardSummarizeResult:
+        self._check_failure("generate_profile_card_draft")
+        return ProfileCardSummarizeResult(
+            schema_version=PROFILE_CARD_SCHEMA_VERSION,
+            prompt_version=PROFILE_CARD_PROMPT_VERSION,
+            self_intro=ProfileCardDraftFieldResult(
+                value="我喜欢把周末过得具体一点，散步、做饭，也愿意认真经营一段稳定关系。",
+                confidence=0.86,
+                source_ref="insight",
+            ),
+            qa_1_partner=ProfileCardDraftFieldResult(
+                value="我希望遇到愿意沟通、生活节奏相近、也能一起把日常过踏实的人。",
+                confidence=0.82,
+                source_ref="ideal_partner",
+            ),
+            qa_3_love=ProfileCardDraftFieldResult(
+                value="我期待的爱情是彼此尊重、慢慢靠近，而不是急着证明什么。",
+                confidence=0.8,
+                source_ref="relationship",
+            ),
+            qa_2_sports_candidates=ProfileCardDraftFieldResult(
+                candidates=("徒步", "跑步"),
+                confidence=0.55,
+                source_ref="lifestyle",
+            ),
+            interest_tag_candidates=ProfileCardDraftFieldResult(
+                candidates=("徒步", "阅读", "下厨"),
+                confidence=0.7,
+                source_ref="interest_tags",
+            ),
+        )
+
     async def stream_chat(
         self,
         messages: list[dict[str, str]],
@@ -396,6 +474,23 @@ class MockAIProvider:
             yield ("content", f"这是 mock 回复。你刚才说：{preview}")
         yield ("finish", "stop")
 
+    async def chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        json_mode: bool = False,
+    ) -> str:
+        """非流式确定性回复，文本与 stream_chat 的 content 段一致。"""
+        self._check_failure("chat")
+        last_user = ""
+        for item in reversed(messages):
+            if item.get("role") == "user":
+                last_user = item.get("content") or ""
+                break
+        preview = last_user.replace("\n", " ").strip()[:24] or "（空输入）"
+        if json_mode:
+            return '{"reply_text":"好的，记下啦。那你现在生活在哪个城市呀？"}'
+        return f"这是 mock 回复。你刚才说：{preview}"
     # ------------------------------------------------------------------
     # Deterministic fixture accessor (used by the acceptance test)
     # ------------------------------------------------------------------
@@ -888,6 +983,49 @@ class _OpenAICompatProvider:
         content = response.choices[0].message.content
         return _parse_json_response(content)
 
+    async def chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        json_mode: bool = False,
+    ) -> str:
+        """非流式 chat。只返回非空 content，不记录原文或供应商响应。"""
+        client = self._ensure_client()
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "messages": messages,
+            "max_tokens": self._max_tokens,
+        }
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        try:
+            response = await client.chat.completions.create(**kwargs)
+        except (
+            _RateLimitError,
+            _APITimeoutError,
+            _APIConnectionError,
+            _AuthenticationError,
+            _PermissionDeniedError,
+            _BadRequestError,
+            _APIStatusError,
+            _APIError,
+        ) as exc:
+            raise self._map_openai_exception(exc) from exc
+        if not response.choices:
+            raise ProviderError(
+                code="AI_INPUT_INVALID",
+                message="provider 返回空 choices",
+                kind=ProviderErrorKind.NON_RETRYABLE,
+            )
+        content = response.choices[0].message.content
+        if not isinstance(content, str) or not content.strip():
+            raise ProviderError(
+                code="AI_INPUT_INVALID",
+                message="provider 返回空内容",
+                kind=ProviderErrorKind.NON_RETRYABLE,
+            )
+        return content
+
     async def stream_chat(
         self,
         messages: list[dict[str, str]],
@@ -1006,20 +1144,24 @@ class _OpenAICompatProvider:
             field_key = item.get("field_key", "")
             if field_key not in request.allowlist:
                 continue
-            fields.append(
-                ExtractedField(
-                    field_key=field_key,
-                    subject=subject,
-                    value=item.get("value"),
-                    source_quote=item.get("source_quote"),
-                    confidence=_safe_confidence(item.get("confidence")),
-                    needs_confirmation=True,
-                    confirmation_status="suggested",
-                    schema_version=_PROFILE_SCHEMA_VERSION,
-                    prompt_version=_PROFILE_PROMPT_VERSION,
-                    policy_revision=request.policy_revision,
+            try:
+                fields.append(
+                    ExtractedField(
+                        field_key=field_key,
+                        subject=subject,
+                        value=item.get("value"),
+                        source_quote=item.get("source_quote"),
+                        confidence=_safe_confidence(item.get("confidence")),
+                        needs_confirmation=True,
+                        confirmation_status="suggested",
+                        schema_version=_PROFILE_SCHEMA_VERSION,
+                        prompt_version=_PROFILE_PROMPT_VERSION,
+                        policy_revision=request.policy_revision,
+                    )
                 )
-            )
+            except (ValidationError, ValueError):
+                _drop_invalid_extract_item("profile_extract", item)
+                continue
         # WP-P1：条目通道。category 先归一再校验（批次3 #9），content 由
         # ExtractedEntry 的 Pydantic 校验把关（9 枚举 + ≤200 字）；归一后
         # 仍非法的条目整条丢弃并留痕，不让坏数据进草稿。
@@ -1313,6 +1455,24 @@ class _OpenAICompatProvider:
             raise ProviderError(
                 code="AI_TEMPORARILY_UNAVAILABLE",
                 message=f"compatibility compare 输出未通过 schema 校验: {exc}",
+                kind=ProviderErrorKind.RETRYABLE,
+            ) from exc
+
+    async def generate_profile_card_draft(
+        self, request: ProfileCardSummarizeRequest
+    ) -> ProfileCardSummarizeResult:
+        prompt = build_profile_card_summarize_prompt(
+            personal_fields=request.personal_fields,
+            narrative=request.narrative,
+            ideal_partner_summary=request.ideal_partner_summary,
+        )
+        data = await self._chat_json(prompt)
+        try:
+            return ProfileCardSummarizeResult.model_validate(data)
+        except ValidationError as exc:
+            raise ProviderError(
+                code="AI_TEMPORARILY_UNAVAILABLE",
+                message=f"profile card 输出未通过 schema 校验: {exc}",
                 kind=ProviderErrorKind.RETRYABLE,
             ) from exc
 

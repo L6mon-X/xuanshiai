@@ -7,11 +7,13 @@ from app.api.dependencies import CurrentMatchmakerAdmin, CurrentUser, get_curren
 from app.db.session import get_db
 from app.schemas.meeting import (
     MeetingFeedbackCreate,
+    MeetingDirectCreate,
     MeetingRecordResponse,
     MeetingRequestCreate,
     MatchmakerMeetingRequestCreate,
     MeetingRequestResponse,
     MeetingScheduleCreate,
+    MeetingStatistics,
     MeetingStatusUpdate,
     MeetingRecordAdminPage,
     MeetingRequestAdminPage,
@@ -25,12 +27,17 @@ from app.services.meeting import (
     list_my_meeting_requests,
     schedule_meeting,
     update_meeting_request,
+    admin_create_meeting,
     admin_feedback,
     admin_get_meeting,
     admin_list_meetings,
     admin_list_requests,
+    admin_meeting_statistics,
+    admin_options,
     admin_update_request,
     admin_update_meeting,
+    admin_delete_meeting,
+    admin_delete_request,
 )
 
 router = APIRouter(prefix="/matchmaker/meetings")
@@ -79,9 +86,9 @@ async def schedule(request_id: int = Path(..., ge=1), body: MeetingScheduleCreat
 
 
 @admin_router.get("/requests", response_model=MeetingRequestAdminPage)
-async def admin_requests(page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), status: str | None = Query(None, max_length=32), search_value: str | None = Query(None, max_length=64), matchmaker_id: int | None = Query(None, ge=1), from_date: str | None = Query(None, max_length=32), to_date: str | None = Query(None, max_length=32), admin: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> MeetingRequestAdminPage:
+async def admin_requests(page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), status: str | None = Query(None, max_length=32), status_group: str | None = Query(None, pattern="^(pending|done)$", description="待处理/已处理分组"), search_value: str | None = Query(None, max_length=64), matchmaker_id: int | None = Query(None, ge=1), from_date: str | None = Query(None, max_length=32), to_date: str | None = Query(None, max_length=32), admin: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> MeetingRequestAdminPage:
     admin.require("meeting.read")
-    return await admin_list_requests(db, page, page_size, status, search_value, matchmaker_id, from_date, to_date)
+    return await admin_list_requests(db, page, page_size, status, search_value, matchmaker_id, from_date, to_date, status_group)
 
 
 @admin_router.patch("/requests/{request_id}", response_model=MeetingRequestResponse)
@@ -91,9 +98,46 @@ async def admin_review_request(request_id: int = Path(..., ge=1), body: MeetingS
 
 
 @admin_router.get("", response_model=MeetingRecordAdminPage)
-async def admin_meetings(page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), status: str | None = Query(None, max_length=32), admin: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> MeetingRecordAdminPage:
+async def admin_meetings(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    status: str | None = Query(None, max_length=32),
+    search: str | None = Query(None, max_length=64, description="昵称/编号/手机/姓名"),
+    member_id: int | None = Query(None, ge=1, description="指定会员 ID；不传则查询全部约会记录"),
+    organizer_id: int | None = Query(None, ge=1),
+    met: str | None = Query(None, pattern="^(met|wait)$"),
+    from_date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    to_date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    admin: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MeetingRecordAdminPage:
     admin.require("meeting.read")
-    return await admin_list_meetings(db, page, page_size, status)
+    return await admin_list_meetings(db, page, page_size, status, search, organizer_id, from_date, to_date, met, member_id)
+
+
+@admin_router.post("", response_model=MeetingRecordResponse, status_code=201, summary="添加约会（约会管理）")
+async def admin_create_meeting_route(
+    body: MeetingDirectCreate,
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MeetingRecordResponse:
+    current.require("meeting.write")
+    return await admin_create_meeting(db, body, current.account.id)
+
+
+@admin_router.get("/statistics", response_model=MeetingStatistics, summary="约会管理统计")
+async def admin_meeting_stats(
+    admin: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MeetingStatistics:
+    admin.require("meeting.read")
+    return await admin_meeting_statistics(db)
+
+
+@admin_router.get("/options", summary="约见/约会管理页面下拉字典")
+async def admin_meeting_options(admin: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> dict:
+    admin.require("meeting.read")
+    return await admin_options(db)
 
 
 @admin_router.get("/{meeting_id}", response_model=MeetingRecordResponse)
@@ -112,3 +156,17 @@ async def admin_meeting_update(meeting_id: int = Path(..., ge=1), body: MeetingR
 async def admin_meeting_feedback(meeting_id: int = Path(..., ge=1), admin: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> list[MeetingFeedbackAdminItem]:
     admin.require("meeting.feedback.read")
     return await admin_feedback(db, meeting_id)
+
+
+@admin_router.delete("/requests/{request_id}", summary="删除约见申请")
+async def admin_delete_request_route(request_id: int = Path(..., ge=1), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> dict:
+    current.require("meeting.write")
+    deleted = await admin_delete_request(db, request_id, current.account.id)
+    return {"id": request_id, "deleted": deleted}
+
+
+@admin_router.delete("/{meeting_id}", summary="删除约会记录")
+async def admin_delete_meeting_route(meeting_id: int = Path(..., ge=1), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> dict:
+    current.require("meeting.write")
+    deleted = await admin_delete_meeting(db, meeting_id, current.account.id)
+    return {"id": meeting_id, "deleted": deleted}

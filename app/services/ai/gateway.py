@@ -11,17 +11,23 @@ here.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
 import uuid
 from dataclasses import dataclass
+from collections.abc import AsyncIterator
 from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
 from app.core.config import settings
-from app.services.ai.audit import GenerationAuditEvent, record_generation_audit
+from app.services.ai.audit import (
+    GenerationAuditEvent,
+    emit_ai_metric,
+    record_generation_audit,
+)
 from app.services.ai.base import (
     AIProvider,
     AITaskContext,
@@ -30,6 +36,7 @@ from app.services.ai.base import (
     GatewayCallRecord,
     ModerationResult,
     NarrativeResult,
+    ProfileCardSummarizeResult,
     ProviderError,
     ProviderErrorKind,
     ReplyResult,
@@ -127,7 +134,7 @@ class AIGateway:
     def __init__(
         self,
         provider: AIProvider | None = None,
-        timeout_seconds: float = 30.0,
+        timeout_seconds: float | None = None,
     ) -> None:
         # Resolve the provider from settings when none is explicitly supplied,
         # instead of hard-coding "mock".  In production a mock provider is a
@@ -141,7 +148,11 @@ class AIGateway:
                 "ai_gateway_mock_provider_in_production "
                 "AIGateway 在生产环境使用 mock provider，请配置真实 AI provider"
             )
-        self._timeout_seconds = timeout_seconds
+        self._timeout_seconds = (
+            settings.ai_gateway_timeout_seconds
+            if timeout_seconds is None
+            else timeout_seconds
+        )
         # Token usage / cost hooks; phase 1 mock reports none.
         self._cost_hook: Any | None = None
         # Narrative 专用 provider（可选）。当 ai_narrative_provider 配置非空时，
@@ -190,10 +201,13 @@ class AIGateway:
     ) -> InvokeOutcome[T]:
         """Run one provider call and normalise the outcome.
 
-        ``method`` must be one of ``structured_extract``, ``parse_search_query``
-        or ``moderate_text``.  The provider's typed result is validated with
-        ``response_type`` when provided, turning schema violations into a
-        non-retryable ``AI_INPUT_INVALID``.
+        ``method`` is one of the typed adapters ``structured_extract``,
+        ``parse_search_query``, ``moderate_text``, ``generate_narrative``,
+        ``generate_search_suggestions``, ``compare_compatibility``,
+        ``generate_reply``, ``generate_profile_card_draft``, the streaming
+        ``stream_chat``, or the generic ``chat``.  The provider's typed
+        result is validated with ``response_type`` when provided, turning
+        schema violations into a non-retryable ``AI_INPUT_INVALID``.
 
         ``provider`` overrides ``self._provider`` for this single call; used by
         ``generate_narrative`` to route the heavy narrative task to an optional
@@ -203,7 +217,9 @@ class AIGateway:
         started = time.monotonic()
         try:
             handler = getattr(active_provider, method)
-            raw_result = await handler(*args)
+            raw_result = await asyncio.wait_for(
+                handler(*args), timeout=self._timeout_seconds
+            )
             record = self._record(
                 context, method, started, error_code=None, succeeded=True
             )
@@ -255,6 +271,12 @@ class AIGateway:
             )
         except (ConnectionError, TimeoutError, OSError) as exc:
             # Network / IO failures are genuinely transient: retryable.
+            # Task 17：provider 超时/网络故障单独计数（运行手册告警项）。
+            emit_ai_metric(
+                "provider_timeout",
+                1,
+                {"method": method, "error": type(exc).__name__},
+            )
             logger.warning(
                 "ai_gateway_retryable_failure method=%s request_id=%s err=%s",
                 method,
@@ -357,6 +379,114 @@ class AIGateway:
             )
         )
 
+    async def stream_chat(
+        self,
+        context: AITaskContext,
+        messages: list[dict[str, str]],
+        *,
+        json_mode: bool = False,
+        provider: AIProvider | None = None,
+    ) -> AsyncIterator[tuple[str, str]]:
+        """Stream provider output behind the Gateway timeout/audit boundary.
+
+        A streaming provider returns an async iterator immediately, so the
+        timeout is applied to the complete stream deadline one chunk at a
+        time.  Cancellation, timeout and provider failures are audited with
+        distinct statuses and re-raised to the caller unchanged.
+        """
+        active_provider = provider or self._provider
+        started = time.monotonic()
+        status = "succeeded"
+        error_code: str | None = None
+        stream_exhausted = False
+        saw_finish = False
+        deadline = asyncio.get_running_loop().time() + self._timeout_seconds
+        iterator = None
+        try:
+            iterator = active_provider.stream_chat(
+                messages, json_mode=json_mode
+            ).__aiter__()
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    status = "timeout"
+                    error_code = "AI_TIMEOUT"
+                    raise TimeoutError("AI provider stream timed out")
+                try:
+                    item = await asyncio.wait_for(
+                        iterator.__anext__(), timeout=remaining
+                    )
+                except StopAsyncIteration:
+                    stream_exhausted = True
+                    break
+                if item[0] == "finish":
+                    saw_finish = True
+                yield item
+        except asyncio.CancelledError:
+            status = "cancelled"
+            error_code = "AI_CANCELLED"
+            raise
+        except TimeoutError:
+            status = "timeout"
+            error_code = "AI_TIMEOUT"
+            raise
+        except Exception as exc:  # provider failure is observable and re-raised
+            status = "failed"
+            error_code = getattr(exc, "code", None) or type(exc).__name__
+            raise
+        finally:
+            if not stream_exhausted and error_code is None:
+                status = "cancelled"
+                error_code = "AI_CANCELLED"
+            elif stream_exhausted and not saw_finish and error_code is None:
+                status = "failed"
+                error_code = "AI_STREAM_INCOMPLETE"
+            if iterator is not None:
+                close_iterator = getattr(iterator, "aclose", None)
+                if close_iterator is not None:
+                    try:
+                        await close_iterator()
+                    except asyncio.CancelledError:
+                        logger.warning(
+                            "ai_gateway_stream_close_cancelled request_id=%s",
+                            context.request_id,
+                        )
+                    except Exception as close_exc:
+                        logger.warning(
+                            "ai_gateway_stream_close_failed request_id=%s err=%s",
+                            context.request_id,
+                            type(close_exc).__name__,
+                        )
+            try:
+                await record_generation_audit(
+                    GenerationAuditEvent(
+                        request_id=context.request_id or uuid.uuid4().hex,
+                        task_id=context.task_id or None,
+                        scene=context.scene,
+                        provider=context.provider,
+                        model=context.model,
+                        prompt_version=context.prompt_version,
+                        schema_version=context.schema_version,
+                        input_revision=context.input_revision,
+                        policy_revision=context.policy_revision,
+                        status=status,
+                        error_code=error_code,
+                        duration_ms=int((time.monotonic() - started) * 1000),
+                        display_eligible=False,
+                    )
+                )
+            except asyncio.CancelledError:
+                logger.warning(
+                    "ai_gateway_stream_audit_cancelled request_id=%s",
+                    context.request_id,
+                )
+            except Exception as audit_exc:
+                logger.warning(
+                    "ai_gateway_stream_audit_failed request_id=%s err=%s",
+                    context.request_id,
+                    type(audit_exc).__name__,
+                )
+
     # ------------------------------------------------------------------
     # Typed convenience methods so business modules never call raw methods.
     # ------------------------------------------------------------------
@@ -428,3 +558,128 @@ class AIGateway:
             context, "generate_reply", request,
             response_type=ReplyResult,
         )
+
+    async def generate_profile_card_draft(
+        self, context: AITaskContext, request: Any
+    ) -> InvokeOutcome[ProfileCardSummarizeResult]:
+        return await self.invoke(
+            context,
+            "generate_profile_card_draft",
+            request,
+            response_type=ProfileCardSummarizeResult,
+        )
+
+    async def chat(
+        self,
+        context: AITaskContext,
+        messages: list[dict[str, str]],
+        *,
+        response_type: type[T] | None = None,
+        json_mode: bool = False,
+    ) -> InvokeOutcome[T]:
+        """Run one generic chat completion through the same boundary as invoke.
+
+        Timeout, ``ProviderError`` / schema / network handling and audit match
+        ``invoke``.  The audit record is metadata only: messages, prompts,
+        user text and provider payloads are never logged or persisted.
+        """
+        active_provider = self._provider
+        method = "chat"
+        started = time.monotonic()
+        try:
+            raw_result = await asyncio.wait_for(
+                getattr(active_provider, "chat")(messages, json_mode=json_mode),
+                timeout=self._timeout_seconds,
+            )
+            if response_type is not None:
+                payload: Any = raw_result
+                if isinstance(raw_result, str):
+                    payload = json.loads(raw_result)
+                validated = response_type.model_validate(payload)
+                record = self._record(
+                    context, method, started, error_code=None, succeeded=True
+                )
+                await self._log_audit(record)
+                return InvokeOutcome(result=validated)
+            if not isinstance(raw_result, str) or not raw_result.strip():
+                raise ProviderError(
+                    code=_SCHEMA_VIOLATION_CODE,
+                    message="provider chat 返回必须是非空字符串",
+                    kind=ProviderErrorKind.NON_RETRYABLE,
+                )
+            record = self._record(
+                context, method, started, error_code=None, succeeded=True
+            )
+            await self._log_audit(record)
+            return InvokeOutcome(result=raw_result)
+        except ProviderError as exc:
+            detail = _redact_provider_message(exc.message)
+            if detail:
+                logger.debug(
+                    "ai_gateway_provider_error method=%s request_id=%s "
+                    "code=%s detail=%s",
+                    method,
+                    context.request_id,
+                    exc.code,
+                    detail,
+                )
+            record = self._record(
+                context, method, started, error_code=exc.code, succeeded=False
+            )
+            await self._log_audit(record)
+            return InvokeOutcome(
+                error_code=exc.code,
+                error_message=_safe_error_message(exc.code),
+                retryable=exc.retryable,
+                retry_after_ms=exc.retry_after_ms,
+            )
+        except (ValidationError, ValueError, json.JSONDecodeError):
+            record = self._record(
+                context, method, started, error_code=_SCHEMA_VIOLATION_CODE,
+                succeeded=False,
+            )
+            await self._log_audit(record)
+            return InvokeOutcome(
+                error_code=_SCHEMA_VIOLATION_CODE,
+                error_message=_safe_error_message(_SCHEMA_VIOLATION_CODE),
+                retryable=False,
+            )
+        except (ConnectionError, TimeoutError, OSError) as exc:
+            emit_ai_metric(
+                "provider_timeout",
+                1,
+                {"method": method, "error": type(exc).__name__},
+            )
+            logger.warning(
+                "ai_gateway_retryable_failure method=%s request_id=%s err=%s",
+                method,
+                context.request_id,
+                type(exc).__name__,
+            )
+            record = self._record(
+                context, method, started,
+                error_code="AI_TEMPORARILY_UNAVAILABLE", succeeded=False,
+            )
+            await self._log_audit(record)
+            return InvokeOutcome(
+                error_code="AI_TEMPORARILY_UNAVAILABLE",
+                error_message=_safe_error_message("AI_TEMPORARILY_UNAVAILABLE"),
+                retryable=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - boundary conversion
+            logger.warning(
+                "ai_gateway_unhandled method=%s request_id=%s err=%s",
+                method,
+                context.request_id,
+                type(exc).__name__,
+            )
+            record = self._record(
+                context, method, started,
+                error_code="AI_TEMPORARILY_UNAVAILABLE", succeeded=False,
+            )
+            await self._log_audit(record)
+            return InvokeOutcome(
+                error_code="AI_TEMPORARILY_UNAVAILABLE",
+                error_message=_safe_error_message("AI_TEMPORARILY_UNAVAILABLE"),
+                retryable=False,
+            )

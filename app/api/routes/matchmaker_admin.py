@@ -22,13 +22,37 @@ from app.services.matchmaker import (
     list_service_products,
 )
 from app.schemas.organization import ResourceAssignmentCreate, ResourceAssignmentResponse, StoreCreate, StoreMemberCreate, StoreMemberResponse, StoreResponse
-from app.schemas.meeting import MeetingRecordResponse, MeetingScheduleCreate
 from app.services.organization import add_store_member, assign_resource, create_store, get_store, list_stores
-from app.services.meeting import schedule_meeting
 from app.api.dependencies import CurrentUser
 from sqlalchemy import text
 
 router = APIRouter(prefix="/admin/matchmaker")
+
+
+def _matchmaker_scope_filter(
+    current: CurrentMatchmakerAdmin,
+    params: dict[str, object],
+    subject_sql: str,
+    alias: str,
+) -> str:
+    """Build a scope predicate for a service-matchmaker subject expression."""
+    scope = current.scope_condition(
+        organization_column=f"{alias}_org.id",
+        params=params,
+        user_column=subject_sql,
+    )
+    if current.account.data_scope in ("ALL",) or "*" in current.permissions:
+        return scope
+    if current.account.data_scope == "SELF":
+        return scope
+    return (
+        f"EXISTS (SELECT 1 FROM organization_member {alias}_om "
+        f"JOIN organization {alias}_org ON {alias}_org.id = {alias}_om.organization_id "
+        f"AND {alias}_org.org_type = 'store' "
+        f"WHERE {alias}_om.user_id = {subject_sql} "
+        f"AND {alias}_om.role_code = 'store_matchmaker' "
+        f"AND {alias}_om.status = 1 AND {scope})"
+    )
 
 
 @router.post("/auth/login", response_model=MatchmakerAdminTokenResponse, summary="红娘后台账号密码登录")
@@ -110,13 +134,17 @@ def _legacy_actor(current: CurrentMatchmakerAdmin) -> CurrentUser:
 
 @router.get("/statistics", response_model=MatchmakerStatistics, summary="查询红娘后台统计")
 async def statistics(current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> MatchmakerStatistics:
+    current.require("matchmaker.read")
+    params: dict[str, object] = {}
+    apply_scope = _matchmaker_scope_filter(current, params, "a.user_id", "stats_apply")
+    service_scope = _matchmaker_scope_filter(current, params, "s.matchmaker_id", "stats_service")
     result = await db.execute(text("""SELECT
-        (SELECT COUNT(*) FROM user_matchmaker_apply WHERE application_type = 'service_matchmaker' AND status IN (1, 2, 3)) AS total,
-        (SELECT COUNT(*) FROM user_matchmaker_apply a JOIN user_role r ON r.user_id = a.user_id AND r.role_code = 'service_matchmaker' AND r.status = 1 WHERE a.application_type = 'service_matchmaker' AND a.status = 1) AS available,
-        (SELECT COUNT(*) FROM matchmaker_service WHERE status = 0) AS pending_services,
-        (SELECT COUNT(*) FROM matchmaker_service WHERE status = 1) AS active_services,
-        (SELECT COUNT(*) FROM matchmaker_service WHERE status = 2) AS completed_services,
-        (SELECT COUNT(*) FROM matchmaker_service WHERE status = 3) AS cancelled_services"""))
+        (SELECT COUNT(*) FROM user_matchmaker_apply a WHERE a.application_type = 'service_matchmaker' AND a.status IN (1, 2, 3) AND """ + apply_scope + """ ) AS total,
+        (SELECT COUNT(*) FROM user_matchmaker_apply a JOIN user_role r ON r.user_id = a.user_id AND r.role_code = 'service_matchmaker' AND r.status = 1 WHERE a.application_type = 'service_matchmaker' AND a.status = 1 AND """ + apply_scope + """ ) AS available,
+        (SELECT COUNT(*) FROM matchmaker_service s WHERE s.status = 0 AND """ + service_scope + """ ) AS pending_services,
+        (SELECT COUNT(*) FROM matchmaker_service s WHERE s.status = 1 AND """ + service_scope + """ ) AS active_services,
+        (SELECT COUNT(*) FROM matchmaker_service s WHERE s.status = 2 AND """ + service_scope + """ ) AS completed_services,
+        (SELECT COUNT(*) FROM matchmaker_service s WHERE s.status = 3 AND """ + service_scope + """ ) AS cancelled_services"""), params)
     return MatchmakerStatistics(**dict(result.mappings().one()))
 
 
@@ -160,8 +188,3 @@ async def assignments(page: int = Query(1, ge=1, le=1000), page_size: int = Quer
     count = await db.execute(text(f"SELECT COUNT(*) FROM resource_assignment WHERE {where}"), {k: v for k, v in params.items() if k not in ("limit", "offset")})
     total = int(count.scalar() or 0)
     return ResourceAssignmentPage(items=[ResourceAssignmentResponse(**dict(row)) for row in rows.mappings().all()], page=page, page_size=page_size, total=total, has_more=page * page_size < total)
-
-
-@router.post("/meetings/requests/{request_id}/schedule", response_model=MeetingRecordResponse, status_code=201, summary="安排约见")
-async def schedule_matchmaker_meeting(request_id: int = Path(..., ge=1), body: MeetingScheduleCreate = ..., current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> MeetingRecordResponse:
-    return await schedule_meeting(db, _legacy_actor(current), request_id, body)

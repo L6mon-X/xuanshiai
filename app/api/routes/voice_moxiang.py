@@ -25,6 +25,38 @@
     {"type": "revise_text", "text": "..."}
     {"type": "cancel"}
 
+v2 实时语音（可选）：``session_start`` 额外携带
+``protocolVersion: 2`` 与 ``capabilities: {pcmPlayback: true}``，服务端门禁
+通过后在 ``journey_ready`` 返回 ``protocol_version: 2`` 与 ``realtime`` 音频
+格式声明；客户端随后复用 audio_start/audio_chunk 发送 16kHz PCM，说话结束
+由供应商 VAD 判定。v2 新增消息：
+
+前端 → 后端::
+
+    {"type": "voice_input_begin", "client_turn_id": "..."}  # 真实开麦
+    {"type": "interrupt", "generation_id": "..."}            # 点击打断
+    {"type": "playback_progress", "generation_id": "...", "played_ms": 1200}
+    {"type": "playback_finished", "generation_id": "...",
+     "status": "completed|interrupted|failed", "played_ms": 3000}
+
+后端 → 前端::
+
+    {"type": "voice_ready"}                       # 可开麦
+    {"type": "input_closed"}                      # 停录
+    {"type": "audio_output_start", "generation_id": "...", "response_id": "...",
+     "sample_rate": 24000, "format": "pcm_s16le"}
+    {"type": "audio_chunk", "generation_id": "...", "seq": 1, "data": "<b64 PCM>"}
+    {"type": "audio_output_end", "generation_id": "...", "response_id": "..."}
+    {"type": "response_done", "generation_id": "...",
+     "status": "completed|interrupted|failed"}    # 生成结束≠播放结束
+    {"type": "cancelled", "generation_id": "..."} # 打断回执
+    {"type": "response_status", "generation_id": "...",
+     "generation_status": "...", "playback_status": "..."}
+
+身份体系：``client_turn_id``（客户端开麦生成，落库幂等）、``generation_id``
+（一次回复生成+播放）、``seq``（音频分片序号）。实时分支默认关闭
+（``ai_realtime_voice_enabled``），fail closed。
+
 后端 → 前端::
 
     {"type": "journey_ready", "session_id": "...", "subject": "personal",
@@ -72,7 +104,9 @@ from app.core.security import decode_access_token
 from app.db.session import session_factory as _db_session_factory
 from app.services.ai.flags import AiFeature, require_ai_feature
 from app.services.ai.gateway import AIGateway
+from app.services.ai.audit import emit_ai_metric
 from app.services.ai.base import ProviderError as AIProviderError
+from app.services.ai.task_events import task_event_channel
 from app.services.ai.profile import (
     AIConsentRequired,
     AIInputError,
@@ -102,6 +136,21 @@ from app.services.voice.master_orchestrator import MoxiangMasterOrchestrator
 from app.services.voice.providers import (
     _AliyunVoiceError,
     get_voice_provider,
+)
+from app.services.voice.realtime.protocol import (
+    AUDIO_FORMAT,
+    DOWNLINK_SAMPLE_RATE,
+    PROTOCOL_VERSION_V2,
+    UPLINK_SAMPLE_RATE,
+)
+from app.services.voice.realtime.moxiang_bridge import (
+    MoxiangRealtimeBridge,
+    RealtimeRouteContext,
+    acquire_session_slot,
+    realtime_daily_minutes_used,
+    realtime_gate_error,
+    realtime_watchdog,
+    release_session_slot,
 )
 
 logger = logging.getLogger(__name__)
@@ -284,6 +333,10 @@ async def _drain_partials(ws: WebSocket, asr_client: Any) -> None:
 _CANDIDATE_TERMINAL_STATUSES = frozenset(
     {"succeeded", "failed", "cancelled", "superseded"}
 )
+
+# Task 11：等待终态的轮询节奏（快段 0.5s×30s 保实时性；慢段 2s×6min 兜住
+# 供应商重试）。pub/sub 唤醒只把下一次读取提前，不改变本节奏的上限。
+_TASK_EVENT_POLL_SCHEDULE = (0.5,) * 60 + (2.0,) * 180
 
 
 async def _load_master_history(
@@ -475,52 +528,112 @@ async def _replay_pending_confirm_card(
     )
 
 
-async def _wait_candidate_and_push(
-    ws: WebSocket, user_id: int, session_id: str, subject: str, task_id: str
-) -> None:
-    """Watch one durable candidate task without cancelling other turns."""
+async def _read_task_status(task_id: str) -> str | None:
+    """Read one ai_task status; returns None when the row is gone or DB failed."""
     if _db_session_factory is None:
+        return None
+    try:
+        async with _db_session_factory() as db:
+            row = (
+                await db.execute(
+                    sql_text(
+                        "SELECT status FROM ai_task "
+                        "WHERE task_id = :task_id"
+                    ),
+                    {"task_id": task_id},
+                )
+            ).mappings().first()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "moxiang_candidate_poll_failed task_id=%s err=%s",
+            task_id,
+            type(exc).__name__,
+        )
+        return None
+    if row is None:
+        return None
+    return str(row["status"])
+
+
+async def _open_task_pubsub(task_id: str) -> Any | None:
+    """Subscribe to the task's event channel; None when Redis is unavailable."""
+    try:
+        from app.core.redis import redis_client
+
+        pubsub = redis_client.pubsub()
+        await pubsub.subscribe(task_event_channel(task_id))
+        return pubsub
+    except Exception:  # noqa: BLE001 - Redis unavailable -> poll-only
+        logger.debug(
+            "moxiang_task_subscribe_failed task_id=%s", task_id, exc_info=True
+        )
+        return None
+
+
+async def _close_task_pubsub(pubsub: Any | None) -> None:
+    """Unsubscribe and release the pub/sub connection (best-effort)."""
+    if pubsub is None:
         return
-    await _send_json(
-        ws,
-        {
-            "type": "extraction_status",
-            "subject": subject,
-            "task_id": task_id,
-            "status": "processing",
-        },
-    )
-    # 快慢两段轮询：快段 0.5s×30s 保实时性；慢段 2s×6min 兜住供应商重试
-    # （实测 dots 单次抽取可到 6 分钟）。窗口内任务未到终态则静默放弃，
-    # 前端保留"正在理解"占位，进度以重连后的 journey_ready 快照兜底。
-    for poll_delay in (0.5,) * 60 + (2.0,) * 180:
-        await asyncio.sleep(poll_delay)
-        try:
-            async with _db_session_factory() as db:
-                row = (
-                    await db.execute(
-                        sql_text(
-                            "SELECT status FROM ai_task "
-                            "WHERE task_id = :task_id"
-                        ),
-                        {"task_id": task_id},
-                    )
-                ).mappings().first()
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "moxiang_candidate_poll_failed task_id=%s err=%s",
-                task_id,
-                type(exc).__name__,
-            )
-            return
-        if row is None:
-            return
-        if str(row["status"]) in _CANDIDATE_TERMINAL_STATUSES:
-            break
-    else:
+    try:
+        await pubsub.unsubscribe()
+    except Exception:  # noqa: BLE001
+        logger.debug("moxiang_task_unsubscribe_failed", exc_info=True)
+    try:
+        await pubsub.aclose()
+    except Exception:  # noqa: BLE001
+        logger.debug("moxiang_task_pubsub_close_failed", exc_info=True)
+
+
+async def _wait_for_task_event(pubsub: Any | None, timeout: float) -> None:
+    """Block up to ``timeout`` for one wake-up event; never raises.
+
+    pubsub 为 None 或读取失败时按纯轮询节奏睡满 timeout——Redis 故障
+    自动退回轮询。
+    """
+    if pubsub is None:
+        await asyncio.sleep(max(0.0, timeout))
         return
-    terminal_status = str(row["status"])
-    if terminal_status != "succeeded":
+    try:
+        await pubsub.get_message(ignore_subscribe_messages=True, timeout=timeout)
+    except Exception:  # noqa: BLE001 - broken pubsub -> keep polling
+        logger.debug("moxiang_task_pubsub_read_failed", exc_info=True)
+
+
+async def _watch_until_terminal(pubsub: Any | None, task_id: str) -> str | None:
+    """Poll/until-wake loop; returns terminal status or None when window expires.
+
+    快慢两段轮询：快段 0.5s×30s 保实时性；慢段 2s×6min 兜住供应商重试
+    （实测 dots 单次抽取可到 6 分钟）。pub/sub 只把下一次读取提前，不
+    携带权威状态——每次唤醒与每个轮询点都以数据库重读为准。窗口内未
+    到终态则返回 None（前端保留"正在理解"占位，进度以重连后的
+    journey_ready 快照兜底）。
+    """
+    loop = asyncio.get_running_loop()
+    for poll_delay in _TASK_EVENT_POLL_SCHEDULE:
+        deadline = loop.time() + poll_delay
+        while True:
+            await _wait_for_task_event(pubsub, deadline - loop.time())
+            status = await _read_task_status(task_id)
+            if status is None:
+                return None
+            if status in _CANDIDATE_TERMINAL_STATUSES:
+                return status
+            if deadline - loop.time() <= 0:
+                # 轮询点已到仍未终态：进入下一段轮询窗口。
+                break
+    return None
+
+
+async def _push_candidate_terminal(
+    ws: WebSocket,
+    user_id: int,
+    session_id: str,
+    subject: str,
+    task_id: str,
+    status: str,
+) -> None:
+    """Push the terminal extraction_status event (and follow-ups) to the client."""
+    if status != "succeeded":
         await _send_json(
             ws,
             {
@@ -546,12 +659,57 @@ async def _wait_candidate_and_push(
     )
 
 
+async def _wait_candidate_and_push(
+    ws: WebSocket, user_id: int, session_id: str, subject: str, task_id: str
+) -> None:
+    """Watch one durable candidate task without cancelling other turns.
+
+    订阅竞态处理（计划 Task 11）：先读一次当前状态——任务可能在订阅建
+    立前就到终态（发布只发生在 commit 后一次）；未终态再订阅并等待唤
+    醒/轮询。Redis 不可用时自动退回纯轮询，语义不变、仅延迟变差。
+    disconnect 时由 finally 关闭订阅并释放连接。
+    """
+    if _db_session_factory is None:
+        return
+    await _send_json(
+        ws,
+        {
+            "type": "extraction_status",
+            "subject": subject,
+            "task_id": task_id,
+            "status": "processing",
+        },
+    )
+    status = await _read_task_status(task_id)
+    if status is None:
+        return
+    if status not in _CANDIDATE_TERMINAL_STATUSES:
+        pubsub = await _open_task_pubsub(task_id)
+        if pubsub is None:
+            emit_ai_metric(
+                "websocket_fallback", 1, {"endpoint": "moxiang_master"}
+            )
+        try:
+            status = await _watch_until_terminal(pubsub, task_id)
+        finally:
+            await _close_task_pubsub(pubsub)
+        if status is None:
+            return
+    await _push_candidate_terminal(
+        ws, user_id, session_id, subject, task_id, status
+    )
+
+
 async def _submit_journey_candidate_turn(
     user_id: int, session_id: str, client_turn_id: str, text_content: str
-) -> str:
-    """Persist one final transcript and enqueue its dedicated candidate task."""
+) -> tuple[str, str]:
+    """Persist one final transcript and enqueue its dedicated candidate task.
+
+    返回 ``(turn_id, task_id)``：turn_id 供实时语音回复元数据关联用户轮次，
+    task_id 供独立的抽取监听。空会话/无数据库时返回 ``("", "")``。
+    """
     if _db_session_factory is None:
-        return ""
+        return "", ""
     async with _db_session_factory() as db:
         submission = await submit_journey_turn(
             db,
@@ -561,7 +719,7 @@ async def _submit_journey_candidate_turn(
             answer_text=text_content,
         )
         await db.commit()
-    return str(submission.task_id or "")
+    return str(submission.turn.turn_id or ""), str(submission.task_id or "")
 
 
 async def _finish_journey_turn(
@@ -643,6 +801,44 @@ async def moxiang_master_conversation(
     poll_tasks: set[asyncio.Task[None]] = set()
     journey_active = False
     journey_consent_version = "profile-text-v1"
+    # 实时语音 v2：协商成功后启用；bridge 承载实时会话与业务回调。
+    realtime_v2 = False
+    realtime_bridge: MoxiangRealtimeBridge | None = None
+    watchdog_task: asyncio.Task[None] | None = None
+
+    async def _submit_realtime_candidate(
+        text: str, client_turn_id: str
+    ) -> tuple[str, str]:
+        """实时路径的候选提交：落库+入队+推送状态+启动独立监听任务。"""
+        turn_subject = active_subject
+        turn_session_id = (
+            sessions_by_subject.get(turn_subject, "")
+            if journey_active
+            else ""
+        )
+        if not turn_session_id or _db_session_factory is None:
+            return "", ""
+        turn_id, task_id = await _submit_journey_candidate_turn(
+            user_id, turn_session_id, client_turn_id, text
+        )
+        if task_id:
+            await _send_json(
+                ws,
+                {
+                    "type": "extraction_status",
+                    "subject": turn_subject,
+                    "task_id": task_id,
+                    "status": "queued",
+                },
+            )
+            watch_task = asyncio.create_task(
+                _wait_candidate_and_push(
+                    ws, user_id, turn_session_id, turn_subject, task_id
+                )
+            )
+            poll_tasks.add(watch_task)
+            watch_task.add_done_callback(poll_tasks.discard)
+        return turn_id, task_id
 
     try:
         while True:
@@ -679,6 +875,22 @@ async def moxiang_master_conversation(
                 if _db_session_factory is None:
                     await _send_error(ws, "AI_TEMPORARILY_UNAVAILABLE", "旅程暂不可用")
                     continue
+                # v2 实时语音协商：客户端显式声明协议版本与 PCM 播放能力；
+                # 服务端门禁通过才启用，未声明的客户端继续旧协议。
+                requested_protocol = message.get(
+                    "protocolVersion", message.get("protocol_version")
+                )
+                raw_capabilities = message.get("capabilities")
+                capabilities = (
+                    raw_capabilities if isinstance(raw_capabilities, dict) else {}
+                )
+                wants_realtime_v2 = (
+                    requested_protocol == PROTOCOL_VERSION_V2
+                    and capabilities.get("pcmPlayback") is True
+                )
+                realtime_ready = (
+                    wants_realtime_v2 and realtime_gate_error() is None
+                )
                 narrative_ctx = await _load_narrative_context(user_id)
                 orchestrator.set_narrative_context(narrative_ctx)
                 consent_version = str(message.get("consentVersion", "profile-text-v1"))
@@ -700,6 +912,12 @@ async def moxiang_master_conversation(
                         history = await _load_master_history(db, session.session_id)
                 except Exception as exc:  # noqa: BLE001
                     code = "AI_CONSENT_REQUIRED" if isinstance(exc, AIConsentRequired) else "AI_TEMPORARILY_UNAVAILABLE"
+                    logger.warning(
+                        "moxiang_session_start_failed subject=%s error=%s",
+                        requested_subject,
+                        type(exc).__name__,
+                        exc_info=True,
+                    )
                     await _send_error(ws, code, "墨相师旅程暂不可用，可稍后重试")
                     continue
                 sessions_by_subject[requested_subject] = session.session_id
@@ -707,18 +925,50 @@ async def moxiang_master_conversation(
                 journey_active = True
                 journey_consent_version = consent_version
                 orchestrator.hydrate_history(history)
-                await _send_json(
-                    ws,
-                    {
-                        "type": "journey_ready",
-                        "session_id": session.session_id,
-                        "subject": requested_subject,
-                        "journey_stage": str(
-                            (stage_row or {}).get("journey_stage") or "chatting"
-                        ),
-                        "resumed": not session.created,
-                    },
-                )
+                if realtime_ready:
+                    realtime_v2 = True
+                    if realtime_bridge is None:
+                        realtime_bridge = MoxiangRealtimeBridge(
+                            ws=ws,
+                            user_id=user_id,
+                            context=RealtimeRouteContext(
+                                session_id=session.session_id,
+                                subject=requested_subject,
+                                narrative_context=narrative_ctx,
+                            ),
+                            poll_tasks=poll_tasks,
+                            emit=lambda event: _send_json(ws, event),
+                            submit_candidate=_submit_realtime_candidate,
+                        )
+                    else:
+                        realtime_bridge.context.session_id = session.session_id
+                        realtime_bridge.context.subject = requested_subject
+                        realtime_bridge.context.narrative_context = narrative_ctx
+                        if realtime_bridge.session is not None:
+                            await realtime_bridge.session.mark_context_dirty()
+                journey_ready_payload: dict[str, Any] = {
+                    "type": "journey_ready",
+                    "session_id": session.session_id,
+                    "subject": requested_subject,
+                    "journey_stage": str(
+                        (stage_row or {}).get("journey_stage") or "chatting"
+                    ),
+                    "resumed": not session.created,
+                }
+                if realtime_ready:
+                    journey_ready_payload["protocol_version"] = PROTOCOL_VERSION_V2
+                    journey_ready_payload["realtime"] = {
+                        "provider": str(settings.ai_realtime_voice_provider),
+                        "input": {
+                            "sample_rate": UPLINK_SAMPLE_RATE,
+                            "format": AUDIO_FORMAT,
+                        },
+                        "output": {
+                            "sample_rate": DOWNLINK_SAMPLE_RATE,
+                            "format": AUDIO_FORMAT,
+                        },
+                    }
+                await _send_json(ws, journey_ready_payload)
                 await _push_journey_progress(ws, session.session_id, requested_subject)
                 if session.created:
                     await _send_json(
@@ -774,6 +1024,12 @@ async def moxiang_master_conversation(
                     sessions_by_subject[requested_subject] = session.session_id
                     active_subject = requested_subject
                     orchestrator.hydrate_history(history)
+                    if realtime_v2 and realtime_bridge is not None:
+                        # 主体切换：实时会话换业务上下文，不换供应商连接。
+                        realtime_bridge.context.session_id = session.session_id
+                        realtime_bridge.context.subject = requested_subject
+                        if realtime_bridge.session is not None:
+                            await realtime_bridge.session.mark_context_dirty()
                 except Exception as exc:  # noqa: BLE001
                     code = (
                         "AI_CONSENT_REQUIRED"
@@ -825,6 +1081,12 @@ async def moxiang_master_conversation(
                         f"消息过长（上限 {_MAX_TEXT_LENGTH} 字）",
                     )
                     continue
+                # 切文字输入：统一停止实时采集/播放并关闭上游（方案 §2）。
+                # 再次进入语音时 audio_start 会按当前业务会话重建上下文。
+                if realtime_bridge is not None and realtime_bridge.session is not None:
+                    await realtime_bridge.session.aclose()
+                    realtime_bridge.session = None
+                    release_session_slot(user_id)
                 turn_subject = active_subject
                 turn_session_id = (
                     sessions_by_subject.get(turn_subject, "")
@@ -833,7 +1095,7 @@ async def moxiang_master_conversation(
                 )
                 task_id = ""
                 if turn_session_id and _db_session_factory is not None:
-                    task_id = await _submit_journey_candidate_turn(
+                    _turn_id, task_id = await _submit_journey_candidate_turn(
                         user_id,
                         turn_session_id,
                         str(message.get("clientTurnId") or uuid.uuid4().hex),
@@ -919,6 +1181,40 @@ async def moxiang_master_conversation(
                     )
 
             elif msg_type == "audio_start":
+                # v2 实时路径：audio_start 只表示客户端准备录音；上游由
+                # voice_ready 驱动，首个 audio_start 时建立实时会话。
+                if realtime_v2 and realtime_bridge is not None:
+                    if realtime_bridge.session is None:
+                        used_minutes = await realtime_daily_minutes_used(user_id)
+                        if used_minutes is None:
+                            await _send_error(
+                                ws,
+                                "AI_TEMPORARILY_UNAVAILABLE",
+                                "语音额度暂不可用，请稍后重试",
+                            )
+                            continue
+                        if used_minutes >= settings.ai_realtime_daily_minutes:
+                            await _send_error(
+                                ws,
+                                "AI_QUOTA_EXCEEDED",
+                                "今日语音时长已用完，明天再来",
+                            )
+                            continue
+                        if not acquire_session_slot(user_id):
+                            await _send_error(
+                                ws,
+                                "REALTIME_SESSION_BUSY",
+                                "已有语音会话进行中",
+                            )
+                            continue
+                        started = await realtime_bridge.start_session()
+                        if started is None:
+                            release_session_slot(user_id)
+                            continue
+                        watchdog_task = asyncio.create_task(
+                            realtime_watchdog(realtime_bridge, ws)
+                        )
+                    continue
                 if not voice_enabled:
                     await _send_error(
                         ws, "AI_FEATURE_DISABLED", "语音对话功能当前不可用"
@@ -961,6 +1257,23 @@ async def moxiang_master_conversation(
                 )
 
             elif msg_type == "audio_chunk":
+                # v2 实时路径：录音帧转交实时会话（输入窗口关闭时由会话丢弃）。
+                if (
+                    realtime_v2
+                    and realtime_bridge is not None
+                    and realtime_bridge.session is not None
+                ):
+                    b64data = str(message.get("data", ""))
+                    if not b64data:
+                        continue
+                    try:
+                        pcm_bytes = base64.b64decode(b64data)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if len(pcm_bytes) > STREAM_CHUNK_MAX_BYTES:
+                        continue
+                    await realtime_bridge.session.handle_audio_chunk(pcm_bytes)
+                    continue
                 if asr_client is None:
                     continue
                 b64data = str(message.get("data", ""))
@@ -982,6 +1295,14 @@ async def moxiang_master_conversation(
                     )
 
             elif msg_type == "audio_end":
+                # v2 实时路径：说话结束由供应商 VAD 判定，audio_end 是 no-op。
+                if (
+                    realtime_v2
+                    and realtime_bridge is not None
+                    and realtime_bridge.session is not None
+                ):
+                    await realtime_bridge.session.handle_audio_end()
+                    continue
                 if asr_client is None:
                     continue
                 if partial_task is not None:
@@ -1015,7 +1336,7 @@ async def moxiang_master_conversation(
                     and _db_session_factory is not None
                     and final_transcript.strip()
                 ):
-                    task_id = await _submit_journey_candidate_turn(
+                    _turn_id, task_id = await _submit_journey_candidate_turn(
                         user_id,
                         turn_session_id,
                         uuid.uuid4().hex,
@@ -1050,6 +1371,51 @@ async def moxiang_master_conversation(
                     poll_tasks,
                 )
                 asr_client = None
+
+            elif msg_type == "voice_input_begin":
+                # v2：客户端真实开麦，绑定本轮发言的幂等身份。
+                if (
+                    realtime_v2
+                    and realtime_bridge is not None
+                    and realtime_bridge.session is not None
+                ):
+                    await realtime_bridge.session.handle_voice_input_begin(
+                        str(message.get("client_turn_id") or "")
+                    )
+
+            elif msg_type == "interrupt":
+                # v2：点击打断，立即作废当前回复世代并轮转上游。
+                if (
+                    realtime_v2
+                    and realtime_bridge is not None
+                    and realtime_bridge.session is not None
+                ):
+                    await realtime_bridge.session.handle_interrupt(
+                        str(message.get("generation_id") or "")
+                    )
+
+            elif msg_type == "playback_progress":
+                if (
+                    realtime_v2
+                    and realtime_bridge is not None
+                    and realtime_bridge.session is not None
+                ):
+                    await realtime_bridge.session.handle_playback_progress(
+                        str(message.get("generation_id") or ""),
+                        int(message.get("played_ms") or 0),
+                    )
+
+            elif msg_type == "playback_finished":
+                if (
+                    realtime_v2
+                    and realtime_bridge is not None
+                    and realtime_bridge.session is not None
+                ):
+                    await realtime_bridge.session.handle_playback_finished(
+                        str(message.get("generation_id") or ""),
+                        str(message.get("status") or ""),
+                        int(message.get("played_ms") or 0),
+                    )
 
             elif msg_type == "listen":
                 if not orchestrator._last_reply_text:  # noqa: SLF001
@@ -1088,7 +1454,7 @@ async def moxiang_master_conversation(
                 )
                 task_id = ""
                 if turn_session_id and _db_session_factory is not None:
-                    task_id = await _submit_journey_candidate_turn(
+                    _turn_id, task_id = await _submit_journey_candidate_turn(
                         user_id,
                         turn_session_id,
                         str(message.get("clientTurnId") or uuid.uuid4().hex),
@@ -1159,6 +1525,10 @@ async def moxiang_master_conversation(
             },
         )
     finally:
+        if watchdog_task is not None:
+            watchdog_task.cancel()
+        if realtime_bridge is not None:
+            await realtime_bridge.close_session()
         if partial_task is not None:
             partial_task.cancel()
         for poll_task in tuple(poll_tasks):

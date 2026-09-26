@@ -66,6 +66,25 @@ class Settings(BaseSettings):
     superlike_daily_vip_limit: int = 3
     paper_plane_daily_limit: int = 3
 
+    live_enabled: bool = False
+    live_provider: Literal["mock", "tencent"] = "mock"
+    tencent_live_sdk_app_id: int | None = Field(default=None, ge=1)
+    tencent_live_sdk_secret_key: SecretStr | None = None
+    tencent_live_secret_id: str | None = None
+    tencent_live_secret_key: SecretStr | None = None
+    tencent_live_region: str = "ap-guangzhou"
+    tencent_live_api_timeout_seconds: float = Field(default=5, gt=0, le=30)
+    tencent_live_max_retries: int = Field(default=2, ge=0, le=5)
+    tencent_live_user_sig_ttl_seconds: int = Field(default=900, ge=60, le=86400)
+    live_rtc_ticket_limit_per_minute: int = Field(default=10, ge=1, le=120)
+    tencent_live_callback_secret: SecretStr | None = None
+    tencent_live_callback_max_skew_seconds: int = Field(default=300, ge=0, le=3600)
+    tencent_live_callback_max_body_bytes: int = Field(default=65536, ge=1024, le=1048576)
+    tencent_live_callback_event_types_raw: str = ""
+    tencent_live_cloud_recording_enabled: bool = False
+    tencent_live_mix_stream_enabled: bool = False
+    tencent_live_css_enabled: bool = False
+
     # AI avatar calls an OpenAI-compatible chat-completions service from the
     # backend only. API keys must never be exposed to the mini-program.
     ai_avatar_provider: Literal["disabled", "openai_compatible"] = "disabled"
@@ -200,7 +219,35 @@ class Settings(BaseSettings):
     # 语音转写单次音频时长上限（秒，与前端录音 60s 上限对齐）。
     ai_asr_max_duration_seconds: int = Field(default=60, gt=0, le=300)
     # 临时音频文件过期清理（小时），合规要求转写后短期保留即删除。
+    # 音频 retention 与 voice_transcript retention 分开配置，禁止混用。
     ai_voice_audio_retention_hours: int = Field(default=24, gt=0)
+    # REST ASR 的转写原文保留期。它是数据库文本，不是临时音频文件；到期后由
+    # worker 从 voice_transcript 删除，且不会影响 ai_memory_state 的逐行 TTL。
+    ai_voice_transcript_retention_hours: int = Field(default=72, gt=0)
+    # worker 主循环执行语音音频清理的最小间隔（秒）。0 表示每轮都尝试。
+    ai_voice_audio_cleanup_interval_seconds: int = Field(default=3600, ge=0)
+
+    # ==================== Memory State TTL 定时清理（Batch-1 Task 2）====================
+    # 单批过期的 ai_memory_state 行数上限（expire_memory_states 的 limit）。
+    ai_memory_state_ttl_batch_size: int = Field(default=200, ge=1)
+    # 单轮最多执行的批次数上限（每批独立会话/独立提交）。
+    ai_memory_state_ttl_max_batches: int = Field(default=10, ge=1)
+    # 单轮墙钟时间上限（秒）：每批开始前检查，预算耗尽即停、剩余留给下一轮。
+    ai_memory_state_ttl_time_budget_seconds: float = Field(default=30.0, gt=0)
+    # worker 主循环执行 Memory State TTL 清理的最小间隔（秒）。0 表示每轮都尝试。
+    ai_memory_state_ttl_cleanup_interval_seconds: int = Field(default=3600, ge=0)
+
+    # ==================== AI 文本/审计/outbox retention（Task 9）====================
+    # 成功 outbox 从 occurred_at 起保留一周；dead-letter 从 dead_letter_at 起
+    # 保留 30 天。pending/processing 永不由 retention 任务删除，仍由消费者的
+    # 有限重试、租约回收和 dead-letter 状态机负责。
+    ai_derivation_outbox_succeeded_retention_hours: int = Field(default=168, gt=0)
+    ai_derivation_outbox_dead_letter_retention_hours: int = Field(default=720, gt=0)
+    # Provider 审计不含 prompt/response，但保留最小调用元数据供追责与计费复核。
+    ai_generation_audit_retention_hours: int = Field(default=2160, gt=0)
+    # 每张表每轮最多删除的行数，以及 worker 定时执行的最小间隔。
+    ai_retention_cleanup_batch_size: int = Field(default=200, ge=1)
+    ai_retention_cleanup_interval_seconds: int = Field(default=3600, ge=0)
 
     # ==================== 实时半双工语音对话（P-04b）====================
     # 实时对话模式开关：默认关闭。生产环境 fail closed（见
@@ -218,6 +265,29 @@ class Settings(BaseSettings):
     ai_aliyun_voice_asr_ws_url: str = (
         "wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1"
     )
+
+    # ==================== 实时全双工语音对话（SenseAudio，v2 协议）====================
+    # 墨相师实时语音分支：由端到端实时供应商直接产出语音回复（ASR+LLM+TTS 一体），
+    # 画像抽取仍走现有旅程任务。默认关闭；生产环境 fail closed：
+    # 需三道审批门禁 + 供应商凭据（见 _validate_ai_feature_gates，按实际启用
+    # 能力校验对应凭据，不借用阿里云 AccessKey 门禁）。
+    # api_key 仅存于被忽略的 .env，不进 .env.example、不进代码与日志。
+    ai_realtime_voice_enabled: bool = False
+    # 实时供应商选择；空串表示未配置，v2 协商直接失败。
+    ai_realtime_voice_provider: Literal["", "senseaudio"] = ""
+    ai_senseaudio_api_key: SecretStr | None = None
+    ai_senseaudio_ws_url: str = "wss://api.senseaudio.cn/ws/v1/realtime/voice-dialog"
+    ai_senseaudio_model: str = "senseaudio-realtime-1.0"
+    # 供应商音色；空串使用供应商默认女声。
+    ai_senseaudio_voice: str = ""
+    # 会话与额度灰度默认值（方案 §5）：每用户同时 1 条会话（内存计数）、
+    # 单次最多 10 分钟、每日最多 20 分钟连接时长、无有效发言 60 秒退出。
+    ai_realtime_session_max_minutes: int = Field(default=10, gt=0, le=60)
+    ai_realtime_daily_minutes: int = Field(default=20, gt=0, le=600)
+    ai_realtime_idle_exit_seconds: int = Field(default=60, gt=0, le=600)
+    # 下行放行前的输入审核等待上限（秒）：最终转写提交（含审核）超过该时长
+    # 仍未通过时终止本轮回复，绝不放行未经审核的下行内容。
+    ai_realtime_submission_hold_seconds: float = Field(default=15.0, gt=0, le=60)
 
     # AI 任务/租约/重试/限流配置。
     ai_lease_seconds: int = Field(default=300, gt=0, le=3600)
@@ -250,8 +320,9 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
-    # AI 军师（助手/润色/搜索/匹配，合著仓方案）。与画像/搜索/语音的
-    # ai_provider/ai_master_* 那套互不影响：本套用 ai_enabled + ai_base_url 直连。
+    # AI 军师（助手/润色/搜索/匹配，合著仓方案）。与画像/搜索/语音共用
+    # 生产 fail-closed：``ai_enabled`` 计入 any_ai_enabled。运行时仍走
+    # ``require_ai_feature(AiFeature.ADVISOR)``（master + ai_enabled + 审批门）。
     ai_enabled: bool = False
     ai_base_url: str = "https://api.deepseek.com/v1"
     ai_api_key: SecretStr | None = None
@@ -330,6 +401,34 @@ class Settings(BaseSettings):
         """Prevent Mock providers from being enabled in production."""
         if self.environment in {"staging", "production"} and self.auto_init_db:
             raise ValueError("staging/production 环境必须关闭 AUTO_INIT_DB")
+        if self.environment in {"staging", "production"} and self.live_provider == "mock":
+            raise ValueError("staging/production 环境禁止使用直播 Mock Provider")
+        if self.live_enabled and self.live_provider == "tencent":
+            sdk_secret = (
+                self.tencent_live_sdk_secret_key.get_secret_value().strip()
+                if self.tencent_live_sdk_secret_key
+                else ""
+            )
+            cam_secret = (
+                self.tencent_live_secret_key.get_secret_value().strip()
+                if self.tencent_live_secret_key
+                else ""
+            )
+            if not self.tencent_live_sdk_app_id or not sdk_secret:
+                raise ValueError(
+                    "启用腾讯直播 Provider 时必须配置 SDKAppID 和 SDKSecretKey"
+                )
+            if not (self.tencent_live_secret_id or "").strip() or not cam_secret:
+                raise ValueError(
+                    "启用腾讯直播 Provider 时必须配置 CAM SecretId 和 SecretKey"
+                )
+            if (
+                not self.tencent_live_callback_secret
+                or not self.tencent_live_callback_secret.get_secret_value().strip()
+            ):
+                raise ValueError("启用腾讯直播 Provider 时必须配置回调密钥")
+            if not self.tencent_live_callback_event_types_raw.strip():
+                raise ValueError("启用腾讯直播 Provider 时必须配置回调事件白名单")
         if not self.is_test_mode and (
             self.sms_provider == "mock" or self.wechat_provider == "mock" or self.wechat_payment_mode == "mock"
         ):
@@ -382,7 +481,14 @@ class Settings(BaseSettings):
                 self.ai_compatibility_shadow_enabled,
                 self.ai_recommend_enabled,
                 self.ai_voice_enabled,
+                # 实时对话/实时语音各自独立开关，必须参与判定，否则仅开
+                # 其中一个时整段 fail-closed 校验会被跳过。
+                self.ai_voice_conversation_enabled,
+                self.ai_realtime_voice_enabled,
                 self.ai_moxiang_journey_enabled,
+                # legacy 军师直连栈：只开 ai_enabled 也必须走审批门，
+                # 不得绕过生产 fail-closed（修复清单 §3.12.4）。
+                self.ai_enabled,
             )
         )
         if not any_ai_enabled:
@@ -409,6 +515,18 @@ class Settings(BaseSettings):
             ):
                 raise ValueError(
                     "生产环境启用实时语音对话必须配置 AccessKey ID/Secret"
+                )
+        if self.ai_realtime_voice_enabled:
+            # 实时语音 v2 按实际启用的能力校验对应凭据：SenseAudio 用自己的
+            # api_key，不借用阿里云 AccessKey 门禁；旧 STT/TTS 启用时仍走
+            # 上面的原凭据检查。
+            if self.ai_realtime_voice_provider != "senseaudio":
+                raise ValueError(
+                    "生产环境启用实时语音必须配置 ai_realtime_voice_provider"
+                )
+            if not self.ai_senseaudio_api_key:
+                raise ValueError(
+                    "生产环境启用实时语音必须配置 SenseAudio api_key"
                 )
 
 

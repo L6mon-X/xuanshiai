@@ -50,18 +50,19 @@ async def list_matchmakers(
     store_id: int | None = Query(None, ge=1),
     commission_level_id: int | None = Query(None, ge=1),
     locked: bool | None = Query(None),
+    in_store: bool | None = Query(None, description="true 仅分店红娘 / false 仅总店红娘 / 不传 全部"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> MatchmakerStaffPage:
     _guard(current)
     return await service.list_staff(
-        db, current, page, page_size, keyword, store_id, commission_level_id, locked
+        db, current, page, page_size, keyword, store_id, commission_level_id, locked, in_store
     )
 
 
 @router.get("/matchmakers/user-candidates", response_model=list[MatchmakerUserCandidate])
 async def matchmaker_user_candidates(
-    keyword: str = Query(..., min_length=2, max_length=100),
+    keyword: str = Query(..., min_length=1, max_length=100),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> list[MatchmakerUserCandidate]:
@@ -95,7 +96,7 @@ async def get_matchmaker(
     db: AsyncSession = Depends(get_db),
 ) -> MatchmakerStaffDetail:
     _guard(current)
-    return await service.get_staff(db, matchmaker_id)
+    return await service.get_staff(db, matchmaker_id, current)
 
 
 @router.put("/matchmakers/{matchmaker_id}", response_model=MatchmakerStaffDetail)
@@ -186,7 +187,7 @@ async def get_work_report(
 ) -> MatchmakerWorkReport:
     _guard(current)
     start, end = _dates(from_date, to_date)
-    return await service.work_report(db, matchmaker_id, start, end)
+    return await service.work_report(db, matchmaker_id, start, end, current)
 
 
 @router.get("/matchmakers/{matchmaker_id}/report", response_model=MatchmakerDetailReport)
@@ -199,7 +200,7 @@ async def get_report(
 ) -> MatchmakerDetailReport:
     _guard(current)
     start, end = _dates(from_date, to_date)
-    return await service.report(db, matchmaker_id, start, end)
+    return await service.report(db, matchmaker_id, start, end, current)
 
 
 @router.post("/matchmakers/{matchmaker_id}/poster", response_model=MatchmakerPosterResponse)
@@ -209,7 +210,7 @@ async def create_poster(
     db: AsyncSession = Depends(get_db),
 ) -> MatchmakerPosterResponse:
     _guard(current)
-    await service.get_staff(db, matchmaker_id)
+    await service.get_staff(db, matchmaker_id, current)
     return await service.poster(matchmaker_id)
 
 

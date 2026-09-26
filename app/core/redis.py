@@ -74,11 +74,32 @@ class LoopAwareRedis:
 
 redis_client = LoopAwareRedis(settings.redis_url)
 _local_quota_counts: dict[str, int] = {}
+_local_window_counts: dict[str, tuple[float, int]] = {}
 
 CONSUME_DAILY_LUA = """
 local value = redis.call('INCR', KEYS[1])
 if value == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
 if value > tonumber(ARGV[1]) then redis.call('DECR', KEYS[1]); return 0 end
+return 1
+"""
+
+# Read and decrement in one Redis script so two concurrent refund attempts
+# cannot both observe the same positive value and drive the quota negative.
+# The script intentionally does not call EXPIRE: DECR preserves the existing
+# TTL, while a missing/empty key is a no-op.
+REFUND_DAILY_LUA = """
+local value = redis.call('GET', KEYS[1])
+if not value then return 0 end
+value = tonumber(value)
+if not value or value <= 0 then return 0 end
+redis.call('DECR', KEYS[1])
+return 1
+"""
+
+CONSUME_WINDOW_LUA = """
+local value = redis.call('INCR', KEYS[1])
+if value == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
+if value > tonumber(ARGV[1]) then return 0 end
 return 1
 """
 
@@ -116,9 +137,7 @@ async def consume_daily(key: str, limit: int) -> bool:
 
 async def refund_daily(key: str) -> None:
     try:
-        value = await redis_client.get(key)
-        if value and int(value) > 0:
-            await redis_client.decr(key)
+        await redis_client.eval(REFUND_DAILY_LUA, 1, key)
     except RedisError as exc:
         if _local_fallback_enabled():
             used = _local_quota_counts.get(key, 0)
@@ -136,4 +155,37 @@ async def get_daily_used(key: str) -> int:
     except RedisError as exc:
         if _local_fallback_enabled():
             return _local_quota_counts.get(key, 0)
+        raise HTTPException(503, detail="Redis服务未配置或暂时不可用") from exc
+
+
+async def consume_rate_limit(key: str, limit: int, window_seconds: int) -> bool:
+    """Consume a fixed-window rate-limit token; production fails closed."""
+    try:
+        consumed = await redis_client.eval(
+            CONSUME_WINDOW_LUA, 1, key, limit, window_seconds
+        )
+        return bool(consumed)
+    except RedisError as exc:
+        if _local_fallback_enabled():
+            now = datetime.now(UTC).timestamp()
+            expires_at, used = _local_window_counts.get(key, (0.0, 0))
+            if expires_at <= now:
+                expires_at, used = now + window_seconds, 0
+            if used >= limit:
+                return False
+            _local_window_counts[key] = (expires_at, used + 1)
+            return True
+        raise HTTPException(503, detail="Redis服务未配置或暂时不可用") from exc
+
+
+async def consume_once(key: str, ttl_seconds: int) -> bool:
+    """Atomically consume a short-lived single-use key; production fails closed."""
+    try:
+        return bool(await redis_client.set(key, "1", ex=ttl_seconds, nx=True))
+    except RedisError as exc:
+        if _local_fallback_enabled():
+            if key in _local_window_counts:
+                return False
+            _local_window_counts[key] = (datetime.now(UTC).timestamp() + ttl_seconds, 1)
+            return True
         raise HTTPException(503, detail="Redis服务未配置或暂时不可用") from exc

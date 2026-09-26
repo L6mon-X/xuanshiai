@@ -21,12 +21,16 @@ class MemberListItem(BaseModel):
     is_married: int | None = None
     height: int | None = None
     weight: int | None = None
+    constellation: str | None = None
     zodiac: str | None = None
     household: str | None = None
     ethnicity: str | None = None
     house: str | None = None
     car: str | None = None
     smoking: str | None = None
+    drinking: str | None = None
+    religion: str | None = None
+    marriage_plan: str | None = None
     hometown_province_code: str | None = None
     hometown_city_code: str | None = None
     hometown_district_code: str | None = None
@@ -40,7 +44,10 @@ class MemberListItem(BaseModel):
     hometown: str | None = None
     residence: str | None = None
     education: str | None = None
+    school: str | None = None
     job: str | None = None
+    company: str | None = None
+    match_status: int | None = None
     auth_status: int | None = None
     intention_level: int | None = None
     last_follow_at: datetime | None = None
@@ -78,6 +85,30 @@ class MemberStatusUpdate(BaseModel):
 class MemberStatusResponse(BaseModel):
     id: int
     status: Literal[1, 2, 3]
+    reason: str
+
+
+class MemberProfileUpdate(BaseModel):
+    """后台统一修改会员基础、认证和隐私信息。未提交字段保持不变。"""
+
+    nickname: str | None = Field(default=None, max_length=64)
+    avatar: str | None = Field(default=None, max_length=255)
+    status: Literal[1, 2, 3] | None = None
+    is_married: Literal[0, 1, 2, 3] | None = None
+    is_single_pledge: bool | None = None
+    real_name: str | None = Field(default=None, max_length=64)
+    auth_status: Literal[0, 1, 2, 3] | None = None
+    house_verified: Literal[0, 1, 2, 3] | None = None
+    education_verified: Literal[0, 1, 2, 3] | None = None
+    match_status: Literal[1, 2, 3, 4, 5] | None = None
+    only_vip_can_see_detail: bool | None = None
+    show_profile: bool | None = None
+    reason: str = Field(min_length=1, max_length=255)
+
+
+class MemberProfileUpdateResponse(BaseModel):
+    user_id: int
+    updated_fields: list[str]
     reason: str
 
 
