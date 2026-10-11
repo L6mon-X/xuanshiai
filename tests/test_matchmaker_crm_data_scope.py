@@ -23,6 +23,21 @@ from app.schemas.matchmaker_admin import MatchmakerAdminAccount
 SELF_MATCHMAKER_USER_ID = 7
 ORGANIZATION_ID = 10
 
+# `members()` 在 2026-10-11 补齐后台筛选参数后新增的 query 参数。单元测试直接调用路由
+# 函数（不经 FastAPI 解析），未显式传值的参数拿到的是 `Query` 默认对象而不是 None，
+# 因此这里显式补齐；新增参数时同步补充本字典。
+NEW_MEMBER_FILTER_DEFAULTS: dict[str, object] = {
+    "search_type": None, "source": None, "region": None, "xiangqin_status": None,
+    "realname": None, "cert_status": None, "organization_id": None, "matchmaker_id": None,
+    "promoter_id": None, "age_min": None, "age_max": None, "height_min": None,
+    "height_max": None, "marriage": None, "education": None, "occupation": None,
+    "income": None, "residence": None, "hometown": None, "hukou": None, "religion": None,
+    "car": None, "level": None, "tags": None, "offline_vip": None, "promoted": None,
+    "newcomer": None, "activity_signup": None, "wechat_added": None, "behavior_type": None,
+    "created_start": None, "created_end": None, "assigned_start": None, "assigned_end": None,
+    "order": None,
+}
+
 
 def _admin(scope: str, *, permissions: set[str] | None = None, matchmaker_user_id: int | None = SELF_MATCHMAKER_USER_ID, organization_id: int | None = ORGANIZATION_ID) -> CurrentMatchmakerAdmin:
     return CurrentMatchmakerAdmin(
@@ -178,6 +193,7 @@ async def test_member_list_applies_scope_predicate() -> None:
         sort_by="created_at",
         current=_admin("SELF"),
         db=db,
+        **NEW_MEMBER_FILTER_DEFAULTS,
     )
     assert page.total == 0
     assert "scope_assignment.matchmaker_id = :scope_matchmaker_user_id" in db.sql()
@@ -200,6 +216,7 @@ async def test_member_list_filters_by_organization_for_org_account() -> None:
         sort_by="created_at",
         current=_admin("ORGANIZATION"),
         db=db,
+        **NEW_MEMBER_FILTER_DEFAULTS,
     )
     assert "scope_assignment.organization_id IN (SELECT id FROM organization" in db.sql()
     assert db.statements[1][1]["scope_organization_id"] == ORGANIZATION_ID
@@ -221,6 +238,7 @@ async def test_member_list_returns_nothing_for_unbound_account() -> None:
         sort_by="created_at",
         current=_admin("ORGANIZATION", matchmaker_user_id=None, organization_id=None),
         db=db,
+        **NEW_MEMBER_FILTER_DEFAULTS,
     )
     assert page.total == 0
     assert "1 = 0" in db.sql()

@@ -52,6 +52,17 @@ class MemberListItem(BaseModel):
     intention_level: int | None = None
     last_follow_at: datetime | None = None
     next_follow_at: datetime | None = None
+    # 2026-10-11 新增：会员资料页筛选与展示补列，迁移未执行时 SQL 侧兜底为 NULL/0。
+    source: str | None = None
+    region: str | None = None
+    cert_status: int | None = None
+    wechat_added: int | None = None
+    promoted: int | None = None
+    newcomer: int | None = None
+    activity_signup: int | None = None
+    level: str | None = None
+    fetched_at: datetime | None = None
+    assigned_at: datetime | None = None
 
 
 class MemberPage(BaseModel):

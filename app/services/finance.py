@@ -23,6 +23,10 @@ from app.schemas.finance import (
     CommissionRuleResponse,
     CreditGrantRequest,
     CreditGrantResult,
+    CreditRecordItem,
+    CreditRecordPage,
+    CREDIT_CATEGORY_SOURCES,
+    CREDIT_MEMBER_SCOPE_SQL,
     EventOption,
     FinanceOrderCreate,
     FinanceReportRow,
@@ -45,6 +49,7 @@ from app.schemas.finance import (
     StoreCommissionSummary,
     StoreOption,
 )
+from app.core.sensitive_fields import mask_contact, redaction_level_from_permissions
 from app.services.matchmaker import activate_paid_service_order
 from app.services.runtime_config import withdrawal_policy
 
@@ -676,6 +681,96 @@ async def admin_grant_credits(db: AsyncSession, admin: CurrentUser, request: Cre
         sample_ledger_ids=ledger_ids[:10],
         target_user_ids=targets,
     )
+
+
+# ============================================
+# 后台「积分明细」页列表 service
+# ============================================
+# 数据来源：account_ledger 中 account_type='user' 的积分流水。发放积分写入
+# source_type='admin_grant'（见 admin_grant_credits），其它类别由各自的业务写入。
+# 会员范围、类别、操作来源、时间区间和关键词都在这里收口；数据可见范围统一走
+# `_account_anchor_scope`，与账本/分成/提现同一口径。
+
+
+def _credit_category_of(source_type: str) -> str | None:
+    """把 account_ledger.source_type 反查成页面上的积分类别编码。"""
+    for category, sources in CREDIT_CATEGORY_SOURCES.items():
+        if source_type in sources:
+            return category
+    return None
+
+
+async def admin_list_credit_records(
+    db: AsyncSession,
+    page: int,
+    page_size: int,
+    member_scope: str | None = None,
+    action_source: str | None = None,
+    category: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    keyword: str | None = None,
+    *,
+    admin: CurrentMatchmakerAdmin,
+) -> CreditRecordPage:
+    params: dict[str, object] = {"limit": page_size, "offset": (page - 1) * page_size}
+    where = [
+        "al.account_type = 'user'",
+        _account_anchor_scope(admin, params, type_column="al.account_type", account_column="al.account_id"),
+    ]
+    if member_scope in CREDIT_MEMBER_SCOPE_SQL:
+        where.append(CREDIT_MEMBER_SCOPE_SQL[member_scope])
+    if action_source == "admin":
+        # 页面上「管理员操作」= 后台人工发放/扣减，source_id 记操作人 users.id。
+        where.append("al.source_type = 'admin_grant'")
+    if category in CREDIT_CATEGORY_SOURCES:
+        sources = CREDIT_CATEGORY_SOURCES[category]
+        placeholders = []
+        for index, source in enumerate(sources):
+            key = f"source_{index}"
+            params[key] = source
+            placeholders.append(f":{key}")
+        where.append(f"al.source_type IN ({', '.join(placeholders)})")
+    if start_date:
+        where.append("al.created_at >= CONCAT(:start_date, ' 00:00:00')")
+        params["start_date"] = start_date
+    if end_date:
+        where.append("al.created_at < DATE_ADD(CONCAT(:end_date, ' 00:00:00'), INTERVAL 1 DAY)")
+        params["end_date"] = end_date
+    if keyword:
+        where.append("(u.nickname LIKE CONCAT('%', :keyword, '%') OR u.id = :keyword_id)")
+        params["keyword"] = keyword
+        params["keyword_id"] = int(keyword) if keyword.isdigit() else -1
+    clause = " AND ".join(where)
+    base = """FROM account_ledger al JOIN users u ON u.id = al.account_id
+        LEFT JOIN user_privacy pr ON pr.user_id = u.id"""
+    rows = await db.execute(text(f"""SELECT al.id, al.account_id AS user_id, u.nickname, u.avatar, u.phone,
+        al.direction, al.amount, al.state, al.source_type, al.source_id, al.created_at
+        {base} WHERE {clause} ORDER BY al.id DESC LIMIT :limit OFFSET :offset"""), params)
+    count = await db.execute(text(f"SELECT COUNT(*) {base} WHERE {clause}"),
+        {key: value for key, value in params.items() if key not in ("limit", "offset")})
+    total = int(count.scalar() or 0)
+    level = redaction_level_from_permissions(admin.permissions)
+    items = []
+    for row in rows.mappings().all():
+        data = dict(row)
+        source_type = str(data["source_type"])
+        items.append(CreditRecordItem(
+            id=data["id"],
+            user_id=data["user_id"],
+            nickname=data["nickname"],
+            avatar=data["avatar"],
+            phone=mask_contact(data.get("phone"), level),
+            direction=data["direction"],
+            amount=data["amount"],
+            state=data["state"],
+            source_type=source_type,
+            action_source="管理员操作" if source_type == "admin_grant" else "系统",
+            category=_credit_category_of(source_type),
+            operator_id=data["source_id"] if source_type == "admin_grant" else None,
+            created_at=data["created_at"],
+        ))
+    return CreditRecordPage(items=items, page=page, page_size=page_size, total=total, has_more=page * page_size < total)
 
 
 # ============================================

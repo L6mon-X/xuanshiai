@@ -465,6 +465,14 @@ LEFT JOIN users u ON u.id = o.buyer_user_id
 """
 
 
+# 搜索方式：按商品关键词 / 按买家手机。值为服务端白名单内的固定 SQL 片段，不拼接用户输入。
+_ORDER_SEARCH_TYPE_SQL: dict[str, str] = {
+    "product": "p.name LIKE CONCAT('%', :kw, '%')",
+    "phone": "u.phone LIKE CONCAT('%', :kw, '%')",
+}
+_ORDER_SEARCH_TYPE_DEFAULT = "product"
+
+
 async def list_orders(
     db: AsyncSession,
     page: int,
@@ -477,6 +485,7 @@ async def list_orders(
     buyer_keyword: str | None,
     verify_start: str | None,
     verify_end: str | None,
+    search_type: str | None = None,
 ) -> MerchantOrderPage:
     where = ["1=1"]
     params: dict = {"limit": page_size, "offset": (page - 1) * page_size}
@@ -490,7 +499,7 @@ async def list_orders(
         where.append("o.verify_status = :verify_status")
         params["verify_status"] = verify_status
     if keyword:
-        where.append("p.name LIKE CONCAT('%', :kw, '%')")
+        where.append(_ORDER_SEARCH_TYPE_SQL.get(search_type or "", _ORDER_SEARCH_TYPE_SQL[_ORDER_SEARCH_TYPE_DEFAULT]))
         params["kw"] = keyword
     if order_no:
         where.append("o.order_no LIKE CONCAT('%', :order_no, '%')")

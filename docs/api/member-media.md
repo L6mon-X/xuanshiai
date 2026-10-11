@@ -531,3 +531,11 @@ Authorization: Bearer <token>
 | DELETE | `/api/v1/admin/members/media/{media_id}` | matchmaker.member.manage |
 
 > 路由冲突规避：`member_records_admin.py` 已有 `GET /admin/members/{member_id}/media`（3 段，单会员媒体分页）。本模块使用 `/admin/members/media`（2 段）、`/admin/members/media/intros`（静态 3 段）、`/admin/members/media/{user_id}/history`（4 段，末段静态 `history`）、`/admin/members/media/{media_id}`（动态 2 段）。段数/末段字面均不冲突，且静态路径在文件中先于动态 `/media/{media_id}` 注册，不会被抢占。
+
+---
+
+## 变更记录
+
+| 日期 | 变更 | 变更前 | 变更后 | 影响范围 |
+|---|---|---|---|---|
+| 2026-10-11 | 搜索方式补全 | `GET /admin/members/media` 与 `GET /admin/members/media/intros` 的 `keyword` 固定匹配「昵称 + 手机（+ 会员编号）」 | 两个接口新增 `search_type`（`phone` 按手机搜 / `code` 按会员编号搜 / `nickname` 按昵称搜）；不传时沿用原有的综合匹配 | 非破坏性；完整契约见 `docs/api/后台筛选参数补全-2026-10-11.md` |

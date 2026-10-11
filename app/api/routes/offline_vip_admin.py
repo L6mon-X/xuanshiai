@@ -24,6 +24,12 @@ router = APIRouter(prefix="/admin/offline-vips")
 # 服务进度合法取值（all 表示不筛选，不落库）
 _PROGRESS_PATTERN = "^(matching|dating|deep|in_love|met_parents|paused|breakup|married)$"
 
+# 服务状态：与 progress（服务进度）是两套维度，独立参数、不塞进 progress。
+_SERVICE_STATUS_PATTERN = "^(active|expired|no_refund_risk)$"
+
+# 统计/排序维度
+_SORT_BY_PATTERN = "^(member_last_paid|member_history_paid|monthly_sales|yearly_sales|monthly_champion)$"
+
 
 @router.get("", response_model=OfflineVipPage, summary="分页查询线下VIP会员")
 async def list_offline_vips(
@@ -36,6 +42,10 @@ async def list_offline_vips(
     sign_start: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="签约日期起（含）"),
     sign_end: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="签约日期止（含）"),
     keyword: str | None = Query(None, max_length=64, description="会员昵称/手机/姓名/编号"),
+    service_status: str | None = Query(None, pattern=_SERVICE_STATUS_PATTERN,
+        description="服务状态：active 服务期内 / expired 已过期 / no_refund_risk 无退费风险"),
+    sort_by: str | None = Query(None, pattern=_SORT_BY_PATTERN,
+        description="统计排序：member_last_paid 会员最近一次付费 / member_history_paid 会员历史付费 / monthly_sales 月度销售额 / yearly_sales 年度销售额 / monthly_champion 每月销冠"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> OfflineVipPage:
@@ -51,6 +61,8 @@ async def list_offline_vips(
         sign_start,
         sign_end,
         keyword,
+        service_status,
+        sort_by,
     )
 
 

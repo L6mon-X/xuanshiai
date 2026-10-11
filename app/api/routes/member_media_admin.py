@@ -99,11 +99,14 @@ async def intro_list(
     letter_lower: bool = Query(False),
     digit: bool = Query(False),
     cn_digit: bool = Query(False),
+    search_type: str | None = Query(None, pattern="^(phone|code|nickname)$", description="keyword 的匹配目标：phone 按手机搜 / code 按会员编号搜 / nickname 按昵称搜"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> MemberIntroPage:
     current.require("matchmaker.member.read")
-    return await service.list_intros(db, page, page_size, keyword, letter_mode, letter_lower, digit, cn_digit)
+    return await service.list_intros(
+        db, page, page_size, keyword, letter_mode, letter_lower, digit, cn_digit, search_type
+    )
 
 
 @router.put("/media/intros/{user_id}", response_model=MemberIntroItem, summary="更新个人介绍（自白）")
@@ -221,11 +224,12 @@ async def media_list(
     review_status: int | None = Query(None, ge=0, le=3),
     keyword: str | None = Query(None, max_length=64),
     gender: int | None = Query(None, ge=1, le=2),
+    search_type: str | None = Query(None, pattern="^(phone|code|nickname)$", description="keyword 的匹配目标：phone 按手机搜 / code 按会员编号搜 / nickname 按昵称搜"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> MemberMediaPage:
     current.require("matchmaker.member.read")
-    return await service.list_media(db, page, page_size, media_type, review_status, keyword, gender)
+    return await service.list_media(db, page, page_size, media_type, review_status, keyword, gender, search_type)
 
 
 @router.get("/media/{user_id}/history", response_model=MemberMediaPage, summary="会员头像历史记录（含已删）")

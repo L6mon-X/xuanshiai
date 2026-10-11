@@ -820,3 +820,4 @@ GET /api/v1/admin/offline-vips/0/meet-logs
 |---|---|---|---|---|
 | 2026-09-11 | 新建模块 | 无 `offline_vip` 相关管理端接口 | 新增 7 个端点 + `offline_vip_admin` 三件套 | 会员CRM → 线下VIP 页面 |
 | 2026-09-11 | 权限映射 | `_matchmaker_admin_permission` 无 `/offline-vips` 规则 | 新增 `/offline-vips` → `matchmaker.member.read/manage` | 权限校验 |
+| 2026-10-11 | 服务状态与统计排序 | `GET /admin/offline-vips` 仅有 `progress` 服务进度 | 新增 `service_status`（`active`/`expired`/`no_refund_risk`，**独立于 `progress`**）与 `sort_by`（`member_last_paid`/`member_history_paid`/`monthly_sales`/`yearly_sales`/`monthly_champion`） | 非破坏性，可选参数；完整契约见 `docs/api/后台筛选参数补全-2026-10-11.md` |

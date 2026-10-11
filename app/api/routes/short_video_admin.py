@@ -157,11 +157,12 @@ async def comment_list(
     page_size: int = Query(20, ge=1, le=100),
     audit_status: str | None = Query(None, pattern="^(pending|approved|rejected)$"),
     keyword: str | None = Query(None, max_length=128),
+    search_type: str | None = Query(None, pattern="^(content|user|video)$", description="keyword 的匹配目标：content 评论内容 / user 评论用户昵称 / video 视频描述"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> VideoCommentPage:
     current.require("video.read")
-    return await service.list_comments(db, page, page_size, audit_status, keyword)
+    return await service.list_comments(db, page, page_size, audit_status, keyword, search_type)
 
 
 @comment_router.post("/batch-delete", summary="批量删除评论")
@@ -205,11 +206,12 @@ async def tip_list(
     page_size: int = Query(20, ge=1, le=100),
     keyword: str | None = Query(None, max_length=64),
     search_by: str | None = Query(None, pattern="^(video|user)$"),
+    search_type: str | None = Query(None, pattern="^(video|user)$", description="与 search_by 等价：video 按视频搜 / user 按昵称搜"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> VideoTipPage:
     current.require("video.read")
-    return await service.list_tips(db, page, page_size, keyword, search_by)
+    return await service.list_tips(db, page, page_size, keyword, search_by, search_type)
 
 
 # ─────────────────────────── 红包 ───────────────────────────
@@ -221,11 +223,12 @@ async def packet_list(
     page_size: int = Query(20, ge=1, le=100),
     claim_status: str | None = Query(None, pattern="^(finished|unfinished)$"),
     keyword: str | None = Query(None, max_length=128),
+    search_type: str | None = Query(None, pattern="^(video|sender)$", description="keyword 的匹配目标：video 按视频搜 / sender 按发放方搜"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> RedPacketPage:
     current.require("video.read")
-    return await service.list_packets(db, page, page_size, claim_status, keyword)
+    return await service.list_packets(db, page, page_size, claim_status, keyword, search_type)
 
 
 @packet_router.get("/{packet_id}/claims", response_model=list[RedPacketClaimItem], summary="红包领取明细")

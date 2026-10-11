@@ -327,8 +327,22 @@ def _comment_item(row: Any) -> VideoCommentItem:
     )
 
 
+# 搜索方式：按评论内容 / 按评论用户昵称 / 按视频描述。值为服务端白名单内的固定 SQL 片段。
+_COMMENT_SEARCH_TYPE_SQL: dict[str, str] = {
+    "content": "c.content LIKE CONCAT('%', :kw, '%')",
+    "user": "u.nickname LIKE CONCAT('%', :kw, '%')",
+    "video": "v.description LIKE CONCAT('%', :kw, '%')",
+}
+_COMMENT_SEARCH_TYPE_DEFAULT = "content"
+
+
 async def list_comments(
-    db: AsyncSession, page: int, page_size: int, audit_status: str | None, keyword: str | None
+    db: AsyncSession,
+    page: int,
+    page_size: int,
+    audit_status: str | None,
+    keyword: str | None,
+    search_type: str | None = None,
 ) -> VideoCommentPage:
     where = ["1=1"]
     params: dict = {"limit": page_size, "offset": (page - 1) * page_size}
@@ -336,7 +350,11 @@ async def list_comments(
         where.append("c.audit_status = :audit_status")
         params["audit_status"] = audit_status
     if keyword:
-        where.append("c.content LIKE CONCAT('%', :kw, '%')")
+        where.append(
+            _COMMENT_SEARCH_TYPE_SQL.get(
+                search_type or "", _COMMENT_SEARCH_TYPE_SQL[_COMMENT_SEARCH_TYPE_DEFAULT]
+            )
+        )
         params["kw"] = keyword
     clause = " AND ".join(where)
     base = (
@@ -439,8 +457,19 @@ def _tip_item(row: Any) -> VideoTipItem:
 
 
 async def list_tips(
-    db: AsyncSession, page: int, page_size: int, keyword: str | None, search_by: str | None
+    db: AsyncSession,
+    page: int,
+    page_size: int,
+    keyword: str | None,
+    search_by: str | None,
+    search_type: str | None = None,
 ) -> VideoTipPage:
+    """分页查询打赏记录。
+
+    ``search_by`` 与 ``search_type`` 等价（前端两种命名都出现过），取先给出的那个：
+    ``video`` 按视频描述搜，其余按打赏人/收款人昵称搜。
+    """
+    search_by = search_by or search_type
     where = ["1=1"]
     params: dict = {"limit": page_size, "offset": (page - 1) * page_size}
     if keyword:
@@ -502,8 +531,21 @@ def _packet_item(row: Any) -> RedPacketItem:
     )
 
 
+# 搜索方式：按视频描述 / 按发放方名称。值为服务端白名单内的固定 SQL 片段。
+_PACKET_SEARCH_TYPE_SQL: dict[str, str] = {
+    "video": "v.description LIKE CONCAT('%', :kw, '%')",
+    "sender": "p.sender_label LIKE CONCAT('%', :kw, '%')",
+}
+_PACKET_SEARCH_TYPE_DEFAULT = "video"
+
+
 async def list_packets(
-    db: AsyncSession, page: int, page_size: int, claim_status: str | None, keyword: str | None
+    db: AsyncSession,
+    page: int,
+    page_size: int,
+    claim_status: str | None,
+    keyword: str | None,
+    search_type: str | None = None,
 ) -> RedPacketPage:
     where = ["1=1"]
     params: dict = {"limit": page_size, "offset": (page - 1) * page_size}
@@ -512,7 +554,11 @@ async def list_packets(
     elif claim_status == "unfinished":
         where.append("p.remain_parts > 0")
     if keyword:
-        where.append("v.description LIKE CONCAT('%', :kw, '%')")
+        where.append(
+            _PACKET_SEARCH_TYPE_SQL.get(
+                search_type or "", _PACKET_SEARCH_TYPE_SQL[_PACKET_SEARCH_TYPE_DEFAULT]
+            )
+        )
         params["kw"] = keyword
     clause = " AND ".join(where)
     rows = await db.execute(

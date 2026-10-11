@@ -41,6 +41,11 @@ def _account_item(row: dict) -> MatchmakerAdminAccountItem:
     )
 
 
+# 注销状态与账号启用状态（status）是两套维度：前者看 admin_account_cancellation
+# 的申请进展，后者看 matchmaker_admin_account.status。两者独立，不合并进 status。
+CANCELLATION_STATUSES: frozenset[str] = frozenset({"pending", "cancelled", "approved"})
+
+
 async def list_accounts(
     db: AsyncSession,
     page: int,
@@ -49,6 +54,7 @@ async def list_accounts(
     display_name: str | None = None,
     status: int | None = None,
     matchmaker_user_id: int | None = None,
+    cancellation_status: str | None = None,
 ) -> MatchmakerAdminAccountPage:
     conditions = ["1 = 1"]
     params: dict[str, object] = {
@@ -67,6 +73,12 @@ async def list_accounts(
     if matchmaker_user_id is not None:
         conditions.append("a.matchmaker_user_id = :matchmaker_user_id")
         params["matchmaker_user_id"] = matchmaker_user_id
+    if cancellation_status in CANCELLATION_STATUSES:
+        conditions.append(
+            "EXISTS (SELECT 1 FROM admin_account_cancellation ac"
+            " WHERE ac.account_id = a.id AND ac.status = :cancellation_status)"
+        )
+        params["cancellation_status"] = cancellation_status
     where = " AND ".join(conditions)
     select = """SELECT a.*, GROUP_CONCAT(p.permission ORDER BY p.permission SEPARATOR '\n') AS permissions
         FROM matchmaker_admin_account a

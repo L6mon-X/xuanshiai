@@ -135,6 +135,47 @@ def _row(payload: dict[str, Any]) -> OfflineVipItem:
     )
 
 
+# 服务状态：`progress` 是服务进度，service_status 是「服务期是否仍在」的独立维度。
+# 库中无退费字段，「无退费风险」按「仍在服务期且已履约约见数达到承诺数」判定
+# （承诺数为 0 视为无风险），判定口径写在 docs/api/offline-vip.md。
+_SERVICE_STATUS_SQL = {
+    "active": "v.service_end IS NOT NULL AND v.service_end >= CURDATE()",
+    "expired": "v.service_end IS NOT NULL AND v.service_end < CURDATE()",
+    "no_refund_risk": (
+        "v.service_end IS NOT NULL AND v.service_end >= CURDATE()"
+        " AND v.success_meet_count >= v.promise_meet_count"
+    ),
+}
+
+# 统计/排序维度：`member_last_paid` 与 `member_history_paid` 按会员维度聚合，
+# `monthly_sales` / `yearly_sales` / `monthly_champion` 按销售红娘维度聚合销售额。
+_SORT_BY_SQL = {
+    "member_last_paid": "COALESCE((SELECT MAX(po.pay_time) FROM payment_order po WHERE po.user_id = v.user_id AND po.status = 1), '1970-01-01') DESC, v.id DESC",
+    "member_history_paid": "COALESCE((SELECT SUM(po.amount) FROM payment_order po WHERE po.user_id = v.user_id AND po.status = 1), 0) DESC, v.id DESC",
+    "monthly_sales": "COALESCE(_month.amount, 0) DESC, v.id DESC",
+    "yearly_sales": "COALESCE(_year.amount, 0) DESC, v.id DESC",
+    "monthly_champion": "COALESCE(_month.amount, 0) DESC, COALESCE(_year.amount, 0) DESC, v.id DESC",
+}
+
+# 销售额排序要额外左连接当月/当年已支付订单汇总，未选这些维度时不附加 join。
+_SALES_JOIN = """
+LEFT JOIN (SELECT v2.sales_matchmaker_id AS matchmaker_id, SUM(po.amount) AS amount
+           FROM offline_vip v2 JOIN payment_order po
+             ON po.user_id = v2.user_id AND po.status = 1
+           WHERE v2.deleted_at IS NULL AND v2.sales_matchmaker_id IS NOT NULL
+             AND po.pay_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01')
+           GROUP BY v2.sales_matchmaker_id) _month
+  ON _month.matchmaker_id = v.sales_matchmaker_id
+LEFT JOIN (SELECT v3.sales_matchmaker_id AS matchmaker_id, SUM(po.amount) AS amount
+           FROM offline_vip v3 JOIN payment_order po
+             ON po.user_id = v3.user_id AND po.status = 1
+           WHERE v3.deleted_at IS NULL AND v3.sales_matchmaker_id IS NOT NULL
+             AND po.pay_time >= MAKEDATE(YEAR(CURDATE()), 1)
+           GROUP BY v3.sales_matchmaker_id) _year
+  ON _year.matchmaker_id = v.sales_matchmaker_id
+"""
+
+
 async def list_vips(
     db: AsyncSession,
     page: int,
@@ -146,6 +187,8 @@ async def list_vips(
     sign_start: str | None = None,
     sign_end: str | None = None,
     keyword: str | None = None,
+    service_status: str | None = None,
+    sort_by: str | None = None,
 ) -> OfflineVipPage:
     """线下VIP 分页列表。progress 为空表示「全部」。"""
     conditions = ["v.deleted_at IS NULL"]
@@ -171,14 +214,19 @@ async def list_vips(
     if keyword:
         conditions.append(_KEYWORD_SQL)
         params["keyword"] = keyword
+    if service_status in _SERVICE_STATUS_SQL:
+        conditions.append(_SERVICE_STATUS_SQL[service_status])
     where = " AND ".join(conditions)
+    # 销售额维度需要带汇总 join；其余排序不附加 join，避免改变既有查询计划。
+    join = _SALES_JOIN if sort_by in ("monthly_sales", "yearly_sales", "monthly_champion") else ""
+    order_by = _SORT_BY_SQL.get(sort_by or "", "v.id DESC")
     rows = await db.execute(
-        text(f"{_SELECT_BODY} WHERE {where} ORDER BY v.id DESC LIMIT :limit OFFSET :offset"),
+        text(f"{_SELECT_BODY}{join} WHERE {where} ORDER BY {order_by} LIMIT :limit OFFSET :offset"),
         params,
     )
     count_params = {k: v for k, v in params.items() if k not in ("limit", "offset")}
     total = _int(
-        (await db.scalar(text(f"SELECT COUNT(*) {_COUNT_BODY} WHERE {where}"), count_params))
+        (await db.scalar(text(f"SELECT COUNT(*) {_COUNT_BODY}{join} WHERE {where}"), count_params))
     )
     return OfflineVipPage(
         items=[_row(dict(row)) for row in rows.mappings().all()],

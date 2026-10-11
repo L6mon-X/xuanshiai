@@ -460,3 +460,4 @@ CREATE TABLE `short_video_homepage` (
 ## 十三、变更记录
 
 - **2026-09-12 v1.0** —— M7-C 首版（视频/刷粉/评论/打赏/红包/主页/配置）
+- **2026-10-11 v1.1** —— 搜索方式补全：`GET /admin/short-video-comments` 新增 `search_type`（`content`/`user`/`video`，默认 `content`）；`GET /admin/short-video-tips` 新增 `search_type`，与既有 `search_by` 等价；`GET /admin/video-red-packets` 新增 `search_type`（`video`/`sender`，默认 `video`）。全部可选，向后兼容。完整契约见 `docs/api/后台筛选参数补全-2026-10-11.md`

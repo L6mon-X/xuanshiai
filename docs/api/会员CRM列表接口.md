@@ -95,3 +95,4 @@ Content-Type: application/json
 - 2026-08-26：会员列表审核、客户意向和服务红娘下拉框接入持久化接口；新增 `auth_status`、`intention_level` 更新字段和会员分派接口。旧字段与旧调用方式保持兼容。
 - 2026-08-25：新增上述全局 CRM 列表和批量状态接口，供会员跟进、线上行为、会员认证和列表批量操作页面使用。
 - 2026-08-25：补齐会员详情自我介绍、择偶要求、微信和登录信息字段；新增会员通话记录表及读写接口。
+- 2026-10-11（筛选参数补全）：`GET /admin/matchmaker/members` 新增 `search_type`、`source`、`region`、`xiangqin_status`、`realname`、`cert_status`、`organization_id`、`matchmaker_id`、`promoter_id`、年龄/身高区间、`marriage`/`education`/`occupation`/`income`/`residence`/`hometown`/`hukou`/`religion`/`car`/`level`/`tags` 多选、`offline_vip`/`promoted`/`newcomer`/`activity_signup`/`wechat_added`/`behavior_type`、录入与分派时间区间、`order`；`auth_status` 由 0-3 放宽为 0-4；`sort_by` 新增 `entered_at`/`assigned_at`/`fetched_at`；出参新增 `source`、`region`、`cert_status`、`wechat_added`、`promoted`、`newcomer`、`activity_signup`、`level`、`fetched_at`、`assigned_at`。全部为可选参数，不传等同历史行为，向后兼容。完整契约见 `docs/api/后台筛选参数补全-2026-10-11.md`。

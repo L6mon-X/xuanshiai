@@ -14,16 +14,18 @@ from app.schemas.matchmaker_crm_admin import MatchRecordCreate, MatchRecordItem,
 from app.schemas.admin import CertificationReviewRequest, RealnameReviewRequest
 from app.services.auth import list_realname_reviews, review_realname
 from app.services.certifications import list_certification_reviews, review_certification
+from app.services.member_crm_filter import build_member_filter, member_sort_sql
 
 router = APIRouter(prefix="/admin/matchmaker")
 
 # 会员归属展示列：每个会员只取一条生效归属，避免 `LEFT JOIN resource_assignment`
 # 因一人多单而放大结果行数（历史实现使用非聚合子查询，会在列表分页中产生重复行）。
+# 同时带出门店与最近分派时间，供「按门店筛选」和「按分派时间排序/筛选」使用。
 # 数据可见范围不使用该派生表，而统一走 `CurrentMatchmakerAdmin.scope_exists_clause`，
 # 以保证「任一生效归属落在作用域内即可见」的正确语义。
 _ASSIGNMENT_DISPLAY_DERIVED = (
-    "(SELECT user_id, MAX(matchmaker_id) AS matchmaker_id FROM resource_assignment "
-    "WHERE status = 1 GROUP BY user_id)"
+    "(SELECT user_id, MAX(matchmaker_id) AS matchmaker_id, MAX(organization_id) AS organization_id, "
+    "MAX(effective_at) AS assigned_at FROM resource_assignment WHERE status = 1 GROUP BY user_id)"
 )
 
 
@@ -89,21 +91,45 @@ async def create_match_record(
     return MatchRecordResponse(id=int(result.lastrowid), from_user_id=body.from_love_user_id, to_user_id=body.to_love_user_id, status=body.line_status, created_at=body.create_time, responded_at=body.complete_time)
 
 
-async def _member_query(db: AsyncSession, where: str, params: dict, page: int, page_size: int, scope: str) -> MemberPage:
+async def _available_columns(db: AsyncSession) -> frozenset[tuple[str, str]]:
+    """读取会员列表会引用的列是否存在，供缺列降级使用。
+
+    迁移（migrations/filters/20261011_01）未执行时，新筛选项与展示列必须降级为
+    NULL 而不是让整页 SQL 报 Unknown column。
+    """
+    column_rows = await db.execute(text("""SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('user_profile', 'user_auth', 'users')"""))
+    return frozenset((row[0], row[1]) for row in column_rows.all())
+
+
+async def _member_query(
+    db: AsyncSession,
+    where: str,
+    params: dict,
+    page: int,
+    page_size: int,
+    scope: str,
+    sort_sql: str | None = None,
+    available: frozenset[tuple[str, str]] | None = None,
+) -> MemberPage:
     """会员 CRM 列表查询。
 
     ``scope`` 必须由调用方通过 `CurrentMatchmakerAdmin.scope_exists_clause`
     生成——本函数不接受手写作用域谓词，也不允许为空（fail-closed）。
+
+    ``available`` 由调用方复用已取到的列集合，避免同一次请求重复查 information_schema。
     """
-    column_rows = await db.execute(text("""SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS
-        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('user_profile', 'user_auth')"""))
-    available = {(row[0], row[1]) for row in column_rows.all()}
+    if available is None:
+        available = await _available_columns(db)
 
     def auth_expr(name: str) -> str:
         return f"ua.{name}" if ("user_auth", name) in available else "NULL"
 
     def profile_expr(name: str) -> str:
         return f"p.{name}" if ("user_profile", name) in available else "NULL"
+
+    def user_expr(name: str) -> str:
+        return f"u.{name}" if ("users", name) in available else "NULL"
 
     base = f"""FROM users u LEFT JOIN user_profile p ON p.user_id = u.id
         LEFT JOIN user_auth ua ON ua.user_id = u.id
@@ -113,15 +139,8 @@ async def _member_query(db: AsyncSession, where: str, params: dict, page: int, p
         LEFT JOIN (SELECT user_id, MAX(created_at) last_follow_at, MAX(next_follow_at) next_follow_at FROM member_follow_up GROUP BY user_id) f ON f.user_id = u.id"""
     where = f"({where}) AND ({scope})"
     params = {**params, "limit": page_size, "offset": (page - 1) * page_size}
-    sort_by = str(params.pop("sort_by", "created_at"))
     # Keep sort fields server-side whitelisted; never interpolate user input.
-    sort_sql = {
-        "created_at": "u.created_at DESC, u.id DESC",
-        "last_login_at": "COALESCE(u.last_login_at, '1970-01-01') DESC, u.id DESC",
-        "last_follow_at": "COALESCE(f.last_follow_at, '1970-01-01') DESC, u.id DESC",
-        "next_follow_at": "COALESCE(f.next_follow_at, '9999-12-31') ASC, u.id DESC",
-        "id": "u.id DESC",
-    }.get(sort_by, "u.created_at DESC, u.id DESC")
+    order_by = sort_sql or "u.created_at DESC, u.id DESC"
     rows = await db.execute(text(f"""SELECT u.id, u.nickname, u.phone, u.gender, u.status, u.created_at,
         COALESCE(u.avatar, JSON_UNQUOTE(JSON_EXTRACT(p.photos, '$[0]'))) AS avatar,
         u.birthday, u.is_married, p.height, p.income, p.hometown, p.residence,
@@ -134,8 +153,16 @@ async def _member_query(db: AsyncSession, where: str, params: dict, page: int, p
         {auth_expr('job')} AS job, {auth_expr('company')} AS company,
         COALESCE({auth_expr('auth_status')}, 0) AS auth_status, {profile_expr('intention_level')} AS intention_level, f.last_follow_at, f.next_follow_at,
         v.vip_end_at, a.matchmaker_id, COALESCE(pr.match_status, 1) AS match_status,
+        {user_expr('source')} AS source, {user_expr('region')} AS region,
+        COALESCE({user_expr('cert_status')}, 0) AS cert_status,
+        COALESCE({user_expr('wechat_added')}, 0) AS wechat_added,
+        COALESCE({user_expr('promoted')}, 0) AS promoted,
+        COALESCE({user_expr('newcomer')}, 0) AS newcomer,
+        COALESCE({user_expr('activity_signup')}, 0) AS activity_signup,
+        {user_expr('level')} AS level, {user_expr('fetched_at')} AS fetched_at,
+        a.assigned_at,
         CASE WHEN v.user_id IS NULL OR (v.vip_end_at IS NOT NULL AND v.vip_end_at <= UTC_TIMESTAMP()) THEN 0 ELSE 1 END AS is_vip
-        {base} WHERE {where} ORDER BY {sort_sql} LIMIT :limit OFFSET :offset"""), params)
+        {base} WHERE {where} ORDER BY {order_by} LIMIT :limit OFFSET :offset"""), params)
     count = await db.execute(text(f"SELECT COUNT(*) {base} WHERE {where}"), {k: v for k, v in params.items() if k not in ("limit", "offset")})
     total = int(count.scalar() or 0)
     items = [MemberListItem(**dict(row)) for row in rows.mappings().all()]
@@ -143,42 +170,78 @@ async def _member_query(db: AsyncSession, where: str, params: dict, page: int, p
 
 
 @router.get("/members", response_model=MemberPage, summary="查询会员 CRM 列表")
-async def members(page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=100), gender: int | None = Query(None, ge=1, le=2), status: int | None = Query(None, ge=1, le=3), vip: bool | None = Query(None), auth_status: int | None = Query(None, ge=0, le=3), assigned: bool | None = Query(None), follow_state: str | None = Query(None, pattern="^(never|due_today|overdue)$"), search: str | None = Query(None, max_length=64), sort_by: str = Query("created_at", pattern="^(created_at|last_login_at|last_follow_at|next_follow_at|id)$"), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> MemberPage:
-    where = "1=1"
-    params: dict = {}
-    if gender is not None:
-        where += " AND u.gender = :gender"
-        params["gender"] = gender
-    if status is not None:
-        where += " AND u.status = :status"
-        params["status"] = status
-    if search:
-        if search.isdigit():
-            where += " AND (u.id = :search_id OR u.nickname LIKE CONCAT('%', :search, '%') OR u.phone LIKE CONCAT('%', :search, '%'))"
-            params["search_id"] = int(search)
-        else:
-            where += " AND (u.nickname LIKE CONCAT('%', :search, '%') OR u.phone LIKE CONCAT('%', :search, '%'))"
-        params["search"] = search
-    if vip is True:
-        where += " AND v.user_id IS NOT NULL AND (v.vip_end_at IS NULL OR v.vip_end_at > UTC_TIMESTAMP())"
-    if vip is False:
-        where += " AND (v.user_id IS NULL OR (v.vip_end_at IS NOT NULL AND v.vip_end_at <= UTC_TIMESTAMP()))"
-    if auth_status is not None:
-        where += " AND COALESCE(ua.auth_status, 0) = :auth_status"
-        params["auth_status"] = auth_status
-    if assigned is True:
-        where += " AND a.matchmaker_id IS NOT NULL"
-    if assigned is False:
-        where += " AND a.matchmaker_id IS NULL"
-    if follow_state == "never":
-        where += " AND f.last_follow_at IS NULL"
-    if follow_state == "due_today":
-        where += " AND f.next_follow_at >= CURDATE() AND f.next_follow_at < DATE_ADD(CURDATE(), INTERVAL 1 DAY)"
-    if follow_state == "overdue":
-        where += " AND f.next_follow_at < CURDATE()"
-    params["sort_by"] = sort_by
+async def members(
+    page: int = Query(1, ge=1, le=1000),
+    page_size: int = Query(20, ge=1, le=100),
+    gender: int | None = Query(None, ge=1, le=2),
+    status: int | None = Query(None, ge=1, le=3),
+    vip: bool | None = Query(None),
+    auth_status: int | None = Query(None, ge=0, le=4, description="资料审核状态 0未提交 1审核中 2已通过 3未通过 4已到店核验"),
+    assigned: bool | None = Query(None),
+    follow_state: str | None = Query(None, pattern="^(never|due_today|overdue)$"),
+    search: str | None = Query(None, max_length=64),
+    search_type: str | None = Query(None, pattern="^(smart|phone|wechat|code|id|nickname|realname)$"),
+    sort_by: str = Query("created_at", pattern="^(created_at|entered_at|last_login_at|last_follow_at|next_follow_at|assigned_at|fetched_at|id)$"),
+    order: str | None = Query(None, pattern="^(latest|earliest|smart)$", description="记录排序；与 sort_by 互斥，同时传时以 order 为准"),
+    source: str | None = Query(None, max_length=32),
+    region: str | None = Query(None, pattern="^(mainland|hmt|overseas)$"),
+    xiangqin_status: int | None = Query(None, ge=1, le=5, description="相亲状态 1公开相亲 2委托红娘 3完全私密 4停止相亲 5已经脱单"),
+    realname: bool | None = Query(None),
+    cert_status: int | None = Query(None, ge=0, le=3, description="身份认证 0未认证 1已认证 2待审核 3认证失败"),
+    organization_id: int | None = Query(None, ge=1),
+    matchmaker_id: int | None = Query(None, ge=1),
+    promoter_id: int | None = Query(None, ge=1),
+    age_min: int | None = Query(None, ge=16, le=100),
+    age_max: int | None = Query(None, ge=16, le=100),
+    height_min: int | None = Query(None, ge=80, le=250),
+    height_max: int | None = Query(None, ge=80, le=250),
+    marriage: str | None = Query(None, max_length=64, description="婚况多选，英文逗号分隔；取值同 users.is_married 编码（1未婚 2离异 3丧偶）"),
+    education: str | None = Query(None, max_length=255, description="学历多选，英文逗号分隔"),
+    occupation: str | None = Query(None, max_length=255, description="职业多选，英文逗号分隔"),
+    income: str | None = Query(None, max_length=255, description="收入多选，英文逗号分隔，按 user_profile.income 原值精确匹配"),
+    residence: str | None = Query(None, max_length=64),
+    hometown: str | None = Query(None, max_length=64),
+    hukou: str | None = Query(None, max_length=64),
+    religion: str | None = Query(None, max_length=32),
+    car: str | None = Query(None, max_length=32),
+    level: str | None = Query(None, max_length=32),
+    tags: str | None = Query(None, max_length=255, description="标签多选，英文逗号分隔，任一命中"),
+    offline_vip: bool | None = Query(None),
+    promoted: bool | None = Query(None),
+    newcomer: bool | None = Query(None),
+    activity_signup: bool | None = Query(None),
+    wechat_added: int | None = Query(None, ge=0, le=2, description="加微信结果 0未添加 1已加上 2没加上"),
+    behavior_type: str | None = Query(None, pattern="^(viewed|viewed_by|favorited|boosted|boosted_by|gift_sent|gift_received)$"),
+    created_start: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    created_end: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    assigned_start: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    assigned_end: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MemberPage:
+    values = {
+        "gender": gender, "status": status, "vip": vip, "auth_status": auth_status,
+        "assigned": assigned, "follow_state": follow_state, "search": search,
+        "search_type": search_type, "source": source, "region": region,
+        "xiangqin_status": xiangqin_status, "realname": realname, "cert_status": cert_status,
+        "organization_id": organization_id, "matchmaker_id": matchmaker_id,
+        "promoter_id": promoter_id, "age_min": age_min, "age_max": age_max,
+        "height_min": height_min, "height_max": height_max, "marriage": marriage,
+        "education": education, "occupation": occupation, "income": income,
+        "residence": residence, "hometown": hometown, "hukou": hukou,
+        "religion": religion, "car": car, "level": level, "tags": tags,
+        "offline_vip": offline_vip, "promoted": promoted, "newcomer": newcomer,
+        "activity_signup": activity_signup, "wechat_added": wechat_added,
+        "behavior_type": behavior_type, "created_start": created_start,
+        "created_end": created_end, "assigned_start": assigned_start,
+        "assigned_end": assigned_end,
+    }
+    available = await _available_columns(db)
+    where, params = build_member_filter(values, available)
     scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = u.id")
-    return await _member_query(db, where, params, page, page_size, scope)
+    return await _member_query(
+        db, where, params, page, page_size, scope, member_sort_sql(sort_by, order), available=available
+    )
 
 
 @router.get("/members/statistics", response_model=MemberStatistics, summary="查询会员统计")

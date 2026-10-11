@@ -115,6 +115,27 @@ def _item_to_row(item: ContentItem) -> dict[str, Any]:
     return row
 
 
+# 域特有筛选项（落地页 type、内容单页 qrcode_type、落地页/自由表单 xiangqin_status）。
+# 这些字段按 admin_content_item 的设计存放在 extra_json，因此筛选走 JSON_EXTRACT；
+# 键名与接口参数同名，前端写入 extra 时需要用相同的键。
+EXTRA_FILTER_KEYS: frozenset[str] = frozenset({"type", "qrcode_type", "xiangqin_status"})
+
+# 搜索方式（search_type）：仅在域内定义过的键才会生效，未定义时退回 title/subtitle/extra_json
+# 全字段模糊匹配（历史行为）。键名取自各域 extra 的写入约定。
+SEARCH_TYPE_EXTRA_KEYS: dict[str, dict[str, str]] = {
+    "free_pay_order": {
+        "nickname": "member_nickname",
+        "phone": "member_phone",
+        "order_no": "order_no",
+    },
+    "gift_exchange": {
+        "nickname": "member_nickname",
+        "phone": "member_phone",
+        "order_no": "order_no",
+    },
+}
+
+
 async def list_items(
     db: AsyncSession,
     domain: str,
@@ -122,16 +143,28 @@ async def list_items(
     page_size: int = 20,
     keyword: str | None = None,
     status: int | None = None,
+    extra_filters: dict[str, str] | None = None,
+    search_type: str | None = None,
 ) -> ContentItemPage:
     _ensure_domain(domain)
     conditions = ["tenant_id = 1", "domain = :domain"]
     params: dict[str, Any] = {"domain": domain}
     if keyword:
-        conditions.append("(title LIKE :kw OR subtitle LIKE :kw OR extra_json LIKE :kw)")
+        search_column = SEARCH_TYPE_EXTRA_KEYS.get(domain, {}).get(search_type or "")
+        if search_column:
+            # 键名来自服务端白名单，不拼接用户输入；取值走绑定参数。
+            conditions.append(f"JSON_UNQUOTE(JSON_EXTRACT(extra_json, '$.{search_column}')) LIKE :kw")
+        else:
+            conditions.append("(title LIKE :kw OR subtitle LIKE :kw OR extra_json LIKE :kw)")
         params["kw"] = f"%{keyword}%"
     if status in (1, 2):
         conditions.append("status = :status")
         params["status"] = status
+    for key, value in (extra_filters or {}).items():
+        # 键名来自服务端白名单，不拼接用户输入；取值走绑定参数。
+        if key in EXTRA_FILTER_KEYS and value:
+            conditions.append(f"JSON_UNQUOTE(JSON_EXTRACT(extra_json, '$.{key}')) = :extra_{key}")
+            params[f"extra_{key}"] = value
     where = " AND ".join(conditions)
 
     total = int(

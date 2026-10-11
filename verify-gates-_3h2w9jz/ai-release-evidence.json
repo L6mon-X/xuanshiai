@@ -1,0 +1,88 @@
+{
+  "blockers": [
+    "master_disabled",
+    "policy_not_approved",
+    "provider_not_approved",
+    "retention_policy_missing",
+    "database_unreachable",
+    "rollback_drill_not_evidenced",
+    "cleanup_consumer_not_schedulable",
+    "evidence_bundle_not_found",
+    "evidence_bundle_missing"
+  ],
+  "config": {
+    "ai_master_enabled": false,
+    "ai_policy_approved": false,
+    "ai_provider": "mock",
+    "ai_provider_approved": false,
+    "ai_retention_policy_version": null
+  },
+  "decision_code": "AI_FEATURE_DISABLED",
+  "environment": "testing",
+  "evidence": {
+    "bundle_present": false,
+    "cleanup_consumer": {
+      "scheduling": "python -m app.workers.ai_worker --consumers",
+      "verified": false
+    },
+    "deletion_replay": {
+      "verified": true
+    },
+    "mock_failure_injection": {
+      "verified": true
+    },
+    "openapi": {
+      "missing": [],
+      "required_paths": [
+        "/api/v1/ai/tasks/{task_id}",
+        "/api/v1/ai/profile-drafts/{draft_id}",
+        "/api/v1/ai/search-drafts",
+        "/api/v1/ai/compatibility/{target_user_id}"
+      ]
+    },
+    "phase4_requires_dpa": true,
+    "phase5_requires_fairness_review": true,
+    "privacy_matrix": {
+      "verified": true
+    },
+    "rollback_drill": {
+      "verified": false
+    },
+    "shadow_report": {
+      "verified": true
+    },
+    "tables": {
+      "reason": "connection_failed",
+      "verified": false
+    },
+    "worker_handlers": {
+      "missing": [],
+      "registered": [
+        "cleanup",
+        "compatibility",
+        "compatibility_llm",
+        "moxiang_candidate_extract",
+        "profile_card_summarize",
+        "profile_extract",
+        "profile_narrative",
+        "profile_preview",
+        "profile_projection",
+        "recommend_rebuild",
+        "search_execute",
+        "search_parse",
+        "search_suggest",
+        "voice_transcribe"
+      ],
+      "required_task_types": [
+        "moxiang_candidate_extract",
+        "search_parse",
+        "search_execute",
+        "compatibility",
+        "profile_projection",
+        "cleanup"
+      ]
+    }
+  },
+  "release_gate": "disabled-until-approved",
+  "target": "internal"
+}

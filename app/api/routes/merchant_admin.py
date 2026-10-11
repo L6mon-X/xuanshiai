@@ -250,13 +250,14 @@ async def order_list(
     buyer_keyword: str | None = Query(None, max_length=64),
     verify_start: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
     verify_end: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    search_type: str | None = Query(None, pattern="^(product|phone)$", description="keyword 的匹配目标：product 按商品关键词 / phone 按买家手机"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> MerchantOrderPage:
     current.require("merchant.read")
     return await service.list_orders(
         db, page, page_size, merchant_id, status, verify_status, keyword, order_no, buyer_keyword,
-        verify_start, verify_end,
+        verify_start, verify_end, search_type,
     )
 
 
@@ -270,6 +271,7 @@ async def order_export(
     buyer_keyword: str | None = Query(None, max_length=64),
     verify_start: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
     verify_end: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    search_type: str | None = Query(None, pattern="^(product|phone)$", description="keyword 的匹配目标：product 按商品关键词 / phone 按买家手机"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
@@ -277,6 +279,7 @@ async def order_export(
     content = await service.build_order_export(
         db, merchant_id=merchant_id, status=status, verify_status=verify_status, keyword=keyword,
         order_no=order_no, buyer_keyword=buyer_keyword, verify_start=verify_start, verify_end=verify_end,
+        search_type=search_type,
     )
     return Response(
         content=content,

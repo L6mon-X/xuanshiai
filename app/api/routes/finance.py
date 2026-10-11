@@ -21,6 +21,7 @@ from app.schemas.finance import (
     CommissionRuleResponse,
     CreditGrantRequest,
     CreditGrantResult,
+    CreditRecordPage,
     FinanceOrderCreate,
     FinanceReportRow,
     FinanceRefundRequest,
@@ -40,6 +41,7 @@ from app.schemas.finance import (
 )
 from app.services.finance import (
     admin_grant_credits,
+    admin_list_credit_records,
     create_order,
     create_rule,
     get_balance,
@@ -323,6 +325,27 @@ async def review(
         raise
     await finish_sensitive_operation(db, reservation, result.model_dump(mode="json"))
     return result
+
+
+@admin_router.get("/credit-records", response_model=CreditRecordPage, summary="分页查询积分明细")
+async def credit_records(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    member_scope: str | None = Query(None, pattern="^(verified|xiangqin|xiangqin_female|xiangqin_male|online_vip)$",
+        description="会员范围：verified 实名认证 / xiangqin 相亲会员 / xiangqin_female 相亲女会员 / xiangqin_male 相亲男会员 / online_vip 线上VIP"),
+    action_source: str | None = Query(None, pattern="^admin$", description="操作来源，当前仅 admin 管理员操作"),
+    category: str | None = Query(None, pattern="^(recharge|gift_exchange|gift_received|gift_sent)$",
+        description="积分类别：recharge 积分充值 / gift_exchange 礼品兑换 / gift_received 收礼物奖励 / gift_sent 送礼物"),
+    start_date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="起始日期 YYYY-MM-DD（含）"),
+    end_date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="结束日期 YYYY-MM-DD（含）"),
+    keyword: str | None = Query(None, min_length=1, max_length=64, description="会员昵称或会员 ID"),
+    admin: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> CreditRecordPage:
+    admin.require("finance.read")
+    return await admin_list_credit_records(
+        db, page, page_size, member_scope, action_source, category, start_date, end_date, keyword, admin=admin
+    )
 
 
 @admin_router.post("/credit-grants", response_model=CreditGrantResult, status_code=201, summary="后台手动发放积分（积分明细-发放积分）")

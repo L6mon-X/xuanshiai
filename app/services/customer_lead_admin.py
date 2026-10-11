@@ -171,7 +171,87 @@ async def _raw_contact(db: AsyncSession, lead_id: int, column: str) -> str | Non
     return row[0] if row else None
 
 
-async def list_leads(db: AsyncSession, page: int, page_size: int, status: str | None, source: str | None, matchmaker_id: int | None, search: str | None, redaction_level: str = REDACTION_LEVEL_STANDARD) -> CustomerLeadPage:
+# 客源线索列表排序白名单；值全部服务端写死，不拼接用户输入。
+_LEAD_ORDER_SQL = {
+    "latest": "id DESC",
+    "earliest": "id ASC",
+}
+
+# 「隐藏今日已跟进 / 已通话」落到当日存在记录的排除条件。
+_LEAD_HIDE_TODAY_SQL = {
+    "followed": """NOT EXISTS (SELECT 1 FROM customer_lead_follow_up fu
+        WHERE fu.lead_id = customer_lead.id AND fu.created_at >= CURDATE()
+          AND fu.created_at < DATE_ADD(CURDATE(), INTERVAL 1 DAY))""",
+    "called": """NOT EXISTS (SELECT 1 FROM customer_lead_call_note cn
+        WHERE cn.lead_id = customer_lead.id AND cn.created_at >= CURDATE()
+          AND cn.created_at < DATE_ADD(CURDATE(), INTERVAL 1 DAY))""",
+}
+
+async def _lead_columns(db: AsyncSession) -> frozenset[str]:
+    rows = await db.execute(text("""SELECT COLUMN_NAME FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'customer_lead'"""))
+    return frozenset(row[0] for row in rows.all())
+
+
+def _split_multi(raw: str | None, limit: int = 50) -> list[str]:
+    """多选参数按英文逗号拆成去重取值列表。"""
+    if not raw:
+        return []
+    return [item.strip() for item in dict.fromkeys(raw.split(",")) if item.strip()][:limit]
+
+
+def _placeholders(prefix: str, values: list[str], params: dict[str, Any]) -> str:
+    """为多值 IN 生成命名占位符并写回 params，避免拼接用户输入。"""
+    names = []
+    for index, value in enumerate(values):
+        key = f"{prefix}_{index}"
+        params[key] = value
+        names.append(f":{key}")
+    return ", ".join(names)
+
+
+async def list_leads(
+    db: AsyncSession,
+    page: int,
+    page_size: int,
+    status: str | None,
+    source: str | None,
+    matchmaker_id: int | None,
+    search: str | None,
+    redaction_level: str = REDACTION_LEVEL_STANDARD,
+    *,
+    intention_level: int | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    assign_start: str | None = None,
+    assign_end: str | None = None,
+    promoter_id: int | None = None,
+    xiangqin_status: int | None = None,
+    bind_mode: str | None = None,
+    wechat_added: int | None = None,
+    tags: str | None = None,
+    age_min: int | None = None,
+    age_max: int | None = None,
+    height_min: int | None = None,
+    height_max: int | None = None,
+    marriage: str | None = None,
+    education: str | None = None,
+    occupation: str | None = None,
+    residence: str | None = None,
+    hometown: str | None = None,
+    hide_followed_today: bool | None = None,
+    hide_called_today: bool | None = None,
+    has_phone: bool | None = None,
+    has_wechat: bool | None = None,
+    order: str | None = None,
+) -> CustomerLeadPage:
+    """客源线索分页列表。
+
+    新增筛选项依赖 `migrations/filters/20261011_01_admin_filter_columns_up.sql`
+    补齐的 customer_lead 列；列不存在时对应条件静默跳过，保证「先发版后迁移」
+    不会让列表整页 500。
+    """
+    columns = await _lead_columns(db)
     where = ["1=1"]
     params: dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size}
     if status:
@@ -186,8 +266,84 @@ async def list_leads(db: AsyncSession, page: int, page_size: int, status: str | 
     if search:
         where.append("(name LIKE CONCAT('%', :search, '%') OR phone LIKE CONCAT('%', :search, '%') OR wechat LIKE CONCAT('%', :search, '%'))")
         params["search"] = search
+
+    if intention_level is not None:
+        where.append("intention_level = :intention_level")
+        params["intention_level"] = intention_level
+    if promoter_id is not None:
+        where.append("promoter_id = :promoter_id")
+        params["promoter_id"] = promoter_id
+    if start_date:
+        where.append("created_at >= :start_date")
+        params["start_date"] = start_date
+    if end_date:
+        # 结束日按「含当日」处理。
+        where.append("created_at < DATE_ADD(:end_date, INTERVAL 1 DAY)")
+        params["end_date"] = end_date
+    if hide_followed_today:
+        where.append(_LEAD_HIDE_TODAY_SQL["followed"])
+    if hide_called_today:
+        where.append(_LEAD_HIDE_TODAY_SQL["called"])
+    if has_phone is True:
+        where.append("phone IS NOT NULL AND TRIM(phone) <> ''")
+    elif has_phone is False:
+        where.append("(phone IS NULL OR TRIM(phone) = '')")
+    if has_wechat is True:
+        where.append("wechat IS NOT NULL AND TRIM(wechat) <> ''")
+    elif has_wechat is False:
+        where.append("(wechat IS NULL OR TRIM(wechat) = '')")
+
+    tag_names = _split_multi(tags)
+    if tag_names:
+        where.append(f"""EXISTS (SELECT 1 FROM customer_lead_tag_relation tr
+            JOIN customer_lead_tag lt ON lt.id = tr.tag_id
+            WHERE tr.lead_id = customer_lead.id
+              AND lt.name IN ({_placeholders('tag', tag_names, params)}))""")
+
+    # 以下筛选项依赖新增列，缺列时跳过。
+    def has(name: str) -> bool:
+        return name in columns
+
+    if has("assigned_at"):
+        if assign_start:
+            where.append("assigned_at >= :assign_start")
+            params["assign_start"] = assign_start
+        if assign_end:
+            where.append("assigned_at < DATE_ADD(:assign_end, INTERVAL 1 DAY)")
+            params["assign_end"] = assign_end
+    if xiangqin_status is not None and has("xiangqin_status"):
+        where.append("xiangqin_status = :xiangqin_status")
+        params["xiangqin_status"] = xiangqin_status
+    if bind_mode and has("bind_mode"):
+        where.append("bind_mode = :bind_mode")
+        params["bind_mode"] = bind_mode
+    if wechat_added is not None and has("wechat_added"):
+        where.append("wechat_added = :wechat_added")
+        params["wechat_added"] = wechat_added
+    if age_min is not None and has("age"):
+        where.append("age >= :age_min")
+        params["age_min"] = age_min
+    if age_max is not None and has("age"):
+        where.append("age <= :age_max")
+        params["age_max"] = age_max
+    if height_min is not None and has("height"):
+        where.append("height >= :height_min")
+        params["height_min"] = height_min
+    if height_max is not None and has("height"):
+        where.append("height <= :height_max")
+        params["height_max"] = height_max
+    for column, raw in (("marriage", marriage), ("education", education), ("occupation", occupation)):
+        values = _split_multi(raw)
+        if values and has(column):
+            where.append(f"{column} IN ({_placeholders(column, values, params)})")
+    for column, raw in (("residence", residence), ("hometown", hometown)):
+        if raw and has(column):
+            where.append(f"{column} LIKE CONCAT('%', :{column}, '%')")
+            params[column] = raw
+
     clause = " AND ".join(where)
-    rows = await db.execute(text(f"{LEAD_SELECT} WHERE {clause} ORDER BY id DESC LIMIT :limit OFFSET :offset"), params)
+    order_sql = _LEAD_ORDER_SQL.get(order or "latest", _LEAD_ORDER_SQL["latest"])
+    rows = await db.execute(text(f"{LEAD_SELECT} WHERE {clause} ORDER BY {order_sql} LIMIT :limit OFFSET :offset"), params)
     count = await db.execute(text(f"SELECT COUNT(*) FROM customer_lead WHERE {clause}"), {k: v for k, v in params.items() if k not in ("limit", "offset")})
     total = int(count.scalar() or 0)
     return CustomerLeadPage(items=[_lead(row, redaction_level) for row in rows.mappings().all()], page=page, page_size=page_size, total=total, has_more=page * page_size < total)

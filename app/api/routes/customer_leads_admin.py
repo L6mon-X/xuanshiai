@@ -16,9 +16,69 @@ _XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.
 
 @declare_permission("customer_lead.manage")
 @router.get("", response_model=CustomerLeadPage, summary="查询客源线索")
-async def lead_list(page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=100), status: str | None = Query(None, pattern="^(NEW|CONTACTED|INTENDED|CONVERTED|LOST|CLOSED)$"), source: str | None = Query(None, max_length=64), matchmaker_id: int | None = Query(None, ge=1), search: str | None = Query(None, max_length=64), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> CustomerLeadPage:
+async def lead_list(
+    page: int = Query(1, ge=1, le=1000),
+    page_size: int = Query(20, ge=1, le=100),
+    status: str | None = Query(None, pattern="^(NEW|CONTACTED|INTENDED|CONVERTED|LOST|CLOSED)$"),
+    source: str | None = Query(None, max_length=64),
+    matchmaker_id: int | None = Query(None, ge=1),
+    search: str | None = Query(None, max_length=64),
+    intention_level: int | None = Query(None, ge=1, le=3, description="意向程度 1低 2中 3高"),
+    start_date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="录入时间起（含）"),
+    end_date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="录入时间止（含）"),
+    assign_start: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="分派时间起（含）"),
+    assign_end: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="分派时间止（含）"),
+    promoter_id: int | None = Query(None, ge=1, description="推广红娘 users.id"),
+    xiangqin_status: int | None = Query(None, ge=1, le=5, description="相亲状态 1公开相亲 2委托红娘 3完全私密 4关闭相亲 5已经脱单"),
+    bind_mode: str | None = Query(None, pattern="^(bind|auto|custom)$", description="落户方式 bind绑定已有账号/auto自动生成账号/custom自定义创建"),
+    wechat_added: int | None = Query(None, ge=0, le=2, description="加微信结果 0未添加 1已加上 2没加上"),
+    tags: str | None = Query(None, max_length=255, description="标签多选，英文逗号分隔，任一命中"),
+    age_min: int | None = Query(None, ge=16, le=100),
+    age_max: int | None = Query(None, ge=16, le=100),
+    height_min: int | None = Query(None, ge=80, le=250),
+    height_max: int | None = Query(None, ge=80, le=250),
+    marriage: str | None = Query(None, max_length=255, description="婚况多选，英文逗号分隔"),
+    education: str | None = Query(None, max_length=255, description="学历多选，英文逗号分隔"),
+    occupation: str | None = Query(None, max_length=255, description="职业多选，英文逗号分隔"),
+    residence: str | None = Query(None, max_length=64, description="现居地模糊匹配"),
+    hometown: str | None = Query(None, max_length=64, description="家乡模糊匹配"),
+    hide_followed_today: bool | None = Query(None, description="隐藏今日已跟进的线索"),
+    hide_called_today: bool | None = Query(None, description="隐藏今日已通话的线索"),
+    has_phone: bool | None = Query(None, description="是否登记手机号"),
+    has_wechat: bool | None = Query(None, description="是否登记微信号"),
+    order: str | None = Query(None, pattern="^(latest|earliest)$", description="记录排序，默认 latest"),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> CustomerLeadPage:
     current.require("customer_lead.manage")
-    return await list_leads(db, page, page_size, status, source, matchmaker_id, search, redaction_level_from_permissions(current.permissions))
+    return await list_leads(
+        db, page, page_size, status, source, matchmaker_id, search,
+        redaction_level_from_permissions(current.permissions),
+        intention_level=intention_level,
+        start_date=start_date,
+        end_date=end_date,
+        assign_start=assign_start,
+        assign_end=assign_end,
+        promoter_id=promoter_id,
+        xiangqin_status=xiangqin_status,
+        bind_mode=bind_mode,
+        wechat_added=wechat_added,
+        tags=tags,
+        age_min=age_min,
+        age_max=age_max,
+        height_min=height_min,
+        height_max=height_max,
+        marriage=marriage,
+        education=education,
+        occupation=occupation,
+        residence=residence,
+        hometown=hometown,
+        hide_followed_today=hide_followed_today,
+        hide_called_today=hide_called_today,
+        has_phone=has_phone,
+        has_wechat=has_wechat,
+        order=order,
+    )
 
 
 @declare_permission("customer_lead.manage")

@@ -373,3 +373,4 @@ CREATE TABLE `merchant_order` (
 ## 十一、变更记录
 
 - **2026-09-12 v1.0** —— M7-B 首版（商家 + 商品 + 订单 + 配置）
+- **2026-10-11 v1.1** —— `GET /admin/merchant-orders` 与 `GET /admin/merchant-orders/export` 新增 `search_type`（`product` 按商品关键词 / `phone` 按买家手机），用于指定 `keyword` 的匹配目标；默认 `product`，与历史行为一致，向后兼容。完整契约见 `docs/api/后台筛选参数补全-2026-10-11.md`

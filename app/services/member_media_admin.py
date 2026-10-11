@@ -92,6 +92,18 @@ def _build_media(r: dict[str, Any]) -> MemberMediaItem:
 
 # ─── 个人介绍（自白内容） ───────────────────────────────────────
 
+# 搜索方式：按手机号 / 按会员编号 / 按昵称。值为服务端白名单内的固定 SQL 片段，
+# 不拼接用户输入；未传 search_type 时按「昵称 + 手机 + 编号」综合匹配（历史行为）。
+_MEMBER_SEARCH_TYPE_SQL: dict[str, str] = {
+    "phone": "u.phone LIKE CONCAT('%', :kw, '%')",
+    "code": f"{_member_code_sql()} LIKE CONCAT('%', :kw, '%')",
+    "nickname": "u.nickname LIKE CONCAT('%', :kw, '%')",
+}
+_MEMBER_SEARCH_TYPE_ALL = (
+    "(u.nickname LIKE CONCAT('%', :kw, '%') OR u.phone LIKE CONCAT('%', :kw, '%') "
+    f"OR {_member_code_sql()} LIKE CONCAT('%', :kw, '%'))"
+)
+
 
 async def list_intros(
     db: AsyncSession,
@@ -102,12 +114,14 @@ async def list_intros(
     letter_lower: bool,
     digit: bool,
     cn_digit: bool,
+    search_type: str | None = None,
 ) -> MemberIntroPage:
     """分页查询会员个人介绍（自白内容）。
 
     数据源 ``users u LEFT JOIN user_profile p``；``self_intro`` 取自 ``p.self_intro``。
     过滤：letter_mode=has → 含英文字母；=none → 不含英文字母；letter_lower/digit/cn_digit
-    分别对应小写字母/数字/中文数字匹配；keyword 匹配昵称或手机号。
+    分别对应小写字母/数字/中文数字匹配；keyword 默认匹配昵称/手机/会员编号，
+    search_type=phone|code|nickname 时只匹配对应字段。
     """
     where = ["1=1"]
     params: dict[str, Any] = {}
@@ -123,9 +137,7 @@ async def list_intros(
     if cn_digit:
         where.append("p.self_intro REGEXP '[零一二三四五六七八九]'")
     if keyword:
-        where.append(
-            "(u.nickname LIKE CONCAT('%', :kw, '%') OR u.phone LIKE CONCAT('%', :kw, '%'))"
-        )
+        where.append(_MEMBER_SEARCH_TYPE_SQL.get(search_type or "", _MEMBER_SEARCH_TYPE_ALL))
         params["kw"] = keyword
     clause = " AND ".join(where)
     base = "FROM users u LEFT JOIN user_profile p ON p.user_id = u.id"
@@ -754,11 +766,13 @@ async def list_media(
     review_status: int | None,
     keyword: str | None,
     gender: int | None,
+    search_type: str | None = None,
 ) -> MemberMediaPage:
     """分页查询指定类型的媒体（头像/照片/视频），仅取未软删记录。
 
     age 由 ``TIMESTAMPDIFF(YEAR, u.birthday, CURDATE())`` 推算；
     meta_text 由 ``生日年份 + 身高 + 学历`` 经 CONCAT_WS 拼接（NULL 自动跳过）。
+    keyword 默认匹配昵称/手机/会员编号，search_type=phone|code|nickname 时只匹配对应字段。
     """
     where = ["m.deleted_at IS NULL", "m.media_type = :mt"]
     params: dict[str, Any] = {"mt": media_type}
@@ -769,10 +783,7 @@ async def list_media(
         where.append("u.gender = :gd")
         params["gd"] = gender
     if keyword:
-        where.append(
-            "(u.nickname LIKE CONCAT('%', :kw, '%') OR u.phone LIKE CONCAT('%', :kw, '%') "
-            f"OR {_member_code_sql()} LIKE CONCAT('%', :kw, '%'))"
-        )
+        where.append(_MEMBER_SEARCH_TYPE_SQL.get(search_type or "", _MEMBER_SEARCH_TYPE_ALL))
         params["kw"] = keyword
     clause = " AND ".join(where)
     base = (

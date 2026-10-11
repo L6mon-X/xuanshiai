@@ -3263,6 +3263,8 @@ class DatabaseManager:
         self._ensure_m6_columns(cursor)
         # M7 活动报名（offline_activity 补字段 + activity_signup 补字段）+ 商家/短视频分类种子
         self._ensure_m7_columns(cursor)
+        # 后台筛选参数补列（users / user_profile / customer_lead / admin_content_item）
+        self._ensure_filter_columns(cursor)
 
         # M10 账号注销申请 + 平台工单反馈（旧库幂等补齐）
         # 两张表已由 BUSINESS_TABLES 中 CREATE TABLE IF NOT EXISTS 直接创建，
@@ -3514,6 +3516,48 @@ class DatabaseManager:
             INSERT IGNORE INTO short_video_category (name, sort, status)
             VALUES ('关于我们', 1, 1), ('脱单干货', 2, 1), ('活动瞬间', 3, 1), ('优质嘉宾', 4, 1), ('直播切片', 5, 1)
         """)
+
+    def _ensure_filter_columns(self, cursor) -> None:
+        """后台筛选参数补列（旧库幂等补齐）。
+
+        镜像 migrations/filters/20261011_01_admin_filter_columns_up.sql：会员资料、
+        客源线索、内容类筛选项在旧库没有对应列，不补齐新版筛选 SQL 会报 Unknown column。
+        所有新增 NOT NULL 列都带默认值，存量行落到默认值，不改写业务数据。
+        """
+        self._ensure_table_columns(cursor, "`users`", self._named_columns({
+            "source": "varchar(32) DEFAULT NULL COMMENT '会员登记来源：后台添加/红娘录入/批量导入/自己注册/落地页/父母登记/线索入库/活动入库/找搭子'",
+            "region": "varchar(16) DEFAULT NULL COMMENT '证件或户籍地区：mainland中国大陆/hmt港澳台/overseas国外'",
+            "cert_status": "tinyint NOT NULL DEFAULT 0 COMMENT '身份认证状态 0未认证 1已认证 2待审核 3认证失败'",
+            "wechat_added": "tinyint NOT NULL DEFAULT 0 COMMENT '加微信结果 0未添加 1已加上 2没加上'",
+            "promoted": "tinyint NOT NULL DEFAULT 0 COMMENT '置顶推广 0否 1是'",
+            "newcomer": "tinyint NOT NULL DEFAULT 0 COMMENT '新人推荐 0否 1是'",
+            "activity_signup": "tinyint NOT NULL DEFAULT 0 COMMENT '活动报名 0否 1是'",
+            "level": "varchar(32) DEFAULT NULL COMMENT '会员级别'",
+            "fetched_at": "datetime DEFAULT NULL COMMENT '最近一次被红娘捞取的时间'",
+        }))
+        self._ensure_table_columns(cursor, "`user_profile`", self._named_columns({
+            "car": "varchar(32) DEFAULT NULL COMMENT '购车情况'",
+            "household": "varchar(128) DEFAULT NULL COMMENT '户口所在地'",
+        }))
+        self._ensure_table_columns(cursor, "`customer_lead`", self._named_columns({
+            "age": "int DEFAULT NULL COMMENT '年龄'",
+            "height": "int DEFAULT NULL COMMENT '身高cm'",
+            "marriage": "varchar(32) DEFAULT NULL COMMENT '婚况'",
+            "education": "varchar(32) DEFAULT NULL COMMENT '学历'",
+            "occupation": "varchar(128) DEFAULT NULL COMMENT '职业'",
+            "residence": "varchar(128) DEFAULT NULL COMMENT '现居地'",
+            "hometown": "varchar(128) DEFAULT NULL COMMENT '家乡'",
+            "xiangqin_status": "tinyint NOT NULL DEFAULT 0 COMMENT '相亲状态 0未填 1公开相亲 2委托红娘 3完全私密 4关闭相亲 5已经脱单'",
+            "bind_mode": "varchar(16) DEFAULT NULL COMMENT '落户方式 bind绑定已有账号/auto自动生成账号/custom自定义创建'",
+            "wechat_added": "tinyint NOT NULL DEFAULT 0 COMMENT '加微信结果 0未添加 1已加上 2没加上'",
+            "assigned_at": "datetime DEFAULT NULL COMMENT '最近一次分派时间'",
+        }))
+        # admin_content_item 的域特有字段按设计存放在 extra_json，筛选走
+        # JSON_EXTRACT，不需要补列（见 migrations/filters/README.md）。
+        self._ensure_optional_index(cursor, "users", "idx_users_source", "(`source`)")
+        self._ensure_optional_index(cursor, "users", "idx_users_fetched", "(`fetched_at`)")
+        self._ensure_optional_index(cursor, "customer_lead", "idx_customer_lead_assigned", "(`assigned_at`)")
+        self._ensure_optional_index(cursor, "customer_lead", "idx_customer_lead_xiangqin", "(`xiangqin_status`)")
 
     def _ensure_optional_index(self, cursor, table_name: str, index_name: str, definition: str) -> None:
         """幂等创建索引：表不存在或索引已存在时静默跳过。"""
