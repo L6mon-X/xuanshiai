@@ -31,6 +31,8 @@ from app.schemas.discovery import DiscoveryFilters
 from app.services.ai_provider import complete, parse_json
 from app.services.discovery import _candidate_score, _card, _fetch_rows, _viewer_context
 from app.services.membership import has_active_membership
+from app.services.profile import _qa_answers_from_value
+from app.schemas.auth import QA_QUESTION_TEXTS
 
 MatchType = Literal["who_likes_me", "i_like", "material", "soul"]
 logger = logging.getLogger(__name__)
@@ -115,6 +117,19 @@ async def assistant_message(db: AsyncSession, user_id: int, session_id: int, con
 async def polish_profile(db: AsyncSession, user_id: int, request: AIProfilePolishRequest) -> AIProfilePolishResponse:
     await _require_vip(db, user_id)
     quota_key = await _consume_ai_quota(db, user_id, "polish", settings.ai_daily_polish_limit)
+    # mock 回退判定与 ai_provider.complete() 的回退分支为同一布尔式（not
+    # ai_enabled and is_test_mode and ai_allow_mock_fallback）：全部成立时
+    # complete() 才返回原文截断 300 字回显，这里显式留痕避免 mock 降级静默
+    # 发生；flag=false 时 complete() 抛 503，不得谎报降级。
+    if (
+        not settings.ai_enabled
+        and settings.is_test_mode
+        and settings.ai_allow_mock_fallback
+    ):
+        logger.warning(
+            "ai_mock_fallback scene=profile_polish user_id=%s mode=echo_truncated_300",
+            user_id,
+        )
     try:
         content = await complete([{"role": "system", "content": "你只润色用户提供的原文，不添加未提供的事实。输出JSON：polished(string), changed_points(array[string])。"}, {"role": "user", "content": f"PROFILE_POLISH style={request.style} max_length={request.max_length}\n{request.content}"}], json_mode=True, scene="profile_polish")
         data = parse_json(content)
@@ -201,7 +216,7 @@ async def analyze_thoughtfulness(db: AsyncSession, user_id: int, request: AIProf
                        p.height, p.weight, p.occupation, p.industry, p.education_level, p.income,
                        p.residence_province_code, p.residence_city_code, p.residence_district_code,
                        p.hometown_province_code, p.hometown_city_code, p.hometown_district_code,
-                       p.self_intro, p.interest_tags, p.personality_tags, p.mbti, p.tags
+                       p.self_intro, p.interest_tags, p.personality_tags, p.mbti, p.tags, p.qa_answers
                        ,p.love_view, p.ideal_partner, p.hobbies, p.family_background,
                        p.single_reason, p.household, p.house, p.car, p.smoking,
                        p.constellation, p.zodiac
@@ -235,6 +250,14 @@ async def analyze_thoughtfulness(db: AsyncSession, user_id: int, request: AIProf
         else:
             facts.append(f"{label}：{value}")
     facts.append(f"相册照片数：{photo_count}")
+    # 「关于我问答」是 user_profile.qa_answers 独立字段，不在上面的 mapping 里；
+    # 不显式读出已保存答案，模型就看不到用户已填写的问答，宣称覆盖全部问答的待办也无从判断。
+    answered_qa = [item for item in _qa_answers_from_value(profile_row["qa_answers"]) if item["answer"] != ""]
+    for item in answered_qa:
+        facts.append(f"关于我问答「{item['question']}」：{item['answer']}")
+    qa_unanswered = max(len(QA_QUESTION_TEXTS) - len(answered_qa), 0)
+    if qa_unanswered > 0:
+        facts.append(f"关于我问答：已回答 {len(answered_qa)} 题，未回答 {qa_unanswered} 题")
     edited_keys = [k for k in (request.edited_keys or [])[:20] if k in THOUGHTFULNESS_KEY_LABELS]
 
     previous_row = (await db.execute(text("""SELECT summary, todos

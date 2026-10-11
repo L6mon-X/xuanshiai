@@ -602,6 +602,7 @@ class ProfileNarrativeRead(BaseModel):
     pending/pending_confirmation 状态下前端应引导确认，字段内容已可展示。
     """
 
+    revision_id: int | None = None
     subject: str
     status: str = "pending"
     persona_title: str = ""
@@ -613,3 +614,105 @@ class ProfileNarrativeRead(BaseModel):
     history_observations: list[ProfileNarrativeHistoryObservation] = []
     # 写在最后：整份画像的概括性收束（旧画像无此字段时为空串）。
     conclusion: str = ""
+
+
+class ProfilePreviewRequest(BaseModel):
+    """草稿预览请求；保留旧客户端的 expected_revision JSON 入参。"""
+
+    expected_revision: int = Field(..., ge=0)
+
+
+class ProfilePublishRequest(BaseModel):
+    """旧 publish 兼容请求；continuous_v2 不接受该入口。"""
+
+    preview_id: str | None = Field(default=None, min_length=1, max_length=96)
+
+# ----------------------------------------------------------------------
+# Phase 3 P3-01：草稿预览响应（建模前为裸 dict；键集与历史返回逐键一致）
+# ----------------------------------------------------------------------
+
+class ProfilePreviewField(BaseModel):
+    """continuous_v2 冻结预览中的完整可审阅字段。"""
+    field_key: str
+    field_kind: str = Field(pattern="^(structured|entry)$")
+    category: str | None = None
+    content: str = ""
+    display_value: str | None = None
+    value_json: Any = None
+    change: str = Field(pattern="^(added|changed|unchanged)$")
+    previous_display_value: str | None = None
+class ProfilePreviewResponse(BaseModel):
+    """`POST /profile-drafts/{draft_id}/preview` 响应（202）。
+
+    status 值域为 ``PREVIEW_STATUSES``（active/confirmed/stale/failed）；
+    建模保持 str 以免对历史行引入额外校验失败面。
+    """
+
+    preview_id: str
+    draft_id: str
+    expected_revision: int
+    subject: str
+    status: str = Field(description="预览状态：active/confirmed/stale/failed")
+    content: str
+    task_id: str | None = None
+    flow_version: str | None = Field(default=None, description="continuous_v2；旧预览为 null")
+    generation_status: str | None = Field(default=None, pattern="^(queued|processing|completed|failed)$")
+    fields: list[ProfilePreviewField] = Field(default_factory=list)
+    boundary_changed: bool = False
+
+
+class ProfilePreviewDetailResponse(ProfilePreviewResponse):
+    """`GET /profile-previews/{preview_id}` response with diagnostics."""
+
+    last_error: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class ContinuousBuildRequest(BaseModel):
+    refresh: bool = False
+
+
+class ContinuousDimensionState(BaseModel):
+    percent: float = Field(ge=0, le=100)
+    evidence_count: int = Field(ge=0)
+
+
+class ContinuousSubjectState(BaseModel):
+    subject: ProfileSubject
+    status: str = Field(pattern="^(collecting|generating|awaiting_confirmation|confirmed|failed|stale)$")
+    overall_percent: float = Field(default=0.0, ge=0.0, le=100.0)
+    dimensions: dict[str, ContinuousDimensionState] = Field(default_factory=dict)
+    draft_id: str | None = None
+    expected_revision: int | None = None
+    preview_id: str | None = None
+    task_id: str | None = None
+    published_revision_id: int | str | None = None
+    has_updates: bool = False
+    last_error: str | None = None
+
+
+class ContinuousStateResponse(BaseModel):
+    flow_version: str
+    consent_granted: bool
+    session_id: str | None = None
+    personal: ContinuousSubjectState
+    ideal_partner: ContinuousSubjectState
+
+
+class ContinuousTurnRead(BaseModel):
+    turn_id: str
+    turn_no: int
+    role: str = Field(pattern="^(user|assistant)$")
+    answer_text: str
+    client_turn_id: str = ""
+    created_at: str | None = None
+
+
+class ContinuousTurnsResponse(BaseModel):
+    turns: list[ContinuousTurnRead] = Field(default_factory=list)
+    next_before_id: str | None = None
+
+
+class ContinuousConfirmRequest(BaseModel):
+    expected_revision: int = Field(..., ge=0)

@@ -151,12 +151,18 @@ class DatabaseManager:
 
     @staticmethod
     def _named_columns(columns: dict) -> dict:
-        """给 {字段名: 类型定义} 字典补上 `字段名` 前缀。
+        """标准化 {字段名: 类型定义} 字典中的完整列定义。
 
         _ensure_table_columns 的 SQL 模板是 `ALTER TABLE ... ADD COLUMN {column_def}`，
-        要求定义自带 `字段名` 前缀；新式字典（键=字段名，值=纯类型定义）需先经过本方法。
+        要求定义自带 `字段名` 前缀；兼容值已经带前缀的旧式定义，避免重复生成
+        `` `name` `name` type ... `` 导致 MySQL 1064。
         """
-        return {name: f"`{name}` {definition}" for name, definition in columns.items()}
+        result = {}
+        for name, definition in columns.items():
+            normalized = str(definition).lstrip()
+            prefix = f"`{name}`"
+            result[name] = normalized if normalized.startswith(prefix) else f"{prefix} {normalized}"
+        return result
 
     @staticmethod
     def _assert_column_definition(table_name: str, column_name: str, column_def: str) -> None:
@@ -2057,7 +2063,7 @@ class DatabaseManager:
                     `reason` varchar(1000) DEFAULT NULL,
                     `risk_level` varchar(16) NOT NULL DEFAULT 'low',
                     `source` varchar(255) DEFAULT NULL,
-                    `version` varchar(64) NOT NULL DEFAULT 'seed-v1',
+                    `version` varchar(64) NOT NULL DEFAULT 'seed-v2',
                     `enabled` tinyint NOT NULL DEFAULT '1',
                     `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
                     `updated_at` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -3369,7 +3375,7 @@ class DatabaseManager:
                 "varchar(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL "
                 "COMMENT '客户端消息幂等键' AFTER `media_url`"
             )
-        elif len(column) > 2 and column[2] != "utf8mb4_bin":
+        elif column["Collation"] != "utf8mb4_bin":
             cursor.execute(
                 "ALTER TABLE `chat_message` MODIFY COLUMN `client_message_id` "
                 "varchar(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL "
@@ -3415,13 +3421,19 @@ class DatabaseManager:
         self._ensure_table_columns(cursor, "`partner_team`", self._named_columns({
             "level_id": "tinyint unsigned NOT NULL DEFAULT 1 COMMENT '合伙级别：1 初级 / 2 中级 / 3 战略合伙人（固定 3 种）'",
         }))
+        self._ensure_optional_index(
+            cursor, "partner_team", "idx_partner_team_level", "(`level_id`, `status`)"
+        )
         # commission_entry 支持后台手工录入：order_id 放开为可空 + 补 source/remark
         self._ensure_table_columns(cursor, "`commission_entry`", self._named_columns({
             "source": "varchar(16) NOT NULL DEFAULT 'order' COMMENT 'order 订单产生 / manual 后台手工录入'",
             "remark": "varchar(255) DEFAULT NULL COMMENT '后台手工录入备注'",
         }))
         try:
-            cursor.execute("ALTER TABLE `commission_entry` MODIFY COLUMN `order_id` bigint unsigned DEFAULT NULL")
+            cursor.execute(
+                "ALTER TABLE `commission_entry` MODIFY COLUMN `order_id` "
+                "bigint unsigned DEFAULT NULL COMMENT '关联订单；后台手工录入时为空'"
+            )
             logger.info("✅ commission_entry.order_id 已放开为可空（支持手工录入分成）")
         except Exception as e:  # 已是可空或权限不足时静默跳过
             logger.debug(f"commission_entry.order_id 调整跳过: {e}")
@@ -3489,8 +3501,11 @@ class DatabaseManager:
             "checked_in": "tinyint NOT NULL DEFAULT 0 COMMENT '是否已签到'",
             "in_crm": "tinyint NOT NULL DEFAULT 0 COMMENT '是否已入库会员CRM'",
             "promoter_id": "bigint unsigned DEFAULT NULL COMMENT '推广红娘 users.id'",
+            "deleted_at": "datetime DEFAULT NULL COMMENT '软删除时间，非空表示已删除'",
+            "deleted_by": "bigint unsigned DEFAULT NULL COMMENT '删除操作人 matchmaker_admin_account.id'",
         }))
         self._ensure_optional_index(cursor, "activity_signup", "idx_activity_signup_promoter", "(`promoter_id`)")
+        self._ensure_optional_index(cursor, "activity_signup", "idx_activity_signup_deleted", "(`deleted_at`)")
         self._ensure_optional_index(cursor, "offline_activity", "idx_offline_activity_online", "(`online`, `sort_order`)")
         # 商家分类种子
         cursor.execute("""

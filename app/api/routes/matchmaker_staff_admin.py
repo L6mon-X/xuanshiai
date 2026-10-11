@@ -5,7 +5,7 @@ from datetime import date, timedelta
 from fastapi import APIRouter, Depends, File, Path, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies import CurrentMatchmakerAdmin, get_current_matchmaker_admin
+from app.api.dependencies import CurrentMatchmakerAdmin, declare_permission, get_current_matchmaker_admin
 from app.db.session import get_db
 from app.schemas.matchmaker_staff_admin import (
     AdminMenuNode,
@@ -29,6 +29,7 @@ from app.schemas.matchmaker_staff_admin import (
     StoreDictItem,
 )
 from app.services import matchmaker_staff_admin as service
+from app.services.media_access import MEDIA_CATEGORY_ADMIN, sign_media_url
 from app.services.profile import _image_outputs, _read_limited
 from uuid import uuid4
 from pathlib import Path as FilePath
@@ -142,11 +143,13 @@ async def visibility_matchmaker(
     return await service.set_visibility(db, matchmaker_id, body)
 
 
+@declare_permission("matchmaker.read")
 @router.get("/menus/tree", response_model=list[AdminMenuNode])
 async def menus_tree(
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> list[AdminMenuNode]:
+    current.require("matchmaker.read")
     _guard(current)
     return await service.menu_tree(db)
 
@@ -244,6 +247,7 @@ async def dict_stores(
     return await service.stores(db)
 
 
+@declare_permission("matchmaker.manage")
 @router.post("/common/upload", response_model=CommonUploadResponse, status_code=201)
 async def common_upload(
     file: UploadFile = File(...),
@@ -262,5 +266,13 @@ async def common_upload(
     target.write_bytes(output)
     (directory / f"{name}-thumb.webp").write_bytes(thumbnail)
     return CommonUploadResponse(
-        url=f"/storage/uploads/admin/{name}.webp", content_type="image/webp", size=len(output)
+        # 后台资源仅后台签发链路：URL 按当前管理员签发（kind=admin），挂载层
+        # 验签时校验该账号仍处于启用状态。
+        url=sign_media_url(
+            f"/storage/uploads/admin/{name}.webp",
+            category=MEDIA_CATEGORY_ADMIN,
+            viewer=current.account.id,
+        ),
+        content_type="image/webp",
+        size=len(output),
     )

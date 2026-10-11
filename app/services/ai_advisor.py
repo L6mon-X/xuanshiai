@@ -26,6 +26,7 @@ from app.schemas.ai_advisor import (
     AdvisorSuggestion,
 )
 from app.services.ai_provider import complete, parse_json
+from app.services.ai.gateway import _redact_provider_message
 from app.services.content_filter import assert_text_allowed
 from app.services.ai.memory.consumers import CounselorMemoryAdapter
 from app.services.ai.features import memory_projection_read_mode
@@ -111,6 +112,39 @@ async def _load_knowledge(db: AsyncSession, scenario: str, tone: str) -> list[di
     if knowledge:
         return knowledge
     return [{"content": item, "reason": "Seed relationship-advice guidance"} for item in _FALLBACK_KNOWLEDGE.get(scenario, _FALLBACK_KNOWLEDGE["reply"])]
+
+
+async def verify_knowledge_version(db: AsyncSession) -> str | None:
+    """校验库中启用知识的版本与配置一致，返回不一致时的说明（一致返回 None）。
+
+    `ai_advisor_call_log.knowledge_version` 记录的是配置值；若库中实际生效的知识
+    版本与之不符，审计链路就无法回答「这次回答用了哪版知识」。非开发/测试环境
+    必须 fail-fast，避免带着失真的审计数据上线。
+    """
+    configured = settings.ai_advisor_knowledge_version
+    try:
+        rows = await db.execute(
+            text("SELECT DISTINCT version FROM ai_advisor_knowledge WHERE enabled = 1")
+        )
+        versions = {str(row[0]) for row in rows.all() if row[0] is not None}
+    except Exception as exc:
+        logger.warning("AI 军师知识版本校验跳过（知识表不可用）：%s", exc)
+        return None
+    if not versions:
+        logger.warning("AI 军师知识库为空，跳过版本一致性校验（configured=%s）", configured)
+        return None
+    if versions == {configured}:
+        logger.info("AI 军师知识版本一致性校验通过：%s", configured)
+        return None
+    detail = (
+        f"AI 军师知识版本不一致：配置为 {configured}，库中启用知识版本为 {sorted(versions)}。"
+        "请执行 scripts/seed_ai_advisor_knowledge.py 或修正 AI_ADVISOR_KNOWLEDGE_VERSION，"
+        "否则 ai_advisor_call_log.knowledge_version 记录将与实际生效知识不符。"
+    )
+    if settings.is_test_mode:
+        logger.warning("%s（当前为 %s 环境，仅告警不阻断）", detail, settings.environment)
+        return detail
+    raise RuntimeError(detail)
 
 
 def _risk_level(content: str) -> str:
@@ -310,6 +344,19 @@ def _exception_detail(exc: HTTPException) -> str:
     return f"HTTP {exc.status_code}: {exc.detail}"
 
 
+def _controlled_error_detail(exc: Exception) -> str:
+    """受控审计摘要（对齐 _exception_detail 与 PROJECT_RULES 3.2）。
+
+    非 HTTP 异常只记 ``type(exc).__name__`` + 结构化且脱敏后的摘要：摘要复用
+    ``gateway._redact_provider_message``（非结构化文本一律置空），杜绝
+    IntegrityError/StatementError 等把完整 SQL 与绑定参数（含用户原文）吸入
+    审计表；写入前限长到 error_detail 列容量 varchar(500)。
+    """
+    summary = _redact_provider_message(str(exc))
+    detail = f"{type(exc).__name__}: {summary}" if summary else type(exc).__name__
+    return detail[:500]
+
+
 async def _rollback_safely(db: AsyncSession) -> None:
     try:
         await db.rollback()
@@ -424,6 +471,15 @@ async def get_advice(
 
     quota_key = await _consume_quota(user_id)
     prompt = _build_prompt(request, context, knowledge, input_risk, memory_context)
+    # mock 回退判定与 ai_provider.complete() 的回退分支为同一布尔式（不得另
+    # 行发明判定）：not ai_enabled and is_test_mode and ai_allow_mock_fallback
+    # 全部成立时本次答复才来自本地 mock，落库 model_name 写 "mock-fallback"
+    # 使审计可区分 mock 与真实调用（纯 DB 内部字段语义）。
+    mock_fallback = (
+        not settings.ai_enabled
+        and settings.is_test_mode
+        and settings.ai_allow_mock_fallback
+    )
     try:
         raw = await complete([
             {"role": "system", "content": "你是谨慎、尊重隐私的婚恋沟通助手，明确标识为 AI，不替用户承诺关系结果，不提供医疗或法律结论。"},
@@ -444,7 +500,7 @@ async def get_advice(
             "input_text": request.incoming_message,
             "output_json": json.dumps(data, ensure_ascii=False),
             "risk_level": data["risk_level"],
-            "model_name": settings.ai_model,
+            "model_name": "mock-fallback" if mock_fallback else settings.ai_model,
             "prompt_version": settings.ai_advisor_prompt_version,
             "knowledge_version": settings.ai_advisor_knowledge_version,
             "request_id": request_id,
@@ -516,7 +572,7 @@ async def get_advice(
                 latency_ms=int((time.monotonic() - started) * 1000),
                 quota_consumed=True,
                 quota_refunded=refunded,
-                error_detail=str(exc),
+                error_detail=_controlled_error_detail(exc),
             )
             await db.commit()
         except Exception:
@@ -538,9 +594,22 @@ async def record_feedback(db: AsyncSession, user_id: int, message_id: int, reque
             "message_id": message_id, "user_id": user_id, "feedback_type": request.feedback_type,
         })
         await db.commit()
-    except Exception as exc:
+    except IntegrityError as exc:
         await db.rollback()
-        if "Duplicate" in str(exc) or "duplicate" in str(exc):
+        if _is_feedback_duplicate(exc):
             return AdvisorFeedbackResponse(message_id=message_id, feedback_type=request.feedback_type, recorded=False)
         raise HTTPException(503, detail="AI军师反馈暂时无法保存") from exc
+    except Exception as exc:
+        await db.rollback()
+        raise HTTPException(503, detail="AI军师反馈暂时无法保存") from exc
     return AdvisorFeedbackResponse(message_id=message_id, feedback_type=request.feedback_type, recorded=True)
+
+
+def _is_feedback_duplicate(exc: IntegrityError) -> bool:
+    """Identify only the feedback uniqueness conflict as an idempotent replay."""
+    original = getattr(exc, "orig", None)
+    args = getattr(original, "args", ())
+    if args and str(args[0]) == "1062":
+        return True
+    detail = str(original or "").lower()
+    return "duplicate" in detail and "feedback" in detail

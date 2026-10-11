@@ -40,7 +40,7 @@ def _make_mock_voice_gateway(
         outcome = VoiceInvokeOutcome(result=synth_result)
     else:
         outcome = VoiceInvokeOutcome(result=SynthesizeResult(
-            audio_url="/storage/tts/test.wav",
+            audio_url="/storage/uploads/tts/test.wav",
             audio_format="wav",
             duration_ms=2000,
             expires_at=None,
@@ -211,7 +211,7 @@ async def test_synthesize_current_success():
         mock_settings.ai_voice_model_name = "test"
         result = await orchestrator.synthesize_current()
 
-    assert result.tts_audio_url == "/storage/tts/test.wav"
+    assert result.tts_audio_url == "/storage/uploads/tts/test.wav"
     assert result.tts_duration_ms == 2000
     assert orchestrator.state == MasterState.IDLE
 

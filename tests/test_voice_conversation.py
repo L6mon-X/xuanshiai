@@ -150,7 +150,7 @@ async def test_process_transcript_full_flow(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr("app.services.voice.conversation.settings", settings)
     extract = _make_extract_result(field_key="age")
     synth = SynthesizeResult(
-        audio_url="/storage/voice/tts/test.mp3",
+        audio_url="/storage/uploads/voice/tts/test.mp3",
         audio_format="mp3",
         duration_ms=3000,
     )
@@ -167,7 +167,7 @@ async def test_process_transcript_full_flow(monkeypatch: pytest.MonkeyPatch) -> 
     assert result.field_key == "age"
     assert result.extracted_value == 28
     assert result.ai_reply  # 非空
-    assert result.tts_audio_url == "/storage/voice/tts/test.mp3"
+    assert result.tts_audio_url == "/storage/uploads/voice/tts/test.mp3"
     assert result.tts_duration_ms == 3000
     assert result.error_code is None
     assert orch.state == ConversationState.IDLE
@@ -182,7 +182,7 @@ async def test_process_transcript_does_not_synthesize_by_default(
     extract = _make_extract_result(field_key="age")
     voice = _make_mock_voice_gateway(
         synth_result=SynthesizeResult(
-            audio_url="/storage/voice/tts/test.mp3",
+            audio_url="/storage/uploads/voice/tts/test.mp3",
             audio_format="mp3",
             duration_ms=3000,
         )
@@ -197,7 +197,7 @@ async def test_process_transcript_does_not_synthesize_by_default(
     assert result.tts_audio_url is None
     voice.synthesize.assert_not_called()
     spoken = await orch.synthesize_current()
-    assert spoken.tts_audio_url == "/storage/voice/tts/test.mp3"
+    assert spoken.tts_audio_url == "/storage/uploads/voice/tts/test.mp3"
     voice.synthesize.assert_called_once()
 
 

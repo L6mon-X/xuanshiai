@@ -61,11 +61,34 @@ def _card(row: Any) -> MatchmakerCard:
 
 
 async def list_matchmakers(
-    db: AsyncSession, page: int, page_size: int, ranking: bool = False, keyword: str | None = None, available: bool | None = None
+    db: AsyncSession,
+    page: int,
+    page_size: int,
+    ranking: bool = False,
+    keyword: str | None = None,
+    available: bool | None = None,
+    admin: CurrentMatchmakerAdmin | None = None,
 ) -> MatchmakerPage:
     order = "success_count DESC, rating_score DESC, app.reviewed_at DESC, app.id DESC" if ranking else "app.reviewed_at DESC, app.id DESC"
     params = {"limit": page_size, "offset": (page - 1) * page_size}
     filters = ["app.application_type = 'service_matchmaker'", "app.status = 1"]
+    if admin is not None:
+        scope = admin.scope_condition(
+            organization_column="scope_org.id",
+            params=params,
+            user_column="app.user_id",
+        )
+        if admin.account.data_scope == "SELF":
+            filters.append(scope)
+        elif admin.account.data_scope != "ALL" and "*" not in admin.permissions:
+            filters.append(
+                "EXISTS (SELECT 1 FROM organization_member scope_member "
+                "JOIN organization scope_org ON scope_org.id = scope_member.organization_id "
+                "AND scope_org.org_type = 'store' "
+                "WHERE scope_member.user_id = app.user_id "
+                "AND scope_member.role_code = 'store_matchmaker' "
+                "AND scope_member.status = 1 AND " + scope + ")"
+            )
     if keyword:
         filters.append("(u.nickname LIKE CONCAT('%', :keyword, '%') OR app.user_id = :keyword_id)")
         params["keyword"] = keyword
@@ -105,7 +128,30 @@ async def list_matchmakers(
     return MatchmakerPage(items=items, page=page, page_size=page_size, total=total, has_more=page * page_size < total)
 
 
-async def get_matchmaker(db: AsyncSession, matchmaker_id: int) -> MatchmakerCard:
+async def get_matchmaker(
+    db: AsyncSession,
+    matchmaker_id: int,
+    admin: CurrentMatchmakerAdmin | None = None,
+) -> MatchmakerCard:
+    params: dict[str, object] = {"matchmaker_id": matchmaker_id}
+    scope_sql = ""
+    if admin is not None:
+        scope = admin.scope_condition(
+            organization_column="scope_org.id",
+            params=params,
+            user_column="app.user_id",
+        )
+        if admin.account.data_scope == "SELF":
+            scope_sql = " AND " + scope
+        elif admin.account.data_scope != "ALL" and "*" not in admin.permissions:
+            scope_sql = (
+                " AND EXISTS (SELECT 1 FROM organization_member scope_member "
+                "JOIN organization scope_org ON scope_org.id = scope_member.organization_id "
+                "AND scope_org.org_type = 'store' "
+                "WHERE scope_member.user_id = app.user_id "
+                "AND scope_member.role_code = 'store_matchmaker' "
+                "AND scope_member.status = 1 AND " + scope + ")"
+            )
     result = await db.execute(text("""SELECT app.user_id, u.nickname, u.avatar, app.intro, app.cert_images,
         COALESCE(service_stats.success_count, 0) AS success_count,
         COALESCE(rating_stats.rating_score, 0) AS rating_score,
@@ -124,7 +170,7 @@ async def get_matchmaker(db: AsyncSession, matchmaker_id: int) -> MatchmakerCard
           FROM matchmaker_rating GROUP BY matchmaker_id) rating_stats
           ON rating_stats.matchmaker_id = app.user_id
         WHERE app.user_id = :matchmaker_id AND app.application_type = 'service_matchmaker'
-          AND app.status = 1"""), {"matchmaker_id": matchmaker_id})
+          AND app.status = 1""" + scope_sql), params)
     row = result.mappings().first()
     if not row:
         raise HTTPException(404, detail="服务红娘不存在或暂不可用")
@@ -729,17 +775,17 @@ async def create_matchmaker_rating(
     row = (await db.execute(text("""SELECT id, user_id, matchmaker_id, order_id, status
         FROM matchmaker_service WHERE id = :id FOR UPDATE"""), {"id": service_id})).mappings().first()
     if not row:
-        raise HTTPException(404, detail="??????")
+        raise HTTPException(404, detail="牵线服务不存在")
     if int(row["user_id"]) != current.id:
-        raise HTTPException(403, detail="???????????")
+        raise HTTPException(403, detail="仅服务本人可以评价")
     if int(row["status"]) != 2:
-        raise HTTPException(409, detail="??????????")
+        raise HTTPException(409, detail="服务尚未完成，暂不能评价")
     paid = await db.execute(text("SELECT 1 FROM payment_order WHERE id = :id AND type = 3 AND status = 1 LIMIT 1"), {"id": row.get("order_id")})
     if row.get("order_id") and not paid.scalar():
-        raise HTTPException(409, detail="?????????")
+        raise HTTPException(409, detail="服务订单未支付，暂不能评价")
     duplicate = await db.execute(text("SELECT id FROM matchmaker_rating WHERE service_id = :service_id AND user_id = :user_id LIMIT 1"), {"service_id": service_id, "user_id": current.id})
     if duplicate.scalar():
-        raise HTTPException(409, detail="??????")
+        raise HTTPException(409, detail="该服务已评价过，请勿重复评价")
     result = await db.execute(text("""INSERT INTO matchmaker_rating
         (service_id, user_id, matchmaker_id, score, content)
         VALUES (:service_id, :user_id, :matchmaker_id, :score, :content)"""), {"service_id": service_id, "user_id": current.id, "matchmaker_id": row["matchmaker_id"], **request.model_dump()})

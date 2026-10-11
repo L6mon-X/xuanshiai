@@ -428,3 +428,102 @@ async def test_close_marks_unknown_playback_and_persists_snapshot() -> None:
     if harness.persisted:
         _, metadata = harness.persisted[0]
         assert metadata["playback_status"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_session_clock_starts_once_and_survives_upstream_rotation() -> None:
+    """单次上限的起点在首次建连时记下，打断后重建上游不重置。"""
+    harness = Harness()
+    session = await start_ready_session(harness)
+    origin = session.session_started_at
+    assert origin is not None
+
+    transport = harness.transports[0]
+    await session.handle_voice_input_begin("ct-1")
+    transport.incoming.put_nowait(sa("speech.started"))
+    transport.incoming.put_nowait(sa("user.transcript.done", text="说一句"))
+    await harness.wait_for_event("input_closed")
+    transport.incoming.put_nowait(sa("assistant.text.delta", text="好"))
+    await harness.settle(40)
+
+    await session.handle_interrupt(session.active_generation_id)
+    await harness.settle(40)
+    assert len(harness.transports) == 2
+    harness.transports[-1].incoming.put_nowait(sa("ready", session_id="s-2"))
+    deadline = asyncio.get_running_loop().time() + 2.0
+    while len(harness.events("voice_ready")) < 2:
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError("轮转后未再次 voice_ready")
+        await asyncio.sleep(0.02)
+
+    assert session.session_started_at == origin
+    await session.aclose()
+
+@pytest.mark.asyncio
+async def test_continuous_v2_final_is_preview_until_confirm_and_replays_once() -> None:
+    harness = Harness()
+    session = harness.make_session(require_transcript_confirmation=True)
+    start_task = asyncio.create_task(session.start())
+    await harness.settle(30)
+    harness.transports[0].incoming.put_nowait(sa("ready", session_id="s-1"))
+    assert await asyncio.wait_for(start_task, timeout=2.0) is True
+
+    transport = harness.transports[0]
+    await session.handle_voice_input_begin("ct-preview-1")
+    transport.incoming.put_nowait(sa("speech.started"))
+    transport.incoming.put_nowait(sa("user.transcript.done", text="原始转写"))
+    preview = await harness.wait_for_event("transcript_preview")
+    assert harness.submitted == []
+    assert harness.events("final_transcript") == []
+
+    assert await session.handle_confirm_transcript(
+        str(preview["transcript_id"]), "编辑后的转写", "ct-preview-1"
+    ) is True
+    while not harness.events("transcript_confirmed"):
+        await harness.settle(10)
+    assert harness.submitted == [("编辑后的转写", "ct-preview-1")]
+
+    assert await session.handle_confirm_transcript(
+        str(preview["transcript_id"]), "编辑后的转写", "ct-preview-1"
+    ) is True
+    await harness.settle(20)
+    assert harness.submitted == [("编辑后的转写", "ct-preview-1")]
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_continuous_v2_cancel_and_expiry_never_submit_transcript() -> None:
+    harness = Harness()
+    session = harness.make_session(require_transcript_confirmation=True)
+    session._transcript_ttl_seconds = 0.2  # noqa: SLF001 - deterministic cancellation window
+    start_task = asyncio.create_task(session.start())
+    await harness.settle(30)
+    harness.transports[0].incoming.put_nowait(sa("ready", session_id="s-1"))
+    assert await asyncio.wait_for(start_task, timeout=2.0) is True
+
+    transport = harness.transports[0]
+    await session.handle_voice_input_begin("ct-cancel-1")
+    transport.incoming.put_nowait(sa("speech.started"))
+    transport.incoming.put_nowait(sa("user.transcript.done", text="取消我"))
+    preview = await harness.wait_for_event("transcript_preview")
+    assert await session.handle_cancel_transcript(
+        str(preview["transcript_id"]), "ct-cancel-1"
+    ) is True
+    await harness.settle(30)
+    assert harness.submitted == []
+
+    deadline = asyncio.get_running_loop().time() + 2.0
+    while len(harness.transports) < 2:
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError("取消后未创建新上游")
+        await harness.settle(10)
+    harness.transports[-1].incoming.put_nowait(sa("ready", session_id="s-2"))
+    await harness.wait_for_event("voice_ready", timeout_s=2.0)
+    session._transcript_ttl_seconds = 0.01  # noqa: SLF001 - deterministic TTL test
+    transport = harness.transports[-1]
+    transport.incoming.put_nowait(sa("speech.started"))
+    transport.incoming.put_nowait(sa("user.transcript.done", text="过期我"))
+    expired = await harness.wait_for_event("transcript_expired")
+    assert expired["transcript_id"] != preview["transcript_id"]
+    assert harness.submitted == []
+    await session.aclose()

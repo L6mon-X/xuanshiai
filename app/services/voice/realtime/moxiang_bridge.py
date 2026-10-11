@@ -4,6 +4,9 @@
 instructions 组装、最终转写提交（现有旅程事务）、助手回复元数据落库、
 额度控制与单会话守卫。路由层只负责 WS 消息分派，不接触供应商协议。
 
+一条 WS 连接可以先后承载多轮语音会话。单次时长上限与每日额度都按
+会话计，不按连接寿命计；没有进行中的会话时不结算额度。
+
 日志只记时序、字节数、状态和错误码，不记录音频、转写、提示词或密钥。
 """
 
@@ -11,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Awaitable, Callable
@@ -31,6 +33,13 @@ from app.services.ai.prompts.moxiang_master import (
     build_realtime_update_instructions,
 )
 from app.services.voice.realtime.provider import RealtimeProviderConfig
+from app.services.voice.realtime.context import (
+    build_continuous_context,
+    build_journey_context,
+    load_continuous_history,
+    load_master_history,
+    send_json,
+)
 from app.services.voice.realtime.session import (
     RealtimeSessionCallbacks,
     RealtimeVoiceSession,
@@ -97,7 +106,7 @@ def release_session_slot(user_id: int) -> None:
 
 
 # ----------------------------------------------------------------------
-# 每日连接时长额度（Redis 原子；限额存储不可用时停止新语音会话）
+# 每日会话时长额度（Redis 原子；限额存储不可用时停止新语音会话）
 # ----------------------------------------------------------------------
 
 
@@ -106,8 +115,19 @@ def _daily_key(user_id: int) -> str:
     return f"{_DAILY_QUOTA_KEY_PREFIX}:{user_id}:{day}"
 
 
+def billable_minutes(elapsed_seconds: float) -> int:
+    """会话时长按分钟向上取整。
+
+    不满 1 分钟也记 1 分钟，避免短会话完全不计费；宁可多算，与
+    「额度不足停止新会话」的 fail-closed 一致。非正时长记 0。
+    """
+    if elapsed_seconds <= 0:
+        return 0
+    return -(-int(elapsed_seconds) // 60)
+
+
 async def realtime_daily_minutes_used(user_id: int) -> int | None:
-    """读取当日已用连接分钟数；Redis 不可用返回 None（fail closed）。"""
+    """读取当日已用会话分钟数；Redis 不可用返回 None（fail closed）。"""
     try:
         from app.core.redis import redis_client
 
@@ -118,27 +138,45 @@ async def realtime_daily_minutes_used(user_id: int) -> int | None:
         return None
 
 
+# incrby 与 expire 必须同一次往返：进程若在两步之间退出，key 会没有 TTL
+# 并永久累加。2 天 TTL 只是防泄漏兑底，日界由键名里的日期后缀决定。
+_CONSUME_MINUTES_LUA = """
+local value = redis.call('INCRBY', KEYS[1], ARGV[1])
+redis.call('EXPIRE', KEYS[1], ARGV[2])
+return value
+"""
+
+
 async def consume_realtime_minutes(user_id: int, minutes: int) -> None:
-    """按实际用满分钟数累计当日额度（best-effort，只在关闭时结算）。"""
+    """按实际用满分钟数累计当日额度（best-effort，只在会话关闭时结算）。"""
     if minutes <= 0:
         return
     try:
         from app.core.redis import redis_client
 
-        key = _daily_key(user_id)
-        await redis_client.incrby(key, minutes)
-        await redis_client.expire(key, _DAILY_QUOTA_TTL_SECONDS)
+        await redis_client.eval(
+            _CONSUME_MINUTES_LUA,
+            1,
+            _daily_key(user_id),
+            minutes,
+            _DAILY_QUOTA_TTL_SECONDS,
+        )
     except Exception:  # noqa: BLE001
         logger.debug("realtime_quota_consume_failed", exc_info=True)
 
 
 @dataclass
 class RealtimeRouteContext:
-    """当前业务会话状态（主体切换时由路由更新）。"""
+    """当前业务会话状态（主体切换时由路由更新）。
+
+    ``flow_version`` 决定回复注入哪一份上下文：continuous_v2 用双主体 +
+    跨会话，legacy 用单主体建构状态。缺省 legacy 保持既有连接行为不变。
+    """
 
     session_id: str
     subject: str
     narrative_context: str
+    flow_version: str = "legacy"
 
 
 class MoxiangRealtimeBridge:
@@ -152,17 +190,43 @@ class MoxiangRealtimeBridge:
         context: RealtimeRouteContext,
         poll_tasks: set[asyncio.Task[None]],
         emit: Callable[[dict[str, Any]], Awaitable[None]],
-        submit_candidate: Callable[[str, str], Awaitable[str]],
+        submit_candidate: Callable[[str, str], Awaitable[tuple[str, str]]],
+        require_transcript_confirmation: bool = False,
     ) -> None:
         self._ws = ws
         self._user_id = user_id
         self.context = context
         self._poll_tasks = poll_tasks
         self._emit = emit
-        # 路由注入的候选提交钩子：落库+入队+推送 extraction_status+启动监听。
+        self._require_transcript_confirmation = require_transcript_confirmation
+        self._transcript_sessions: dict[str, str] = {}
+        async def emit_with_context(event: dict[str, Any]) -> None:
+            event_type = event.get("type")
+            if event_type in {
+                "transcript_preview",
+                "transcript_confirmed",
+                "transcript_cancelled",
+                "transcript_expired",
+            }:
+                transcript_id = str(event.get("transcript_id") or "")
+                if event_type == "transcript_preview" and transcript_id:
+                    self._transcript_sessions[transcript_id] = self.context.session_id
+                event = {
+                    **event,
+                    "session_id": self.context.session_id,
+                    "subject": self.context.subject,
+                }
+            await emit(event)
+        self._emit_with_context = emit_with_context
         self._submit_candidate = submit_candidate
         self.session: RealtimeVoiceSession | None = None
-        self.started_at = time.monotonic()
+
+    async def submit_final_transcript(
+        self, text: str, client_turn_id: str
+    ) -> TurnOutcome:
+        """确认后的转写只经统一 journey 提交回调，返回业务轮次结果。"""
+        turn_id, task_id = await self._submit_candidate(text, client_turn_id)
+        return TurnOutcome(turn_id=str(turn_id or ""), task_id=str(task_id or ""))
 
     # -- instructions --------------------------------------------------
 
@@ -183,32 +247,82 @@ class MoxiangRealtimeBridge:
         )
 
     async def _build_context(self) -> str:
-        from app.api.routes.voice_moxiang import _journey_build_context
-
-        ctx = await _journey_build_context(
-            self.context.session_id, self.context.subject
+        if self.context.flow_version == "continuous_v2":
+            # 双主体 + 跨内部会话：连续对话恢复不依赖当前 session 是否新建。
+            context = await build_continuous_context(
+                self._user_id, session_factory=_db_session_factory
+            )
+            if context is None:
+                raise RuntimeError("continuous context unavailable")
+            return context
+        if not self.context.session_id:
+            return ""
+        context = await build_journey_context(
+            self.context.session_id,
+            self.context.subject,
+            session_factory=_db_session_factory,
         )
-        return ctx or ""
+        if context is None:
+            raise RuntimeError("journey context unavailable")
+        return context
 
     async def _load_history(self) -> list[dict[str, str]]:
-        from app.api.routes.voice_moxiang import _load_master_history
-
-        if _db_session_factory is None or not self.context.session_id:
+        continuous = self.context.flow_version == "continuous_v2"
+        if not continuous and not self.context.session_id:
             return []
+        if _db_session_factory is None:
+            raise RuntimeError("realtime history unavailable")
+
         try:
             async with _db_session_factory() as db:
-                return await _load_master_history(db, self.context.session_id)
-        except Exception:  # noqa: BLE001
-            logger.debug("realtime_history_load_failed", exc_info=True)
-            return []
+                if continuous:
+                    return await load_continuous_history(db, self._user_id)
+                return await load_master_history(db, self.context.session_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "realtime_history_load_failed session_id=%s err=%s",
+                self.context.session_id,
+                type(exc).__name__,
+            )
+            raise RuntimeError("realtime history unavailable") from exc
 
-    # -- 业务回调 -------------------------------------------------------
+    async def handle_confirm_transcript(
+        self,
+        transcript_id: str,
+        text: str,
+        client_turn_id: str = "",
+        session_id: str = "",
+    ) -> bool:
+        if self.session is None:
+            return False
+        if (
+            not session_id
+            or self._transcript_sessions.get(transcript_id) != session_id
+            or session_id != self.context.session_id
+        ):
+            return False
+        return await self.session.handle_confirm_transcript(
+            transcript_id, text, client_turn_id
+        )
 
-    async def submit_final_transcript(
-        self, text: str, client_turn_id: str
-    ) -> TurnOutcome:
-        turn_id, task_id = await self._submit_candidate(text, client_turn_id)
-        return TurnOutcome(turn_id=turn_id, task_id=task_id)
+    async def handle_cancel_transcript(
+        self,
+        transcript_id: str,
+        client_turn_id: str = "",
+        session_id: str = "",
+    ) -> bool:
+        if self.session is None:
+            return False
+        if (
+            not session_id
+            or self._transcript_sessions.get(transcript_id) != session_id
+            or session_id != self.context.session_id
+        ):
+            return False
+        return await self.session.handle_cancel_transcript(
+            transcript_id, client_turn_id
+        )
+
 
     async def persist_reply(self, text: str, metadata: dict[str, Any]) -> str:
         if _db_session_factory is None or not self.context.session_id:
@@ -265,7 +379,7 @@ class MoxiangRealtimeBridge:
         """创建并启动实时会话；失败返回 None（错误已发给客户端）。"""
         await self._audit_session_started()
         callbacks = RealtimeSessionCallbacks(
-            emit=self._emit,
+            emit=self._emit_with_context,
             build_instructions=self.build_instructions,
             build_update_instructions=self.build_update_instructions,
             submit_final_transcript=self.submit_final_transcript,
@@ -276,6 +390,7 @@ class MoxiangRealtimeBridge:
             provider_config=build_provider_config(),
             callbacks=callbacks,
             submission_hold_seconds=settings.ai_realtime_submission_hold_seconds,
+            require_transcript_confirmation=self._require_transcript_confirmation,
         )
         ok = await session.start()
         if not ok:
@@ -285,11 +400,17 @@ class MoxiangRealtimeBridge:
         return session
 
     async def close_session(self) -> None:
-        """连接收尾：结算额度、释放单会话名额、关闭实时会话。"""
+        """连接收尾：有进行中的会话才结算额度，并释放名额、关闭会话。
+
+        结算按本轮会话时长向上取整，不用连接寿命。没有会话（从未开麦，
+        或已切到文字）时不扣额度。
+        """
         session = self.session
         self.session = None
-        elapsed_minutes = int((time.monotonic() - self.started_at) // 60)
-        await consume_realtime_minutes(self._user_id, elapsed_minutes)
+        if session is not None:
+            await consume_realtime_minutes(
+                self._user_id, billable_minutes(session.session_elapsed_seconds)
+            )
         release_session_slot(self._user_id)
         if session is not None:
             await session.aclose()
@@ -299,10 +420,11 @@ async def realtime_watchdog(
     bridge: MoxiangRealtimeBridge,
     ws: Any,
 ) -> None:
-    """会话级守护：空闲超时/单次时长上限到达时关闭连接。
+    """会话级守护：空闲超时或本轮时长上限到达时关闭连接。
 
-    每 10 秒巡检一次；到限先给客户端一条可恢复错误，再关闭 WS
-    （连接关闭由路由 finally 统一收尾）。
+    每 10 秒巡检一次。没有进行中的会话时跳过，不因连接已经活了很久
+    而误断。到限先给客户端一条可恢复错误，再关闭 WS（连接关闭由路由
+    finally 统一收尾）。
     """
     try:
         while True:
@@ -312,8 +434,7 @@ async def realtime_watchdog(
                 continue
             idle_limit = settings.ai_realtime_idle_exit_seconds
             total_limit = settings.ai_realtime_session_max_minutes * 60
-            elapsed = time.monotonic() - bridge.started_at
-            if elapsed >= total_limit:
+            if session.session_elapsed_seconds >= total_limit:
                 logger.info(
                     "realtime_session_time_limit user_id=%s", bridge._user_id  # noqa: SLF001
                 )
@@ -326,9 +447,7 @@ async def realtime_watchdog(
     except asyncio.CancelledError:
         return
     try:
-        from app.api.routes.voice_moxiang import _send_json
-
-        await _send_json(
+        await send_json(
             ws,
             {
                 "type": "error",
