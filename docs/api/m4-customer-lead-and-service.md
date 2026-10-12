@@ -34,6 +34,17 @@
 
 依赖文件：`app/api/dependencies.py:_matchmaker_admin_permission(request)` 按路径子串自动映射（`/promotion-orders` 已加入映射表）。
 
+### 1.2.1 数据范围（D-16 收口，2026-10-12 批次 B）
+
+本模块的**客源线索**与**推广管理**两块后台端点已接入 `get_current_matchmaker_admin` 的**四档数据范围**（`ALL / SELF / STORE / ORGANIZATION`）：
+
+| 子模块 | 归属锚点 | 谓词 |
+|---|---|---|
+| 客源线索 `/admin/customer-leads/*` | `customer_lead.matchmaker_id` / `customer_lead.organization_id`（表自带归属列） | `scope_clause`（JOIN 查询用 `cl.` 前缀） |
+| 推广管理 `/admin/promotion-orders/*` | `promotion_order.user_id` → `resource_assignment` | `scope_exists_clause` |
+
+作用域谓词**唯一定义**于 `app/api/dependencies.py::CurrentMatchmakerAdmin`，路由与服务层不得自行实现。越权读统一 **404**；越权写不落库；未绑定组织/红娘 → **fail-closed**（`1 = 0`）。完整口径见 `后台数据范围与敏感操作-2026-10-04.md` §1.3.1。
+
 ### 1.3 响应与异常
 
 - 成功响应**不包裹** `data` 字段

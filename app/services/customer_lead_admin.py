@@ -75,9 +75,21 @@ async def _sync_tags(db: AsyncSession, lead_id: int, tags: list[str]) -> None:
             await db.execute(text("""INSERT IGNORE INTO customer_lead_tag_relation (lead_id, tag_id) VALUES (:lead_id, :tag_id)"""), {"lead_id": lead_id, "tag_id": int(tag_id)})
 
 
-async def create_lead(db: AsyncSession, account_id: int, request: CustomerLeadCreate, redaction_level: str = REDACTION_LEVEL_STANDARD) -> CustomerLead:
+async def _ensure_user_in_scope(db: AsyncSession, user_id: int | None, scope: str | None, scope_params: dict[str, Any] | None) -> None:
+    if user_id is None:
+        return
+    if not scope:
+        raise HTTPException(404, detail="目标人员不在当前数据范围")
+    params = dict(scope_params or {})
+    params["target_user_id"] = user_id
+    if not await db.scalar(text(f"SELECT 1 FROM users WHERE id = :target_user_id AND ({scope})"), params):
+        raise HTTPException(404, detail="目标人员不在当前数据范围")
+
+
+async def create_lead(db: AsyncSession, account_id: int, request: CustomerLeadCreate, redaction_level: str = REDACTION_LEVEL_STANDARD, *, assignment_scope: str | None = None, assignment_scope_params: dict[str, Any] | None = None) -> CustomerLead:
     phone = normalize_contact(request.phone)
     wechat = normalize_contact(request.wechat)
+    await _ensure_user_in_scope(db, request.promoter_id, assignment_scope, assignment_scope_params)
     await ensure_contact_available(db, phone, wechat)
     try:
         result = await db.execute(text("""INSERT INTO customer_lead
@@ -96,8 +108,32 @@ async def create_lead(db: AsyncSession, account_id: int, request: CustomerLeadCr
     return await get_lead(db, lead_id, redaction_level)
 
 
-async def get_lead(db: AsyncSession, lead_id: int, redaction_level: str = REDACTION_LEVEL_STANDARD) -> CustomerLead:
-    row = (await db.execute(text(f"{LEAD_SELECT} WHERE id = :id"), {"id": lead_id})).mappings().first()
+def _merge_scope(
+    where: list[str], params: dict[str, Any], scope: str | None, scope_params: dict[str, Any] | None
+) -> None:
+    """把四档数据范围谓词并入查询（D-16）。
+
+    ``scope`` 由 `CurrentMatchmakerAdmin.scope_clause` 在路由层生成（唯一实现），
+    服务层只负责拼接；``scope`` 为空表示不做约束（超管 / 服务层直调）。
+    """
+    if not scope:
+        return
+    params.update(scope_params or {})
+    where.append(f"({scope})")
+
+
+async def get_lead(
+    db: AsyncSession,
+    lead_id: int,
+    redaction_level: str = REDACTION_LEVEL_STANDARD,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> CustomerLead:
+    where = ["id = :id"]
+    params: dict[str, Any] = {"id": lead_id}
+    _merge_scope(where, params, scope, scope_params)
+    row = (await db.execute(text(f"{LEAD_SELECT} WHERE {' AND '.join(where)}"), params)).mappings().first()
     if not row:
         raise HTTPException(404, detail="客源线索不存在")
     return _lead(row, redaction_level)
@@ -110,10 +146,17 @@ async def convert_lead(
     matchmaker_user_id: int | None,
     lead_id: int,
     request: CustomerLeadConvertRequest,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> tuple[CustomerLead, int, bool]:
     """Convert one admin lead into a pending member review atomically."""
-    await db.execute(text("SELECT id FROM customer_lead WHERE id = :id FOR UPDATE"), {"id": lead_id})
-    lead = await get_lead(db, lead_id, "full")
+    guard_where = ["id = :id"]
+    guard_params: dict[str, Any] = {"id": lead_id}
+    _merge_scope(guard_where, guard_params, scope, scope_params)
+    if not await db.scalar(text(f"SELECT id FROM customer_lead WHERE {' AND '.join(guard_where)} FOR UPDATE"), guard_params):
+        raise HTTPException(404, detail="客源线索不存在")
+    lead = await get_lead(db, lead_id, "full", scope=scope, scope_params=scope_params)
     if lead.converted_user_id:
         return lead, lead.converted_user_id, True
     if lead.status in ("LOST", "CLOSED", "CONVERTED"):
@@ -244,16 +287,22 @@ async def list_leads(
     has_phone: bool | None = None,
     has_wechat: bool | None = None,
     order: str | None = None,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> CustomerLeadPage:
     """客源线索分页列表。
 
     新增筛选项依赖 `migrations/filters/20261011_01_admin_filter_columns_up.sql`
     补齐的 customer_lead 列；列不存在时对应条件静默跳过，保证「先发版后迁移」
     不会让列表整页 500。
+
+    `scope` / `scope_params` 由路由层用 `CurrentMatchmakerAdmin.scope_clause`（D-16）
+    生成并下传；未传表示不做约束（超管或服务层直调）。
     """
     columns = await _lead_columns(db)
     where = ["1=1"]
     params: dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size}
+    _merge_scope(where, params, scope, scope_params)
     if status:
         where.append("status = :status")
         params["status"] = status
@@ -349,8 +398,17 @@ async def list_leads(
     return CustomerLeadPage(items=[_lead(row, redaction_level) for row in rows.mappings().all()], page=page, page_size=page_size, total=total, has_more=page * page_size < total)
 
 
-async def update_lead(db: AsyncSession, account_id: int, lead_id: int, request: CustomerLeadUpdate, redaction_level: str = REDACTION_LEVEL_STANDARD) -> CustomerLead:
-    current = await get_lead(db, lead_id, redaction_level)
+async def update_lead(
+    db: AsyncSession,
+    account_id: int,
+    lead_id: int,
+    request: CustomerLeadUpdate,
+    redaction_level: str = REDACTION_LEVEL_STANDARD,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> CustomerLead:
+    current = await get_lead(db, lead_id, redaction_level, scope=scope, scope_params=scope_params)
     values = request.model_dump(exclude_unset=True)
     # 掩码值不写回：表单预填的是脱敏后的展示值，原样落库会把真实微信号毁成 ***
     if is_masked_value(values.get("wechat")):
@@ -364,27 +422,51 @@ async def update_lead(db: AsyncSession, account_id: int, lead_id: int, request: 
     assignments = ", ".join(f"{key} = :{key}" for key in values)
     # 掩码回显字段被全部丢弃时 assignments 为空，直接拼会产出 ``SET , updated_at`` 病态 SQL；此时只刷时间戳。
     set_clause = f"{assignments}, " if assignments else ""
+    # 写路径同样带上作用域谓词（D-16）：读可见校验与写之间若被改派，UPDATE 也不越权落库。
+    update_where = ["id = :id"]
+    update_params: dict[str, Any] = {**values, "id": lead_id}
+    _merge_scope(update_where, update_params, scope, scope_params)
     try:
-        await db.execute(text(f"UPDATE customer_lead SET {set_clause}updated_at = UTC_TIMESTAMP() WHERE id = :id"), {**values, "id": lead_id})
+        await db.execute(text(f"UPDATE customer_lead SET {set_clause}updated_at = UTC_TIMESTAMP() WHERE {' AND '.join(update_where)}"), update_params)
         await db.execute(text("INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id) VALUES (:actor, 'customer_lead.update', 'customer_lead', :id)"), {"actor": account_id, "id": lead_id})
         await db.commit()
     except IntegrityError:
         await db.rollback()
         raise_duplicate_contact()
-    return await get_lead(db, lead_id, redaction_level)
+    return await get_lead(db, lead_id, redaction_level, scope=scope, scope_params=scope_params)
 
 
-async def assign_lead(db: AsyncSession, account_id: int, lead_id: int, request: CustomerLeadAssignment, redaction_level: str = REDACTION_LEVEL_STANDARD) -> CustomerLead:
-    await get_lead(db, lead_id)
+async def assign_lead(
+    db: AsyncSession,
+    account_id: int,
+    lead_id: int,
+    request: CustomerLeadAssignment,
+    redaction_level: str = REDACTION_LEVEL_STANDARD,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> CustomerLead:
+    await get_lead(db, lead_id, scope=scope, scope_params=scope_params)
     await _validate_owner(db, request)
-    await db.execute(text("UPDATE customer_lead SET matchmaker_id = :matchmaker_id, organization_id = :organization_id, updated_at = UTC_TIMESTAMP() WHERE id = :id"), {**request.model_dump(), "id": lead_id})
+    assign_where = ["id = :id"]
+    assign_params: dict[str, Any] = {**request.model_dump(), "id": lead_id}
+    _merge_scope(assign_where, assign_params, scope, scope_params)
+    await db.execute(text(f"UPDATE customer_lead SET matchmaker_id = :matchmaker_id, organization_id = :organization_id, updated_at = UTC_TIMESTAMP() WHERE {' AND '.join(assign_where)}"), assign_params)
     await db.execute(text("INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id) VALUES (:actor, 'customer_lead.assign', 'customer_lead', :id)"), {"actor": account_id, "id": lead_id})
     await db.commit()
-    return await get_lead(db, lead_id, redaction_level)
+    return await get_lead(db, lead_id, redaction_level, scope=scope, scope_params=scope_params)
 
 
-async def add_follow_up(db: AsyncSession, account_id: int, lead_id: int, request: CustomerLeadFollowUpCreate) -> CustomerLeadFollowUp:
-    await get_lead(db, lead_id)
+async def add_follow_up(
+    db: AsyncSession,
+    account_id: int,
+    lead_id: int,
+    request: CustomerLeadFollowUpCreate,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> CustomerLeadFollowUp:
+    await get_lead(db, lead_id, scope=scope, scope_params=scope_params)
     result = await db.execute(text("""INSERT INTO customer_lead_follow_up
         (lead_id, method, content, intention_level, next_follow_at, created_by)
         VALUES (:lead_id, :method, :content, :intention_level, :next_follow_at, :created_by)"""), {**request.model_dump(), "lead_id": lead_id, "created_by": account_id})
@@ -395,22 +477,46 @@ async def add_follow_up(db: AsyncSession, account_id: int, lead_id: int, request
     return CustomerLeadFollowUp(**dict(row))
 
 
-async def list_follow_ups(db: AsyncSession, lead_id: int, page: int, page_size: int) -> list[CustomerLeadFollowUp]:
-    await get_lead(db, lead_id)
+async def list_follow_ups(
+    db: AsyncSession,
+    lead_id: int,
+    page: int,
+    page_size: int,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> list[CustomerLeadFollowUp]:
+    await get_lead(db, lead_id, scope=scope, scope_params=scope_params)
     rows = await db.execute(text("""SELECT id, lead_id, method, content, intention_level, next_follow_at, created_by, created_at
         FROM customer_lead_follow_up WHERE lead_id = :lead_id ORDER BY id DESC LIMIT :limit OFFSET :offset"""), {"lead_id": lead_id, "limit": page_size, "offset": (page - 1) * page_size})
     return [CustomerLeadFollowUp(**dict(row)) for row in rows.mappings().all()]
 
 
-async def lead_statistics(db: AsyncSession) -> CustomerLeadStatistics:
-    row = (await db.execute(text("""SELECT COUNT(*) total, SUM(status = 'NEW') new_count, SUM(status = 'CONTACTED') contacted_count,
+async def lead_statistics(
+    db: AsyncSession,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> CustomerLeadStatistics:
+    where = ["1=1"]
+    params: dict[str, Any] = {}
+    _merge_scope(where, params, scope, scope_params)
+    row = (await db.execute(text(f"""SELECT COUNT(*) total, SUM(status = 'NEW') new_count, SUM(status = 'CONTACTED') contacted_count,
         SUM(status = 'INTENDED') intended_count, SUM(status = 'CONVERTED') converted_count, SUM(status = 'LOST') lost_count
-        FROM customer_lead"""))).mappings().one()
+        FROM customer_lead WHERE {' AND '.join(where)}"""), params)).mappings().one()
     return CustomerLeadStatistics(**{key: int(row[key] or 0) for key in ("total", "new_count", "contacted_count", "intended_count", "converted_count", "lost_count")})
 
 
-async def abandon_lead(db: AsyncSession, account_id: int, lead_id: int, reason: str) -> CustomerLeadAbandonment:
-    lead = await get_lead(db, lead_id)
+async def abandon_lead(
+    db: AsyncSession,
+    account_id: int,
+    lead_id: int,
+    reason: str,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> CustomerLeadAbandonment:
+    lead = await get_lead(db, lead_id, scope=scope, scope_params=scope_params)
     if lead.status in ("CONVERTED", "CLOSED"):
         raise HTTPException(409, detail="已入库或已关闭的客源不能弃海")
     active = await db.execute(text("SELECT 1 FROM customer_lead_abandonment WHERE lead_id = :id AND restored_at IS NULL"), {"id": lead_id})
@@ -418,15 +524,27 @@ async def abandon_lead(db: AsyncSession, account_id: int, lead_id: int, reason: 
         raise HTTPException(409, detail="该客源已在弃海池")
     result = await db.execute(text("""INSERT INTO customer_lead_abandonment (lead_id, reason, abandoned_by)
         VALUES (:lead_id, :reason, :account_id)"""), {"lead_id": lead_id, "reason": reason, "account_id": account_id})
-    await db.execute(text("UPDATE customer_lead SET status = 'LOST', matchmaker_id = NULL, next_follow_at = NULL WHERE id = :id"), {"id": lead_id})
+    abandon_where = ["id = :id"]
+    abandon_params: dict[str, Any] = {"id": lead_id}
+    _merge_scope(abandon_where, abandon_params, scope, scope_params)
+    await db.execute(text(f"UPDATE customer_lead SET status = 'LOST', matchmaker_id = NULL, next_follow_at = NULL WHERE {' AND '.join(abandon_where)}"), abandon_params)
     await db.execute(text("INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id) VALUES (:actor, 'customer_lead.abandon', 'customer_lead', :id)"), {"actor": account_id, "id": lead_id})
     await db.commit()
     row = (await db.execute(text("SELECT id, lead_id, reason, abandoned_by, abandoned_at, restored_by, restored_at, restore_reason FROM customer_lead_abandonment WHERE id = :id"), {"id": int(result.lastrowid)})).mappings().one()
     return CustomerLeadAbandonment(**dict(row))
 
 
-async def restore_lead(db: AsyncSession, account_id: int, lead_id: int, reason: str, redaction_level: str = REDACTION_LEVEL_STANDARD) -> CustomerLead:
-    current = await get_lead(db, lead_id)
+async def restore_lead(
+    db: AsyncSession,
+    account_id: int,
+    lead_id: int,
+    reason: str,
+    redaction_level: str = REDACTION_LEVEL_STANDARD,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> CustomerLead:
+    current = await get_lead(db, lead_id, scope=scope, scope_params=scope_params)
     active = (await db.execute(text("SELECT id FROM customer_lead_abandonment WHERE lead_id = :id AND restored_at IS NULL ORDER BY id DESC LIMIT 1"), {"id": lead_id})).scalar()
     if not active:
         raise HTTPException(409, detail="该客源不在弃海池")
@@ -439,15 +557,36 @@ async def restore_lead(db: AsyncSession, account_id: int, lead_id: int, reason: 
         detail="该客源的联系方式已被其他有效线索占用，无法恢复",
     )
     await db.execute(text("UPDATE customer_lead_abandonment SET restored_by = :account_id, restored_at = UTC_TIMESTAMP(), restore_reason = :reason WHERE id = :id"), {"account_id": account_id, "reason": reason, "id": active})
-    await db.execute(text("UPDATE customer_lead SET status = 'NEW', updated_at = UTC_TIMESTAMP() WHERE id = :id"), {"id": lead_id})
+    restore_where = ["id = :id"]
+    restore_params: dict[str, Any] = {"id": lead_id}
+    _merge_scope(restore_where, restore_params, scope, scope_params)
+    await db.execute(text(f"UPDATE customer_lead SET status = 'NEW', updated_at = UTC_TIMESTAMP() WHERE {' AND '.join(restore_where)}"), restore_params)
     await db.execute(text("INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id) VALUES (:actor, 'customer_lead.restore', 'customer_lead', :id)"), {"actor": account_id, "id": lead_id})
     await db.commit()
-    return await get_lead(db, lead_id, redaction_level)
+    return await get_lead(db, lead_id, redaction_level, scope=scope, scope_params=scope_params)
 
 
-async def list_abandonments(db: AsyncSession, active_only: bool) -> list[CustomerLeadAbandonment]:
-    where = "WHERE restored_at IS NULL" if active_only else ""
-    rows = await db.execute(text(f"SELECT id, lead_id, reason, abandoned_by, abandoned_at, restored_by, restored_at, restore_reason FROM customer_lead_abandonment {where} ORDER BY id DESC"))
+async def list_abandonments(
+    db: AsyncSession,
+    active_only: bool,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> list[CustomerLeadAbandonment]:
+    """弃海记录列表。
+
+    弃海表自身不带归属列，归属在 ``customer_lead``；JOIN 后把作用域谓词限定在
+    ``cl``（customer_lead）别名上，避免与弃海表同名列歧义（D-16）。
+    """
+    where = ["1=1"]
+    params: dict[str, Any] = {}
+    if active_only:
+        where.append("ab.restored_at IS NULL")
+    _merge_scope(where, params, scope, scope_params)
+    rows = await db.execute(text(f"""SELECT ab.id, ab.lead_id, ab.reason, ab.abandoned_by, ab.abandoned_at,
+        ab.restored_by, ab.restored_at, ab.restore_reason
+        FROM customer_lead_abandonment ab JOIN customer_lead cl ON cl.id = ab.lead_id
+        WHERE {' AND '.join(where)} ORDER BY ab.id DESC"""), params)
     return [CustomerLeadAbandonment(**dict(row)) for row in rows.mappings().all()]
 
 
@@ -463,10 +602,14 @@ async def _insert_leads(
     default_audit_status: str = "active",
     default_tags: list[str] | None = None,
     start_index: int = 2,
+    assignment_scope: str | None = None,
+    assignment_scope_params: dict[str, Any] | None = None,
 ) -> CustomerLeadImportSummary:
     """批量写入客源线索。留空/无法匹配的字段按 default_* 兜底；dup_mode=skip 时联系方式重复的行跳过。"""
     created = skipped = failed = 0
     errors: list[str] = []
+    await _ensure_user_in_scope(db, default_matchmaker_id, assignment_scope, assignment_scope_params)
+    await _ensure_user_in_scope(db, default_promoter_id, assignment_scope, assignment_scope_params)
     tag_names = [name.strip() for name in (default_tags or []) if name and name.strip()]
     for index, row in enumerate(rows, start=start_index):  # Excel 数据从第 2 行起
         if not row.phone and not row.wechat:
@@ -525,9 +668,12 @@ async def batch_import_leads(
     account_id: int,
     rows: list[CustomerLeadImportRow],
     dup_mode: str = "skip",
+    *,
+    assignment_scope: str | None = None,
+    assignment_scope_params: dict[str, Any] | None = None,
 ) -> CustomerLeadBatchImportResult:
     """批量导入客源线索。dup_mode=skip 时联系方式重复的行跳过，append 时仍然导入。"""
-    return await _insert_leads(db, account_id, rows, dup_mode)
+    return await _insert_leads(db, account_id, rows, dup_mode, assignment_scope=assignment_scope, assignment_scope_params=assignment_scope_params)
 
 
 # ─── Excel 模板下载与文件解析 ────────────────────────────────────────
@@ -631,6 +777,8 @@ async def import_leads_file(
     default_promoter_id: int | None = None,
     default_tags: list[str] | None = None,
     dup_mode: str = "skip",
+    assignment_scope: str | None = None,
+    assignment_scope_params: dict[str, Any] | None = None,
 ) -> CustomerLeadImportSummary:
     """解析上传的 Excel 并按导入设置写入客源线索。"""
     rows = parse_import_file(content, filename)
@@ -644,14 +792,28 @@ async def import_leads_file(
         default_promoter_id=default_promoter_id,
         default_audit_status=audit_status,
         default_tags=default_tags,
+        assignment_scope=assignment_scope,
+        assignment_scope_params=assignment_scope_params,
     )
 
 
-async def lead_options(db: AsyncSession) -> CustomerLeadOptions:
-    """客源线索页面下拉字典：来源、服务红娘、推广红娘、标签。"""
+async def lead_options(
+    db: AsyncSession,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> CustomerLeadOptions:
+    """客源线索页面下拉字典：来源、服务红娘、推广红娘、标签。
+
+    「来源」取自本账号可见的线索集合（带作用域，D-16）；红娘/推广/标签为全局
+    配置型字典，不随数据范围收敛。
+    """
+    source_where = ["source <> ''"]
+    source_params: dict[str, Any] = {}
+    _merge_scope(source_where, source_params, scope, scope_params)
     sources = [
         CustomerLeadOption(value=row["source"], label=row["source"])
-        for row in (await db.execute(text("SELECT DISTINCT source FROM customer_lead WHERE source <> '' ORDER BY source"))).mappings().all()
+        for row in (await db.execute(text(f"SELECT DISTINCT source FROM customer_lead WHERE {' AND '.join(source_where)} ORDER BY source"), source_params)).mappings().all()
     ]
     matchmakers = [
         CustomerLeadOption(value=str(row["id"]), label=row["label"])

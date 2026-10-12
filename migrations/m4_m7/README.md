@@ -6,6 +6,7 @@
 | --- | --- | --- |
 | `20260916_01_m4_m7_backoffice_columns_*` | M4–M7 后台运营补列与种子 | 见下文「一、后台运营补列」 |
 | `20261004_01_activity_signup_soft_delete_*` | `activity_signup` 软删除两列 + 索引 | 见下文「二、活动报名软删除」 |
+| `20261012_01_realname_face_backfill_*` | 实名/人脸双写一致性数据回填 | 见下文「三、实名/人脸双写回填」 |
 
 ---
 
@@ -62,7 +63,27 @@ up 通过 `INFORMATION_SCHEMA` 检查后用 `PREPARE`/`EXECUTE` 执行动态 DDL
 
 **回滚**：`20261004_01_activity_signup_soft_delete_down.sql` 删除索引与两列，**会永久丢失软删除标记（含 `deleted_by` 操作人留痕）**，已软删的报名记录在回滚后重新变为"存在"状态。仅在放弃这批留痕时使用；down 可重复执行，未写入过数据的库可安全执行。
 
+## 三、实名/人脸双写一致性回填（2026-10-12，D-14）
+
+`20261012_01_realname_face_backfill_up.sql` 是一条**纯数据回填**：把 `user_auth` 中 `face_verified = 1` 但 `realname_status <> 2` 的历史记录补齐为 `realname_status = 2 / auth_status = 2 / auth_step = 4`。
+
+**背景**：实名存在两条并行审核链路——旧后台实名审核写 `realname_status`，会员认证后台审核写 `face_verified`；而 C 端门禁读的是 `realname_status == 2`。结果是「在会员认证后台通过实名的用户过不了门禁」。代码侧已收敛到 `app/services/auth.py::apply_realname_review`（两个后台入口共用，`sync_face=True` 时同步写人脸标记），本迁移负责把已产生的历史数据对齐。
+
+**幂等性**：条件为 `face_verified = 1 AND (realname_status IS NULL OR realname_status <> 2)`，可重复执行；`user_auth` 表不存在时静默跳过。
+
+**执行与校验**：
+
+1. 执行 `20261012_01_realname_face_backfill_up.sql`。
+2. 执行 `20261012_01_realname_face_backfill_verify.sql`，期望：第 1 项「人脸已通过但实名未同步」返回 0 行；第 2 项返回 1 行（`user_auth` 存在）。
+3. 开发/测试环境由 `database_setup_marriage.py` 的 `_ensure_*` 建表逻辑负责结构，本迁移只处理存量数据。
+
+**回滚**：`20261012_01_realname_face_backfill_down.sql` 是 **no-op**。回填后的行与「历史上确实通过旧后台实名审核」的行在数据上不可区分，无法安全逆向；如需撤销请依据迁移前备份定向还原。
+
+**无自动化测试**：本迁移不改变表结构，`tests/test_realname_face_unification.py` 覆盖的是代码侧一致性（两个后台入口写入同一列），不覆盖数据回填。
+
 ## 与自动化测试的对应
 
 - `tests/test_m4_m7_column_migration.py`：覆盖 `20260916_01` 的 up/down/verify 与 `_ensure_*` 的一致性。
 - `tests/test_activity_signup_soft_delete.py`：覆盖 `20261004_01` 的 up/down/verify 结构、软删除列在 `_ensure_m7_columns` 中的齐备性，以及应用层软删除与审计行为。
+- `tests/test_realname_face_unification.py`：覆盖 D-14 的代码侧一致性（两个后台入口都写 `realname_status`）。
+> 测试范围：没有针对回填 SQL 的真实 MySQL 自动化执行测试；`tests/test_realname_face_unification.py` 覆盖代码侧一致性，不覆盖数据回填。`down` 为 no-op，发布前必须完成备份、校验脚本和人工回滚预案，不得把 no-op down 当作可逆迁移。

@@ -50,6 +50,18 @@
 
 电子合同状态枚举：`none` 未发起 / `pending` 签署中 / `signed` 已签署 / `void` 已作废。
 
+### 1.3 数据范围（D-16 收口，2026-10-12 批次 B）
+
+本模块**全部后台端点**已接入 `get_current_matchmaker_admin` 的**四档数据范围**（`ALL / SELF / STORE / ORGANIZATION`）：
+
+| 资源 | 归属锚点 | 关联 |
+|---|---|---|
+| 线下 VIP 服务记录 | `offline_vip.user_id` | `scope_assignment.user_id = v.user_id` |
+| 会员目标解析（新增/编辑时选人） | `users.id` | `scope_assignment.user_id = u.id` |
+| 下拉套餐子查询 | `offline_vip v`（别名） | 同上 |
+
+写路径（新增 / 编辑）带 scope 谓词，越权不落库；`statistics` / `options` 的聚合与子查询同样带作用域。越权读统一 **404**；未绑定组织/红娘 → **fail-closed**（`1 = 0`）。完整口径见 `后台数据范围与敏感操作-2026-10-04.md` §1.3.1。
+
 ---
 
 ## 2. 列表

@@ -12,7 +12,7 @@
 |---|---:|---|---|
 | `Authorization` | 是 | Bearer 登录令牌 | `Bearer <token>` |
 | `Content-Type` | 有请求体时是 | 固定 `application/json` | `application/json` |
-| `Idempotency-Key` | 否 | 相同用户和会话的成功结果可按现有唯一约束回读；并发冲突回滚当前扣额并回读首次成功结果 | `advisor-20260922-001` |
+| `Idempotency-Key` | 创建会话和生成建议必填 | 8-128 字符；相同用户、操作和请求载荷重试返回首次结果，不重复创建会话、调用 Provider 或扣减额度 | `advisor-20261012-001` |
 
 **通用错误**：
 
@@ -83,7 +83,7 @@ Content-Type: application/json
 }
 ```
 
-**使用方法与业务规则**：绑定聊天时后端校验当前用户是聊天参与者。AI 不会因为绑定会话而自动读取历史；生成建议时仍需提交 `include_history=true`。创建会话当前不接收幂等键，调用方应避免重复创建；建议生成接口的持久化幂等见下文。
+**使用方法与业务规则**：绑定聊天时后端校验当前用户是聊天参与者。AI 不会因为绑定会话而自动读取历史；生成建议时仍需提交 `include_history=true`。创建会话必须携带 `Idempotency-Key`；相同用户、相同操作、相同请求载荷重试会回放首次创建结果，不会产生第二个会话；相同 key 对应不同载荷返回 `409`。建议生成接口的持久化幂等见下文。
 
 **错误**：除通用错误外，聊天会话不属于当前用户返回 `403`；参数校验失败返回 `422`。
 
@@ -320,12 +320,13 @@ AI_ADVISOR_KNOWLEDGE_VERSION=seed-v2
 
 - 产品口径尚未冻结，会员额度、保留期和人工转接策略使用临时默认值。
 - 已建立知识库表和内置回退话术，但尚未批量导入 `情感话术.docx` 的 80～150 条种子数据。
-- 建议生成已使用 `ai_advisor_message.idempotency_key` 做持久化幂等，并写入 `ai_advisor_call_log`；创建会话本身仍不提供幂等键。真实数据库约束、迁移和 Provider 验收不属于当前代码批次。
+- 建议生成使用 `ai_advisor_message.idempotency_key` 做持久化幂等，并写入 `ai_advisor_call_log`；创建会话复用 `api_idempotency_record` 做持久化幂等。真实 Provider、真实 Redis/MySQL 并发和会员额度验收仍不属于当前代码批次。
 - 第三方敏感词审核继续复用现有适配器配置；未配置时以本地词库为主。
 
 ## 变更记录
 
 - 2026-08-23：新增 AI 情感军师后端框架、五个接口、数据库表、Mock、风险校验、额度退款和基础测试。
+- 2026-10-12：`POST /api/v1/ai/advisor/sessions` 新增必填 `Idempotency-Key`；相同请求回放首次会话，不同载荷返回 `409`。旧客户端必须在创建会话时生成 8-128 字符幂等键。
 
 ## 2026-08-27 契约补充
 

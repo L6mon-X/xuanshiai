@@ -635,3 +635,14 @@ def test_ai_avatar_message_exposes_optional_bounded_idempotency_key() -> None:
     )
     assert schema["minLength"] == 1
     assert schema["maxLength"] == 128
+
+
+def test_ai_avatar_uses_one_shared_daily_quota_key_and_limit() -> None:
+    import inspect
+
+    source = inspect.getsource(ai_avatar._consume_quota)
+    assert 'daily_quota_key("ai-avatar", viewer_user_id)' in source
+    assert "settings.ai_avatar_daily_limit" in source
+    assert 'daily_quota_key("ai-avatar", viewer_id)' in inspect.getsource(
+        ai_avatar.send_ai_message
+    )

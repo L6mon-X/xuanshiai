@@ -43,6 +43,14 @@ class Settings(BaseSettings):
     wechat_app_secret: str | None = None
     wechat_provider: str = "wechat"
     wechat_payment_mode: Literal["mock", "real"] = "mock"
+    # D-21：支付回调验签密钥。real 模式必须显式配置；mock 模式使用
+    # wechat_payment_mock_secret（仅开发/测试，生产禁止 mock）。
+    wechat_payment_sign_key: SecretStr | None = None
+    wechat_payment_mock_secret: str = "mock-payment-secret"
+    # D-14：人脸认证供应商。disabled 时门禁 fail-closed（不可发帖），
+    # mock 仅允许 development/testing。
+    face_provider: str = "disabled"
+    face_mock_pass: bool = True
     wechat_mock_openid_prefix: str = "mock-openid-"
     sms_provider: str = "disabled"
     agreement_versions_raw: str = (
@@ -338,7 +346,6 @@ class Settings(BaseSettings):
     ai_daily_search_limit: int = Field(default=10, ge=1, le=100)
     ai_daily_match_limit: int = Field(default=10, ge=1, le=100)
     ai_daily_advisor_limit: int = Field(default=20, ge=1, le=1000)
-    ai_daily_avatar_limit: int = Field(default=20, ge=1, le=1000)
     ai_daily_thoughtfulness_limit: int = Field(default=10, ge=1, le=100)
     ai_advisor_max_context_messages: int = Field(default=80, ge=10, le=200)
     ai_advisor_prompt_version: str = "relationship-v1"

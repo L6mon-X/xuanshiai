@@ -56,3 +56,5 @@ class WechatPaymentCallback(BaseModel):
     order_no: str = Field(min_length=1, max_length=64)
     transaction_id: str = Field(min_length=1, max_length=64)
     signature: str = Field(min_length=1, max_length=512)
+    # D-21：金额一致性校验所需字段（real 模式必填；mock 模式可省略）。
+    amount: float | None = Field(default=None, ge=0)

@@ -59,12 +59,13 @@ def _admin(scope: str, *, permissions: set[str] | None = None, matchmaker_user_i
 class StubResult:
     """最小可用结果对象，按需返回行 / 标量。"""
 
-    def __init__(self, *, rows=None, scalar=None, first=None, one=None, rowcount=0):
+    def __init__(self, *, rows=None, scalar=None, first=None, one=None, rowcount=0, lastrowid=1):
         self._rows = list(rows or [])
         self._scalar = scalar
         self._first = first
         self._one = one
         self.rowcount = rowcount
+        self.lastrowid = lastrowid
 
     def all(self):
         return list(self._rows)
@@ -91,6 +92,7 @@ class StubDB:
         self.statements: list[tuple[str, dict]] = []
         self._results = list(results or [])
         self.committed = False
+        self.rolled_back = False
 
     async def execute(self, statement, params=None):
         self.statements.append((str(statement), dict(params or {})))
@@ -105,8 +107,15 @@ class StubDB:
     async def commit(self):
         self.committed = True
 
+    async def rollback(self):
+        self.rolled_back = True
+
     def sql(self) -> str:
         return "\n".join(text for text, _ in self.statements)
+
+
+# D-9：改派 / 批量改状态已纳入统一幂等，直调服务层须显式传 idempotency_key。
+IDEMPOTENCY_KEY = "crm-scope-test-key"
 
 
 # --------------------------------------------------------------------------- #
@@ -310,35 +319,57 @@ async def test_member_assignment_out_of_scope_is_rejected() -> None:
         await crm.member_assignment(
             member_id=99,
             body=crm.MemberAssignmentUpdate(matchmaker_id=5),
+            idempotency_key=IDEMPOTENCY_KEY,
             current=_admin("ORGANIZATION"),
             db=db,
         )
     assert exc.value.status_code == 404
     assert "scope_assignment.organization_id" in db.statements[0][0]
     assert db.committed is False
+    # 越权在幂等预占之前拦截，不留幂等残留行。
+    assert not any("api_idempotency_record" in s for s, _ in db.statements)
 
 
 @pytest.mark.asyncio
 async def test_batch_member_status_update_is_scoped_for_unbound_account() -> None:
-    db = StubDB([StubResult(scalar=0)])
+    db = StubDB([StubResult(lastrowid=1), StubResult(rows=[]), StubResult(rowcount=0), StubResult(rowcount=1)])
     result = await crm.batch_member_status(
         body=crm.MemberBatchStatus(member_ids=[1, 2, 3], status=2, reason="批量越权测试"),
+        idempotency_key=IDEMPOTENCY_KEY,
         current=_admin("ORGANIZATION", matchmaker_user_id=None, organization_id=None),
         db=db,
     )
     assert result["updated"] == 0
-    assert "1 = 0" in db.statements[0][0]
+    assert result["rejected_ids"] == [1, 2, 3]
+    assert "1 = 0" in db.sql()
 
 
 @pytest.mark.asyncio
 async def test_batch_member_status_allows_platform_account() -> None:
-    db = StubDB([StubResult(scalar=0)])
+    db = StubDB([StubResult(lastrowid=1), StubResult(rows=[(1,)]), StubResult(rowcount=1), StubResult(rowcount=1)])
     await crm.batch_member_status(
         body=crm.MemberBatchStatus(member_ids=[1], status=2, reason="平台批量"),
+        idempotency_key=IDEMPOTENCY_KEY,
         current=_admin("ALL"),
         db=db,
     )
-    assert "AND (1 = 1)" in db.statements[0][0]
+    assert "AND (1 = 1)" in db.sql()
+
+
+@pytest.mark.asyncio
+async def test_batch_member_status_uses_idempotency_operation() -> None:
+    """D-9：批量改状态必须落统一幂等预占（operation + idempotency_key）。"""
+    db = StubDB([StubResult(lastrowid=1), StubResult(rows=[(1,)]), StubResult(rowcount=1), StubResult(rowcount=1)])
+    await crm.batch_member_status(
+        body=crm.MemberBatchStatus(member_ids=[1], status=2, reason="幂等校验"),
+        idempotency_key=IDEMPOTENCY_KEY,
+        current=_admin("ALL"),
+        db=db,
+    )
+    reserve_sql, reserve_params = db.statements[0]
+    assert "INSERT INTO api_idempotency_record" in reserve_sql
+    assert reserve_params["operation"] == "matchmaker.member.batch_status"
+    assert reserve_params["idempotency_key"] == IDEMPOTENCY_KEY
 
 
 # --------------------------------------------------------------------------- #

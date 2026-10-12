@@ -33,6 +33,16 @@ order_router = APIRouter(prefix="/admin/merchant-orders")
 
 _XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
+# 商家/商品/订单均无组织列，归属以商家「管理账号」m.admin_user_id 的
+# resource_assignment 判定；统一用 EXISTS 包装（D-16）。
+_MERCHANT_CORRELATION = "scope_assignment.user_id = m.admin_user_id"
+
+
+def _scope(current: CurrentMatchmakerAdmin) -> tuple[str, dict[str, object]]:
+    """生成四档数据范围谓词；唯一判定在 `CurrentMatchmakerAdmin.scope_clause`（D-16）。"""
+    params: dict[str, object] = {}
+    return current.scope_exists_clause(params, correlation=_MERCHANT_CORRELATION), params
+
 
 # ─────────────────────────── 商家分类 ───────────────────────────
 
@@ -101,7 +111,8 @@ async def merchant_list(
     db: AsyncSession = Depends(get_db),
 ) -> MerchantPage:
     current.require("merchant.read")
-    return await service.list_merchants(db, page, page_size, category_id, keyword, visible)
+    scope, scope_params = _scope(current)
+    return await service.list_merchants(db, page, page_size, category_id, keyword, visible, scope=scope, scope_params=scope_params)
 
 
 @router.post("", response_model=MerchantItem, status_code=201, summary="新增商家")
@@ -111,7 +122,8 @@ async def merchant_create(
     db: AsyncSession = Depends(get_db),
 ) -> MerchantItem:
     current.require("merchant.manage")
-    return await service.create_merchant(db, body)
+    scope, scope_params = _scope(current)
+    return await service.create_merchant(db, body, scope=scope, scope_params=scope_params)
 
 
 @router.get("/options", response_model=list[MerchantOption], summary="商家下拉字典")
@@ -120,7 +132,8 @@ async def merchant_options(
     db: AsyncSession = Depends(get_db),
 ) -> list[MerchantOption]:
     current.require("merchant.read")
-    page = await service.list_merchants(db, 1, 500, None, None, None)
+    scope, scope_params = _scope(current)
+    page = await service.list_merchants(db, 1, 500, None, None, None, scope=scope, scope_params=scope_params)
     return [MerchantOption(id=m.id, label=m.name) for m in page.items]
 
 
@@ -132,7 +145,8 @@ async def merchant_visible(
     db: AsyncSession = Depends(get_db),
 ) -> MerchantItem:
     current.require("merchant.manage")
-    return await service.set_merchant_visible(db, merchant_id, visible)
+    scope, scope_params = _scope(current)
+    return await service.set_merchant_visible(db, merchant_id, visible, scope=scope, scope_params=scope_params)
 
 
 @router.put("/{merchant_id}", response_model=MerchantItem, summary="修改商家")
@@ -143,7 +157,8 @@ async def merchant_update(
     db: AsyncSession = Depends(get_db),
 ) -> MerchantItem:
     current.require("merchant.manage")
-    return await service.update_merchant(db, merchant_id, body)
+    scope, scope_params = _scope(current)
+    return await service.update_merchant(db, merchant_id, body, scope=scope, scope_params=scope_params)
 
 
 @router.delete("/{merchant_id}", status_code=204, summary="删除商家")
@@ -153,7 +168,8 @@ async def merchant_delete(
     db: AsyncSession = Depends(get_db),
 ) -> None:
     current.require("merchant.manage")
-    await service.delete_merchant(db, merchant_id)
+    scope, scope_params = _scope(current)
+    await service.delete_merchant(db, merchant_id, scope=scope, scope_params=scope_params)
 
 
 @router.get("/{merchant_id}", response_model=MerchantItem, summary="商家详情")
@@ -163,7 +179,8 @@ async def merchant_detail(
     db: AsyncSession = Depends(get_db),
 ) -> MerchantItem:
     current.require("merchant.read")
-    return await service._get_merchant(db, merchant_id)
+    scope, scope_params = _scope(current)
+    return await service._get_merchant(db, merchant_id, scope, scope_params)
 
 
 # ─────────────────────────── 商品 ───────────────────────────
@@ -180,7 +197,8 @@ async def product_list(
     db: AsyncSession = Depends(get_db),
 ) -> MerchantProductPage:
     current.require("merchant.read")
-    return await service.list_products(db, page, page_size, merchant_id, keyword, status)
+    scope, scope_params = _scope(current)
+    return await service.list_products(db, page, page_size, merchant_id, keyword, status, scope=scope, scope_params=scope_params)
 
 
 @product_router.post("", response_model=MerchantProductItem, status_code=201, summary="新增商品")
@@ -190,7 +208,8 @@ async def product_create(
     db: AsyncSession = Depends(get_db),
 ) -> MerchantProductItem:
     current.require("merchant.manage")
-    return await service.create_product(db, body)
+    scope, scope_params = _scope(current)
+    return await service.create_product(db, body, scope=scope, scope_params=scope_params)
 
 
 @product_router.patch("/{product_id}/status", response_model=MerchantProductItem, summary="商品上架/下架")
@@ -201,7 +220,8 @@ async def product_status(
     db: AsyncSession = Depends(get_db),
 ) -> MerchantProductItem:
     current.require("merchant.manage")
-    return await service.set_product_status(db, product_id, status)
+    scope, scope_params = _scope(current)
+    return await service.set_product_status(db, product_id, status, scope=scope, scope_params=scope_params)
 
 
 @product_router.put("/{product_id}", response_model=MerchantProductItem, summary="修改商品")
@@ -212,7 +232,8 @@ async def product_update(
     db: AsyncSession = Depends(get_db),
 ) -> MerchantProductItem:
     current.require("merchant.manage")
-    return await service.update_product(db, product_id, body)
+    scope, scope_params = _scope(current)
+    return await service.update_product(db, product_id, body, scope=scope, scope_params=scope_params)
 
 
 @product_router.delete("/{product_id}", status_code=204, summary="删除商品")
@@ -222,7 +243,8 @@ async def product_delete(
     db: AsyncSession = Depends(get_db),
 ) -> None:
     current.require("merchant.manage")
-    await service.delete_product(db, product_id)
+    scope, scope_params = _scope(current)
+    await service.delete_product(db, product_id, scope=scope, scope_params=scope_params)
 
 
 @product_router.get("/{product_id}", response_model=MerchantProductItem, summary="商品详情")
@@ -232,7 +254,8 @@ async def product_detail(
     db: AsyncSession = Depends(get_db),
 ) -> MerchantProductItem:
     current.require("merchant.read")
-    return await service._get_product(db, product_id)
+    scope, scope_params = _scope(current)
+    return await service._get_product(db, product_id, scope, scope_params)
 
 
 # ─────────────────────────── 订单 ───────────────────────────
@@ -255,9 +278,10 @@ async def order_list(
     db: AsyncSession = Depends(get_db),
 ) -> MerchantOrderPage:
     current.require("merchant.read")
+    scope, scope_params = _scope(current)
     return await service.list_orders(
         db, page, page_size, merchant_id, status, verify_status, keyword, order_no, buyer_keyword,
-        verify_start, verify_end, search_type,
+        verify_start, verify_end, search_type, scope=scope, scope_params=scope_params,
     )
 
 
@@ -276,8 +300,10 @@ async def order_export(
     db: AsyncSession = Depends(get_db),
 ) -> Response:
     current.require("merchant.read")
+    scope, scope_params = _scope(current)
     content = await service.build_order_export(
-        db, merchant_id=merchant_id, status=status, verify_status=verify_status, keyword=keyword,
+        db, scope=scope, scope_params=scope_params,
+        merchant_id=merchant_id, status=status, verify_status=verify_status, keyword=keyword,
         order_no=order_no, buyer_keyword=buyer_keyword, verify_start=verify_start, verify_end=verify_end,
         search_type=search_type,
     )
@@ -296,7 +322,8 @@ async def order_update(
     db: AsyncSession = Depends(get_db),
 ) -> MerchantOrderItem:
     current.require("merchant.manage")
-    return await service.update_order_status(db, order_id, body)
+    scope, scope_params = _scope(current)
+    return await service.update_order_status(db, order_id, body, scope=scope, scope_params=scope_params)
 
 
 @order_router.get("/{order_id}", response_model=MerchantOrderItem, summary="订单详情")
@@ -306,9 +333,15 @@ async def order_detail(
     db: AsyncSession = Depends(get_db),
 ) -> MerchantOrderItem:
     current.require("merchant.read")
+    scope, scope_params = _scope(current)
+    where = ["o.id = :id"]
+    params: dict[str, object] = {"id": order_id}
+    if scope:
+        params.update(scope_params)
+        where.append(f"({scope})")
     row = (
         await db.execute(
-            text(f"{service._ORDER_SELECT} WHERE o.id = :id"), {"id": order_id}
+            text(f"{service._ORDER_SELECT} WHERE {' AND '.join(where)}"), params
         )
     ).mappings().first()
     if not row:

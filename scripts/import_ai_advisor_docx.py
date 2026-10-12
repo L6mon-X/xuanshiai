@@ -129,10 +129,19 @@ def import_entries(path: Path, version: str) -> tuple[int, int]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path", nargs="?", type=Path, default=Path("no upload/情感话术.docx"))
-    parser.add_argument("--version", default="docx-v1")
+    # D-11：默认版本必须与 AI_ADVISOR_KNOWLEDGE_VERSION 一致，否则写库后启动期
+    # 一致性校验（verify_knowledge_version）会把 {seed-v2, docx-v1} 判为不一致而在
+    # 生产 fail-fast；且 _load_knowledge 无版本过滤，会同时取到两类行。
+    parser.add_argument("--version", default=settings.ai_advisor_knowledge_version)
     args = parser.parse_args()
     if settings.environment not in {"development", "testing"}:
         raise SystemExit("Refusing to import DOCX outside development/testing environment")
+    if args.version != settings.ai_advisor_knowledge_version:
+        raise SystemExit(
+            f"--version={args.version} 与 AI_ADVISOR_KNOWLEDGE_VERSION="
+            f"{settings.ai_advisor_knowledge_version} 不一致，会导致启动期知识版本校验失败；"
+            "如确需并存版本，请先扩展 verify_knowledge_version 的口径。"
+        )
     inserted, skipped = import_entries(args.path, args.version)
     print(f"source={args.path}")
     print(f"version={args.version}")

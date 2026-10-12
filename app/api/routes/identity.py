@@ -88,8 +88,14 @@ async def admin_matchmaker_applications(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     admin.require("matchmaker.application.read")
+    # D-10：申请列表按四档数据范围收口（此前无作用域，任意后台账号可看全平台申请）。
+    scope_params: dict[str, object] = {}
+    scope = admin.scope_exists_clause(
+        scope_params, correlation="scope_assignment.user_id = user_matchmaker_apply.user_id"
+    )
     return await admin_list_matchmaker_applications(
-        db, page=page, page_size=page_size, application_type=application_type, status=status, search=search
+        db, page=page, page_size=page_size, application_type=application_type,
+        status=status, search=search, scope=scope, scope_params=scope_params,
     )
 
 
@@ -101,7 +107,13 @@ async def admin_matchmaker_application_detail(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     admin.require("matchmaker.application.read")
-    return await admin_get_matchmaker_application(db, application_id)
+    scope_params: dict[str, object] = {}
+    scope = admin.scope_exists_clause(
+        scope_params, correlation="scope_assignment.user_id = user_matchmaker_apply.user_id"
+    )
+    return await admin_get_matchmaker_application(
+        db, application_id, scope=scope, scope_params=scope_params
+    )
 
 
 @declare_permission("matchmaker.application.review")

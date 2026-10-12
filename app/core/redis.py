@@ -103,6 +103,26 @@ if value > tonumber(ARGV[1]) then return 0 end
 return 1
 """
 
+SMS_ISSUE_LUA = """
+if redis.call('SET', KEYS[1], '1', 'EX', ARGV[1], 'NX') == false then return -1 end
+local used = tonumber(redis.call('GET', KEYS[2]) or '0')
+if used >= tonumber(ARGV[2]) then redis.call('DEL', KEYS[1]); return -2 end
+local next = redis.call('INCR', KEYS[2])
+if next == 1 then redis.call('EXPIRE', KEYS[2], ARGV[3]) end
+redis.call('SET', KEYS[3], ARGV[4], 'EX', ARGV[5])
+return 1
+"""
+
+SMS_COMPENSATE_LUA = """
+if redis.call('GET', KEYS[3]) == ARGV[1] then
+  redis.call('DEL', KEYS[1], KEYS[3])
+  local used = tonumber(redis.call('GET', KEYS[2]) or '0')
+  if used > 0 then redis.call('DECR', KEYS[2]) end
+  return 1
+end
+return 0
+"""
+
 
 def daily_quota_key(prefix: str, user_id: int) -> str:
     """Build a daily quota key using UTC date (aligned with consume_daily TTL reset)."""

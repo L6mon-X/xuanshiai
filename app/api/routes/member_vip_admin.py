@@ -11,16 +11,33 @@ from app.services.member_vip_admin import update_vip
 
 router = APIRouter(prefix="/admin/members")
 
+# 会员/订单/流水均无组织列，归属只存在于 resource_assignment，统一用 EXISTS 包装（D-16）。
+_MEMBER_CORRELATION = "scope_assignment.user_id = users.id"
+_USER_CORRELATION = "scope_assignment.user_id = u.id"
+
+
+def _scope(current: CurrentMatchmakerAdmin, correlation: str) -> tuple[str, dict[str, object]]:
+    """生成四档数据范围谓词；唯一判定在 `CurrentMatchmakerAdmin.scope_clause`（D-16）。"""
+    params: dict[str, object] = {}
+    return current.scope_exists_clause(params, correlation=correlation), params
+
 
 @router.patch("/{member_id}/vip", response_model=AdminVipUpdateResponse, summary="开通、续期或取消 VIP")
 async def update_member_vip(member_id: int = Path(..., ge=1), body: AdminVipUpdate = ..., current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> AdminVipUpdateResponse:
-    return await update_vip(db, current.account.id, member_id, body)
+    current.require("matchmaker.member.manage")
+    scope, scope_params = _scope(current, _MEMBER_CORRELATION)
+    return await update_vip(db, current.account.id, member_id, body, scope=scope, scope_params=scope_params)
 
 
 @router.get("/vip", response_model=AdminVipPage, summary="查询 VIP 会员")
 async def vip_members(page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=100), expiring_within_days: int | None = Query(None, ge=1, le=3650), search: str | None = Query(None, max_length=64), vip_level: str | None = Query(None, max_length=64), open_method: str | None = Query(None, pattern="^(admin|self)$"), open_nature: str | None = Query(None, pattern="^(first|renew|upgrade|again)$"), vip_status: str | None = Query(None, pattern="^(active|expired)$"), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> AdminVipPage:
+    current.require("matchmaker.member.read")
     where = ["m.status <> 3"]
     params: dict = {"limit": page_size, "offset": (page - 1) * page_size}
+    scope, scope_params = _scope(current, _USER_CORRELATION)
+    if scope:
+        params.update(scope_params)
+        where.append(f"({scope})")
     if search:
         where.append("(u.nickname LIKE CONCAT('%', :search, '%') OR u.phone LIKE CONCAT('%', :search, '%'))")
         params["search"] = search
@@ -53,9 +70,15 @@ async def vip_members(page: int = Query(1, ge=1, le=1000), page_size: int = Quer
 
 @router.get("/{member_id}/behavior/login-logs", response_model=AdminLoginLogPage, summary="查询会员登录日志")
 async def login_logs(member_id: int = Path(..., ge=1), page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=100), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> AdminLoginLogPage:
+    current.require("matchmaker.member.read")
     base = "FROM user_login_log l JOIN users u ON u.id = l.user_id"
     params = {"user_id": member_id, "limit": page_size, "offset": (page - 1) * page_size}
-    rows = await db.execute(text(f"SELECT l.id, l.user_id, u.nickname, l.login_status, l.ip, l.device_id, l.platform, l.failure_reason, l.created_at {base} WHERE l.user_id = :user_id ORDER BY l.id DESC LIMIT :limit OFFSET :offset"), params)
-    count = await db.execute(text(f"SELECT COUNT(*) {base} WHERE l.user_id = :user_id"), {"user_id": member_id})
+    scope, scope_params = _scope(current, _USER_CORRELATION)
+    scope_filter = ""
+    if scope:
+        params.update(scope_params)
+        scope_filter = f" AND ({scope})"
+    rows = await db.execute(text(f"SELECT l.id, l.user_id, u.nickname, l.login_status, l.ip, l.device_id, l.platform, l.failure_reason, l.created_at {base} WHERE l.user_id = :user_id{scope_filter} ORDER BY l.id DESC LIMIT :limit OFFSET :offset"), params)
+    count = await db.execute(text(f"SELECT COUNT(*) {base} WHERE l.user_id = :user_id{scope_filter}"), {k: v for k, v in params.items() if k not in ("limit", "offset")})
     total = int(count.scalar() or 0)
     return AdminLoginLogPage(items=[AdminLoginLogItem(**dict(row)) for row in rows.mappings().all()], page=page, page_size=page_size, total=total, has_more=page * page_size < total)

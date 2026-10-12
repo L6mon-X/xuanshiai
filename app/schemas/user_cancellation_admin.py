@@ -66,3 +66,15 @@ class UserCancellationStatistics(BaseModel):
     pending: int = 0
     approved_today: int = 0
     cancelled_today: int = 0
+
+
+class UserCancellationSelfResponse(BaseModel):
+    """当前用户可见的注销申请状态。"""
+
+    id: int
+    status: CancellationStatus
+    reason: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    reviewed_at: datetime | None = None
+    review_note: str | None = None

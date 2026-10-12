@@ -21,6 +21,16 @@ from app.services import offline_vip_admin as service
 
 router = APIRouter(prefix="/admin/offline-vips")
 
+# 线下VIP/会员均无组织列，归属只存在于 resource_assignment，统一用 EXISTS 包装（D-16）。
+_VIP_CORRELATION = "scope_assignment.user_id = v.user_id"
+_USER_CORRELATION = "scope_assignment.user_id = u.id"
+
+
+def _scope(current: CurrentMatchmakerAdmin, correlation: str) -> tuple[str, dict[str, object]]:
+    """生成四档数据范围谓词；唯一判定在 `CurrentMatchmakerAdmin.scope_clause`（D-16）。"""
+    params: dict[str, object] = {}
+    return current.scope_exists_clause(params, correlation=correlation), params
+
 # 服务进度合法取值（all 表示不筛选，不落库）
 _PROGRESS_PATTERN = "^(matching|dating|deep|in_love|met_parents|paused|breakup|married)$"
 
@@ -50,6 +60,7 @@ async def list_offline_vips(
     db: AsyncSession = Depends(get_db),
 ) -> OfflineVipPage:
     current.require("matchmaker.member.read")
+    scope, scope_params = _scope(current, _VIP_CORRELATION)
     return await service.list_vips(
         db,
         page,
@@ -63,6 +74,8 @@ async def list_offline_vips(
         keyword,
         service_status,
         sort_by,
+        scope=scope,
+        scope_params=scope_params,
     )
 
 
@@ -72,7 +85,8 @@ async def offline_vip_statistics(
     db: AsyncSession = Depends(get_db),
 ) -> OfflineVipStatistics:
     current.require("matchmaker.member.read")
-    return await service.statistics(db)
+    scope, scope_params = _scope(current, _VIP_CORRELATION)
+    return await service.statistics(db, scope=scope, scope_params=scope_params)
 
 
 @router.get("/options", response_model=OfflineVipOptions, summary="线下VIP 下拉选项")
@@ -81,7 +95,8 @@ async def offline_vip_options(
     db: AsyncSession = Depends(get_db),
 ) -> OfflineVipOptions:
     current.require("matchmaker.member.read")
-    return await service.options(db)
+    scope, scope_params = _scope(current, _VIP_CORRELATION)
+    return await service.options(db, scope=scope, scope_params=scope_params)
 
 
 @router.post("", response_model=OfflineVipItem, status_code=201, summary="添加线下VIP会员")
@@ -91,7 +106,8 @@ async def create_offline_vip(
     db: AsyncSession = Depends(get_db),
 ) -> OfflineVipItem:
     current.require("matchmaker.member.manage")
-    return await service.create_vip(db, current.account.id, body)
+    scope, scope_params = _scope(current, _USER_CORRELATION)
+    return await service.create_vip(db, current.account.id, body, scope=scope, scope_params=scope_params)
 
 
 @router.get("/{vip_id}", response_model=OfflineVipItem, summary="查询线下VIP详情")
@@ -101,7 +117,8 @@ async def get_offline_vip(
     db: AsyncSession = Depends(get_db),
 ) -> OfflineVipItem:
     current.require("matchmaker.member.read")
-    return await service.get_vip(db, vip_id)
+    scope, scope_params = _scope(current, _VIP_CORRELATION)
+    return await service.get_vip(db, vip_id, scope=scope, scope_params=scope_params)
 
 
 @router.put("/{vip_id}", response_model=OfflineVipItem, summary="编辑线下VIP会员服务信息")
@@ -112,7 +129,8 @@ async def update_offline_vip(
     db: AsyncSession = Depends(get_db),
 ) -> OfflineVipItem:
     current.require("matchmaker.member.manage")
-    return await service.update_vip(db, vip_id, current.account.id, body)
+    scope, scope_params = _scope(current, _VIP_CORRELATION)
+    return await service.update_vip(db, vip_id, current.account.id, body, scope=scope, scope_params=scope_params)
 
 
 @router.get("/{vip_id}/meet-logs", response_model=OfflineVipMeetLogPage, summary="成功约见次数修改记录")
@@ -124,4 +142,5 @@ async def offline_vip_meet_logs(
     db: AsyncSession = Depends(get_db),
 ) -> OfflineVipMeetLogPage:
     current.require("matchmaker.member.read")
-    return await service.list_meet_logs(db, vip_id, page, page_size)
+    scope, scope_params = _scope(current, _VIP_CORRELATION)
+    return await service.list_meet_logs(db, vip_id, page, page_size, scope=scope, scope_params=scope_params)

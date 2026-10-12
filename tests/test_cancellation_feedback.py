@@ -8,6 +8,7 @@
 """
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
@@ -17,7 +18,12 @@ from app.schemas.admin_ticket import (
     AdminTicketReply,
     AdminTicketStatusUpdate,
 )
-from app.schemas.user_cancellation_admin import UserCancellationItem, UserCancellationReview
+from app.api.routes import users as users_routes
+from app.schemas.user_cancellation_admin import (
+    UserCancellationItem,
+    UserCancellationReview,
+    UserCancellationSelfResponse,
+)
 from app.services import user_cancellation_admin as cancellation_service
 from app.services.revisions import RevisionKind
 
@@ -34,6 +40,104 @@ def test_user_cancellation_routes_are_registered() -> None:
     assert "get" in paths[base]
     assert "get" in paths[f"{base}/statistics"]
     assert "post" in paths[f"{base}/{{cancellation_id}}/review"]
+
+
+def test_user_self_cancellation_contract_is_registered() -> None:
+    paths = client.get("/openapi.json").json()["paths"]
+    base = "/api/v1/users/me/cancellation"
+    assert set(paths[base]) == {"get", "post", "delete"}
+    assert paths[base]["post"]["requestBody"]["required"] is True
+    schema_ref = paths[base]["post"]["requestBody"]["content"]["application/json"]["schema"]
+    assert schema_ref["$ref"].endswith("/CancellationRequest")
+
+
+def test_user_self_cancellation_endpoints_require_authentication() -> None:
+    base = "/api/v1/users/me/cancellation"
+    assert client.get(base).status_code == 401
+    assert client.post(base, json={"reason": "不再使用"}).status_code == 401
+    assert client.delete(base).status_code == 401
+
+
+def test_user_self_cancellation_reason_is_limited() -> None:
+    body = users_routes.CancellationRequest(reason="x" * 500)
+    assert len(body.reason or "") == 500
+    with pytest.raises(ValidationError):
+        users_routes.CancellationRequest(reason="x" * 501)
+
+
+def test_user_self_cancellation_response_contract() -> None:
+    response = UserCancellationSelfResponse(
+        id=1,
+        status="pending",
+        reason=None,
+        created_at="2026-01-01 00:00:00",
+        updated_at="2026-01-01 00:00:00",
+    )
+    assert response.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_request_user_cancellation_is_idempotent_for_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    existing = UserCancellationSelfResponse(
+        id=9,
+        status="pending",
+        reason="already requested",
+        created_at="2026-01-01 00:00:00",
+        updated_at="2026-01-01 00:00:00",
+    )
+    execute_called = False
+
+    async def fake_get_current(_db: object, user_id: int) -> UserCancellationSelfResponse:
+        assert user_id == 42
+        return existing
+
+    class _Db:
+        async def execute(self, *_args: object, **_kwargs: object) -> None:
+            nonlocal execute_called
+            execute_called = True
+
+    monkeypatch.setattr(
+        cancellation_service,
+        "get_current_user_cancellation",
+        fake_get_current,
+    )
+    result = await cancellation_service.request_user_cancellation(
+        _Db(), 42, "new reason", "127.0.0.1"
+    )
+    assert result == existing
+    assert execute_called is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_user_cancellation_rejects_without_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Result:
+        rowcount = 0
+
+    class _Db:
+        async def execute(self, *_args: object, **_kwargs: object) -> _Result:
+            return _Result()
+
+    async def fake_get_current(_db: object, _user_id: int) -> UserCancellationSelfResponse:
+        return UserCancellationSelfResponse(
+            id=10,
+            status="approved",
+            reason=None,
+            created_at="2026-01-01 00:00:00",
+            updated_at="2026-01-01 00:00:00",
+        )
+
+    monkeypatch.setattr(
+        cancellation_service,
+        "get_current_user_cancellation",
+        fake_get_current,
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        await cancellation_service.cancel_user_cancellation(_Db(), 42)
+    assert exc_info.value.status_code == 409
 
 
 def test_user_cancellation_endpoints_require_authentication() -> None:

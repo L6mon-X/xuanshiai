@@ -42,9 +42,15 @@ async def list_orders(
     pay_status: str | None = None,
     status: str | None = None,
     search: str | None = None,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> PromotionOrderPage:
     where = ["1 = 1"]
     params: dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size}
+    if scope:
+        params.update(scope_params or {})
+        where.append(f"({scope})")
     if pay_status:
         where.append("o.pay_status = :pay_status")
         params["pay_status"] = pay_status
@@ -67,45 +73,92 @@ async def list_orders(
     )
 
 
-async def get_order(db: AsyncSession, order_id: int) -> PromotionOrder:
-    row = (await db.execute(text(f"{_ORDER_SELECT} WHERE o.id = :id"), {"id": order_id})).mappings().first()
+async def get_order(
+    db: AsyncSession,
+    order_id: int,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> PromotionOrder:
+    where = ["o.id = :id"]
+    params: dict[str, Any] = {"id": order_id}
+    if scope:
+        params.update(scope_params or {})
+        where.append(f"({scope})")
+    row = (await db.execute(text(f"{_ORDER_SELECT} WHERE {' AND '.join(where)}"), params)).mappings().first()
     if not row:
         raise HTTPException(404, detail="推广订单不存在")
     return _order(row)
 
 
-async def update_order(db: AsyncSession, order_id: int, body: PromotionOrderUpdate, actor_id: int) -> PromotionOrder:
-    await get_order(db, order_id)
+async def update_order(
+    db: AsyncSession,
+    order_id: int,
+    body: PromotionOrderUpdate,
+    actor_id: int,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> PromotionOrder:
+    await get_order(db, order_id, scope=scope, scope_params=scope_params)
     values = body.model_dump(exclude_unset=True, exclude_none=True)
+    # 写路径带作用域谓词，避免读校验与写之间被改派时越权落库（D-16）。
+    guard = ""
+    guard_params: dict[str, Any] = {}
+    if scope:
+        guard_params.update(scope_params or {})
+        guard = f" AND ({scope})"
     # 支付状态改为已支付时补记支付时间；退款/未支付则清空。
     if values.get("pay_status") == "paid":
-        await db.execute(text("UPDATE promotion_order SET paid_at = COALESCE(paid_at, UTC_TIMESTAMP()) WHERE id = :id"), {"id": order_id})
+        await db.execute(text(f"UPDATE promotion_order SET paid_at = COALESCE(paid_at, UTC_TIMESTAMP()) WHERE id = :id{guard}"), {"id": order_id, **guard_params})
     elif "pay_status" in values:
-        await db.execute(text("UPDATE promotion_order SET paid_at = NULL WHERE id = :id"), {"id": order_id})
+        await db.execute(text(f"UPDATE promotion_order SET paid_at = NULL WHERE id = :id{guard}"), {"id": order_id, **guard_params})
     if values:
         assignments = ", ".join(f"{key} = :{key}" for key in values)
-        await db.execute(text(f"UPDATE promotion_order SET {assignments}, updated_at = UTC_TIMESTAMP() WHERE id = :id"), {**values, "id": order_id})
+        await db.execute(text(f"UPDATE promotion_order SET {assignments}, updated_at = UTC_TIMESTAMP() WHERE id = :id{guard}"), {**values, "id": order_id, **guard_params})
     await db.execute(text("""INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id)
         VALUES (:actor, 'promotion_order.update', 'promotion_order', :id)"""), {"actor": actor_id, "id": order_id})
     await db.commit()
-    return await get_order(db, order_id)
+    return await get_order(db, order_id, scope=scope, scope_params=scope_params)
 
 
-async def delete_order(db: AsyncSession, order_id: int, actor_id: int) -> bool:
-    await get_order(db, order_id)
-    await db.execute(text("DELETE FROM promotion_order WHERE id = :id"), {"id": order_id})
+async def delete_order(
+    db: AsyncSession,
+    order_id: int,
+    actor_id: int,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> bool:
+    await get_order(db, order_id, scope=scope, scope_params=scope_params)
+    guard = ""
+    guard_params: dict[str, Any] = {}
+    if scope:
+        guard_params.update(scope_params or {})
+        guard = f" AND ({scope})"
+    await db.execute(text(f"DELETE FROM promotion_order WHERE id = :id{guard}"), {"id": order_id, **guard_params})
     await db.execute(text("""INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id)
         VALUES (:actor, 'promotion_order.delete', 'promotion_order', :id)"""), {"actor": actor_id, "id": order_id})
     await db.commit()
     return True
 
 
-async def order_statistics(db: AsyncSession) -> PromotionOrderStatistics:
-    row = (await db.execute(text("""SELECT COUNT(*) AS total,
+async def order_statistics(
+    db: AsyncSession,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> PromotionOrderStatistics:
+    where = "1 = 1"
+    params: dict[str, Any] = {}
+    if scope:
+        params.update(scope_params or {})
+        where = scope
+    row = (await db.execute(text(f"""SELECT COUNT(*) AS total,
         SUM(pay_status = 'paid') AS paid_count,
         SUM(status = 'processing') AS processing_count,
         SUM(CASE WHEN pay_status = 'paid' THEN amount ELSE 0 END) AS paid_amount
-        FROM promotion_order"""))).mappings().one()
+        FROM promotion_order o WHERE {where}"""), params)).mappings().one()
     return PromotionOrderStatistics(
         total=int(row["total"] or 0),
         paid_count=int(row["paid_count"] or 0),

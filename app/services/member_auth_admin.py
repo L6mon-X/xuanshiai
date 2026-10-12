@@ -536,12 +536,20 @@ async def review_auth(
         raise HTTPException(422, detail="审核未通过时必须填写原因")
     if kind == "realname":
         resource_type = "user_auth"
-        exists = await db.execute(text("SELECT id FROM user_auth WHERE id = :id"), {"id": review_id})
-        if not exists.scalar():
+        exists = await db.execute(text("SELECT id, user_id FROM user_auth WHERE id = :id"), {"id": review_id})
+        realname_row = exists.mappings().first()
+        if not realname_row:
             raise HTTPException(404, detail="实名认证记录不存在")
-        await db.execute(
-            text("UPDATE user_auth SET face_verified = :st, reviewed_by = :actor, reviewed_at = UTC_TIMESTAMP() WHERE id = :id"),
-            {"st": new_status, "actor": actor_id, "id": review_id},
+        # D-14：实名审核统一走 auth.apply_realname_review，同源写入 realname_status（门禁读取列）
+        # 与 face_verified（人脸标记），避免两个后台入口双写分裂导致门禁不可达。
+        from app.services import auth as auth_service
+        await auth_service.apply_realname_review(
+            db,
+            int(realname_row["user_id"]),
+            auth_service.REALNAME_STATUS_PASSED if new_status == 1 else auth_service.REALNAME_STATUS_FAILED,
+            body.remark,
+            actor_id,
+            sync_face=True,
         )
     elif kind == "commitment":
         resource_type = "user_commitment_sign"

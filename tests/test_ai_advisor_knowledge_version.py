@@ -40,6 +40,20 @@ def test_config_default_matches_seed_script() -> None:
     assert f"version='{VERSION}'" in script or f"'{VERSION}'" in script
 
 
+def test_env_example_matches_config() -> None:
+    """D-11：.env.example 曾残留 seed-v1，照抄示例会在生产触发启动期 fail-fast。"""
+    env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    assert f"AI_ADVISOR_KNOWLEDGE_VERSION={VERSION}" in env_example
+    assert "AI_ADVISOR_KNOWLEDGE_VERSION=seed-v1" not in env_example
+
+
+def test_docx_import_defaults_to_configured_version() -> None:
+    """D-11：DOCX 导入脚本默认版本必须跟配置走，禁止隐式写入异版本。"""
+    script = (ROOT / "scripts/import_ai_advisor_docx.py").read_text(encoding="utf-8")
+    assert 'default=settings.ai_advisor_knowledge_version' in script
+    assert '"docx-v1"' not in script
+
+
 def test_schema_default_matches_config() -> None:
     source = (ROOT / "database_setup_marriage.py").read_text(encoding="utf-8")
     assert f"`version` varchar(64) NOT NULL DEFAULT '{VERSION}'" in source

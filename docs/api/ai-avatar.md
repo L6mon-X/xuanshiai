@@ -161,7 +161,7 @@ Idempotency-Key: ai-avatar-20260905-001
 {"messages":[{"id":0,"type":"text","content":"欢迎语","time":1786675200000,"showTime":false,"isMine":false,"avatar":null,"source":"system","category":"general","handoffRequired":false,"handoffStatus":"not_requested"},{"id":11,"type":"text","content":"Ta 喜欢什么？","time":1786675201000,"showTime":false,"isMine":true,"avatar":null,"source":"user","category":"interest","handoffRequired":false,"handoffStatus":"not_requested"},{"id":12,"type":"text","content":"Ta 的公开资料提到喜欢徒步，这是 AI 回答。","time":1786675202000,"showTime":false,"isMine":false,"avatar":null,"source":"real-ai","category":"interest","handoffRequired":false,"handoffStatus":"not_requested"}],"result":{"reply":"Ta 的公开资料提到喜欢徒步，这是 AI 回答。","category":"interest","source":"real-ai","handoffRequired":false,"handoffStatus":"not_requested"}}
 ```
 
-**使用方法与业务规则**：先调用资料和历史接口。服务端重新检查隐私，读取最近 `AI_MAX_CONTEXT_MESSAGES` 条历史，调用供应商，过滤输出后再一次性保存用户问题和 AI 回答，同时向主人待回答列表记录问题。供应商或数据库失败时不保存本轮消息并返还本次额度。客户端应为一次用户发送生成一个 `Idempotency-Key`；同一用户、相同请求键和相同请求体会复用首次成功响应。相同键对应不同请求体返回 `409`，处理中再次发送相同键也返回 `409`。
+**使用方法与业务规则**：先调用资料和历史接口。服务端重新检查隐私，读取最近 `AI_MAX_CONTEXT_MESSAGES` 条历史，调用供应商，过滤输出后再一次性保存用户问题和 AI 回答，同时向主人待回答列表记录问题。供应商或数据库失败时不保存本轮消息并返还本次额度。客户端应为一次用户发送生成一个 `Idempotency-Key`；同一用户、相同请求键和相同请求体会复用首次成功响应。相同键对应不同请求体返回 `409`，处理中再次发送相同键也返回 `409`。无状态 `/api/v1/ai/avatar/{target_user_id}/reply` 与有状态消息接口共用用户级每日额度，额度 key 为 `ai-avatar:{user_id}:{UTC日期}`，配置项为 `AI_AVATAR_DAILY_LIMIT`。
 
 **频率与并发**：每位访问者共享每日额度，不按目标分别计算。数据库会话按访问者与目标唯一。客户端发送期间仍应禁用重复提交；网络重试必须复用同一个 `Idempotency-Key`，而新的用户发送必须生成新键。
 
@@ -223,3 +223,7 @@ AI_AVATAR_DAILY_LIMIT=20
 ```
 
 本地无密钥的兼容服务可不设置 `AI_AVATAR_API_KEY`。staging/production 强制 `AI_AVATAR_BASE_URL` 使用 HTTPS。修改配置后需要重启 FastAPI。
+
+## 变更记录
+
+- 2026-10-12：统一无状态 reply 与有状态消息接口的用户级每日额度；均使用 `AI_AVATAR_DAILY_LIMIT` 和 Redis key 前缀 `ai-avatar`。旧的 `AI_DAILY_AVATAR_LIMIT` / `ai:avatar` 不再作为运行时额度来源。

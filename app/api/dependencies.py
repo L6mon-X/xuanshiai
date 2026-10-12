@@ -117,6 +117,10 @@ async def get_face_verified_user(
     """Require realname plus face verification for publishing community posts.
 
     Fail-closed: a missing face record is treated as not verified.
+
+    D-14：`face_verified` 由「会员认证后台」实名审核（携带人脸照片/评分，审核即
+    人脸核验）写入；人脸供应商适配层见 `app/services/face/`，在真实供应商接入前
+    本门禁保持 fail-closed（`FACE_PROVIDER=disabled` 时无人脸自助入口）。
     """
     if current.realname_status != 2:
         raise HTTPException(status_code=403, detail="请先完成实名认证")

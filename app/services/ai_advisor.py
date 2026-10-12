@@ -26,6 +26,9 @@ from app.schemas.ai_advisor import (
     AdvisorSuggestion,
 )
 from app.services.ai_provider import complete, parse_json
+from app.services.idempotency import abort as abort_idempotency
+from app.services.idempotency import complete as complete_idempotency
+from app.services.idempotency import reserve_or_replay
 from app.services.ai.gateway import _redact_provider_message
 from app.services.content_filter import assert_text_allowed
 from app.services.ai.memory.consumers import CounselorMemoryAdapter
@@ -229,22 +232,46 @@ def _normalize_result(data: dict[str, Any], request: AdvisorAdviceRequest) -> di
     }
 
 
-async def create_session(db: AsyncSession, user_id: int, request: AdvisorSessionCreate) -> AdvisorSessionResponse:
+async def create_session(
+    db: AsyncSession,
+    user_id: int,
+    request: AdvisorSessionCreate,
+    *,
+    idempotency_key: str,
+) -> AdvisorSessionResponse:
     await _require_vip(db, user_id)
     if request.chat_session_id is not None:
         await _assert_chat_session_access(db, user_id, request.chat_session_id)
-    result = await db.execute(text("""INSERT INTO ai_advisor_session
-        (user_id, advisor_type, chat_session_id, title)
-        VALUES (:user_id, :advisor_type, :chat_session_id, :title)"""), {
-        "user_id": user_id,
-        "advisor_type": request.advisor_type,
-        "chat_session_id": request.chat_session_id,
-        "title": request.title or "Relationship advisor",
-    })
-    await db.commit()
-    row = (await db.execute(text("""SELECT id, advisor_type, chat_session_id, title, created_at, updated_at
-        FROM ai_advisor_session WHERE id=:id"""), {"id": result.lastrowid})).mappings().one()
-    return AdvisorSessionResponse(**dict(row), message_count=0)
+    reservation = await reserve_or_replay(
+        db,
+        user_id,
+        "ai-advisor-session",
+        idempotency_key,
+        {
+            "advisor_type": request.advisor_type,
+            "chat_session_id": request.chat_session_id,
+            "title": request.title,
+        },
+    )
+    if reservation.response is not None:
+        return AdvisorSessionResponse.model_validate(reservation.response)
+    try:
+        result = await db.execute(text("""INSERT INTO ai_advisor_session
+            (user_id, advisor_type, chat_session_id, title)
+            VALUES (:user_id, :advisor_type, :chat_session_id, :title)"""), {
+            "user_id": user_id,
+            "advisor_type": request.advisor_type,
+            "chat_session_id": request.chat_session_id,
+            "title": request.title or "Relationship advisor",
+        })
+        row = (await db.execute(text("""SELECT id, advisor_type, chat_session_id, title, created_at, updated_at
+            FROM ai_advisor_session WHERE id=:id"""), {"id": result.lastrowid})).mappings().one()
+        response = AdvisorSessionResponse(**dict(row), message_count=0)
+        await complete_idempotency(db, reservation, response.model_dump(mode="json"))
+        return response
+    except Exception:
+        await abort_idempotency(db, reservation)
+        raise
 
 
 async def list_sessions(db: AsyncSession, user_id: int, page: int, page_size: int) -> AdvisorSessionPage:

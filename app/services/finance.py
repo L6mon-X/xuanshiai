@@ -349,7 +349,7 @@ async def release_commission(db: AsyncSession, admin: CurrentUser, entry_id: int
 async def refund_order(db: AsyncSession, admin: CurrentUser, order_id: int, request: FinanceRefundRequest, *, scope_admin: CurrentMatchmakerAdmin | None = None) -> None:
     params: dict[str, object] = {"id": order_id}
     scope = "1 = 1" if scope_admin is None else _member_anchor_scope(scope_admin, params, member_column="payment_order.user_id")
-    result = await db.execute(text(f"""SELECT id, status, service_request_id
+    result = await db.execute(text(f"""SELECT id, status, type, order_no, service_request_id
         FROM payment_order WHERE id = :id AND ({scope}) FOR UPDATE"""), params)
     order = result.mappings().first()
     if not order:
@@ -389,6 +389,23 @@ async def refund_order(db: AsyncSession, admin: CurrentUser, order_id: int, requ
             (actor_user_id, action, resource_type, resource_id, reason)
             VALUES (:admin_id, 'matchmaker_service.refund_close', 'matchmaker_service', :service_id, :reason)"""), {
             "admin_id": admin.id, "service_id": service_id, "reason": request.reason,
+        })
+    # D-22：会员订单（type=1）退款必须同步回收会员权益，否则退款后用户仍在有效期内可用会员权益。
+    if int(order["type"]) == 1 and order["order_no"]:
+        memberships = await db.execute(text("""SELECT id, status FROM user_membership
+            WHERE order_no = :order_no FOR UPDATE"""), {"order_no": order["order_no"]})
+        revoked_memberships: list[dict[str, object]] = []
+        for membership in memberships.mappings().all():
+            if int(membership["status"] or 0) != 1:
+                continue
+            await db.execute(text("""UPDATE user_membership SET status = 3, updated_at = UTC_TIMESTAMP()
+                WHERE id = :membership_id AND status = 1"""), {"membership_id": membership["id"]})
+            revoked_memberships.append({"id": int(membership["id"]), "previous_status": int(membership["status"])})
+        await db.execute(text("""INSERT INTO business_audit_log
+            (actor_user_id, action, resource_type, resource_id, reason, after_json)
+            VALUES (:admin_id, 'membership.refund_revoke', 'payment_order', :order_id, :reason, :after_json)"""), {
+            "admin_id": admin.id, "order_id": order["id"], "reason": request.reason,
+            "after_json": json.dumps({"memberships": revoked_memberships}, ensure_ascii=False),
         })
     await db.execute(text("UPDATE payment_order SET status = 3, refund_time = UTC_TIMESTAMP() WHERE id = :id"), {"id": order_id})
     await db.commit()

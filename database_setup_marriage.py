@@ -698,6 +698,41 @@ class DatabaseManager:
                 (71, 7, '维护门店', NULL, 'button', 'matchmaker.organization.manage', NULL, 1, 1),
                 (81, 8, '编辑红娘', NULL, 'button', 'matchmaker.manage', NULL, 1, 1)
         """)
+        # D-17：补齐被 URL 权限映射 / @declare_permission / require() 引用、但未登记
+        # 菜单种子的权限码（此前只有 `*` 超管可用，普通后台账号访问必 403）。
+        # 保留 id 100+ 段位，避免与上面的既有 id 冲突；INSERT IGNORE 幂等。
+        cursor.execute("""
+            INSERT IGNORE INTO admin_menu
+                (id, parent_id, name, path, menu_type, permission_code, icon, sort, status)
+            VALUES
+                (52, 5, '查看约见反馈', NULL, 'button', 'meeting.feedback.read', NULL, 2, 1),
+                (61, 6, '财务操作', NULL, 'button', 'finance.write', NULL, 1, 1),
+                (82, 8, '查看红娘', NULL, 'button', 'matchmaker.read', NULL, 2, 1),
+                (100, NULL, '平台配置', '/platform-config', 'menu', 'platform.config.read', 'setting', 100, 1),
+                (101, NULL, '消息管理', '/messages', 'menu', 'message.read', 'message', 110, 1),
+                (102, NULL, '内容治理', '/community', 'menu', 'community.read', 'community', 120, 1),
+                (103, NULL, '活动管理', '/activities', 'menu', 'community.activity.read', 'activity', 130, 1),
+                (104, NULL, '商家联盟', '/merchant', 'menu', 'merchant.read', 'merchant', 140, 1),
+                (105, NULL, '短视频', '/short-video', 'menu', 'video.read', 'video', 150, 1),
+                (106, NULL, '奖励规则', '/reward-rules', 'menu', 'reward.read', 'reward', 160, 1),
+                (107, NULL, '佣金等级', '/commission-levels', 'menu', 'commission.read', 'commission', 170, 1),
+                (108, NULL, '服务商品', '/service-products', 'menu', 'matchmaker.product.read', 'product', 180, 1),
+                (109, NULL, '分派配置', '/apportion-config', 'menu', 'matchmaker.apportion.read', 'apportion', 190, 1),
+                (110, NULL, '红娘申请', '/matchmaker-applications', 'menu', 'matchmaker.application.read', 'apply', 200, 1),
+                (111, NULL, '系统工单', '/tickets', 'menu', 'matchmaker.system.read', 'ticket', 210, 1),
+                (1001, 100, '编辑平台配置', NULL, 'button', 'platform.config.write', NULL, 1, 1),
+                (1011, 101, '消息处置', NULL, 'button', 'message.manage', NULL, 1, 1),
+                (1021, 102, '内容处置', NULL, 'button', 'community.moderate', NULL, 1, 1),
+                (1031, 103, '活动编辑', NULL, 'button', 'community.activity.manage', NULL, 1, 1),
+                (1041, 104, '商家编辑', NULL, 'button', 'merchant.manage', NULL, 1, 1),
+                (1051, 105, '短视频编辑', NULL, 'button', 'video.manage', NULL, 1, 1),
+                (1061, 106, '奖励规则编辑', NULL, 'button', 'reward.write', NULL, 1, 1),
+                (1071, 107, '佣金等级编辑', NULL, 'button', 'commission.write', NULL, 1, 1),
+                (1081, 108, '商品编辑', NULL, 'button', 'matchmaker.product.manage', NULL, 1, 1),
+                (1091, 109, '分派配置编辑', NULL, 'button', 'matchmaker.apportion.write', NULL, 1, 1),
+                (1101, 110, '红娘申请审核', NULL, 'button', 'matchmaker.application.review', NULL, 1, 1),
+                (1111, 111, '工单处置', NULL, 'button', 'matchmaker.system.manage', NULL, 1, 1)
+        """)
         cursor.execute("""
             INSERT IGNORE INTO matchmaker_tutorial (id, title, content, link_url, status)
             VALUES (

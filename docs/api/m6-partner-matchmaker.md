@@ -36,6 +36,18 @@
 依赖文件：`app/api/dependencies.py:_matchmaker_admin_permission(request)` 按路径子串映射。
 `/partner-levels` 与 `/partner-relations` 均**不含** `/partners` 子串，三条映射互不干扰。
 
+### 1.2.1 数据范围（D-16 收口，2026-10-12 批次 B）
+
+合伙人管理 / 团队关系 / 分成明细的**全部后台端点**已接入 `get_current_matchmaker_admin` 的**四档数据范围**（`ALL / SELF / STORE / ORGANIZATION`），归属统一经 `resource_assignment` 判定：
+
+| 资源 | 归属锚点 | 关联 |
+|---|---|---|
+| 合伙人列表 / 详情 / 目标用户 | `users.id` | `scope_assignment.user_id = users.id` |
+| 团队关系 | `partner_team.owner_user_id` | `scope_assignment.user_id = t.owner_user_id` |
+| 分成明细 | `commission_entry.beneficiary_id` | `scope_assignment.user_id = ce.beneficiary_id` |
+
+写路径分两类：带直列谓词的直接拼进 UPDATE；依赖 JOIN 别名的先带 scope 读校验再按主键落改（越权不落库）。分成配置（`partner_level_config`）为**全局配置表，不收敛**，仅权限码约束。完整口径见 `后台数据范围与敏感操作-2026-10-04.md` §1.3.1。
+
 ### 1.3 响应与异常
 
 - 列表响应统一为 `{ items, page, page_size, total, has_more }`。

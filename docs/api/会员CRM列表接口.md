@@ -16,7 +16,11 @@
 
 ## POST `/admin/matchmaker/members/batch-status`
 
+批量改状态采用部分成功语义。响应同时返回 `updated_ids` 和 `rejected_ids`；不存在、越权或不满足作用域的会员进入 `rejected_ids`，不会被修改。`updated` 等于 `updated_ids` 的长度。
+
 批量修改会员状态。Body：`{"member_ids":[1,2],"status":1,"reason":"会员列表批量修改"}`；`member_ids` 必须 1-200 个正整数，`status` 为 1/2/3，`reason` 1-255 字符。成功返回 `{"updated":2,"status":1}`，事务内完成更新；未登录 401，参数非法 422。重复提交是幂等的，不会重复创建会员。
+
+> **敏感操作（2026-10-11，D-9）**：必须携带 `Idempotency-Key`（8–128）与 `confirm=true`；缺幂等键 `422`，缺二次确认 `428`。同一 `Idempotency-Key` 重放直接返回上次的 `{updated,status}`，不重复执行更新；`operation` 为 `matchmaker.member.batch_status`。
 
 ## 会员详情补充字段
 
@@ -63,7 +67,9 @@ Content-Type: application/json
 
 ### PATCH `/admin/matchmaker/members/{member_id}/assignment`
 
-**用途与权限**：修改会员的服务红娘分派。需要红娘后台管理员登录，成功返回 200；`matchmaker_id` 可为有效服务红娘用户 ID，传 `null` 取消当前分派。
+**用途与权限**：修改会员的服务红娘分派。需要红娘后台管理员登录，成功返回 200；`matchmaker_id` 可为有效服务红娘用户 ID，传 `null` 取消当前分派。`operation` 为 `matchmaker.member.reassign`。
+
+> **敏感操作（2026-10-11，D-9）**：必须携带 `Idempotency-Key`（8–128）与 `confirm=true`；缺幂等键 `422`，缺二次确认 `428`。同键重放返回上次结果，不重复结束/创建归属。越权（会员不在数据范围内）在幂等预占之前按 `404` 拦截，不留幂等残留行。
 
 **请求参数**：`member_id` 为 path 正整数；`matchmaker_id` 为 body 正整数或 `null`。指定的用户必须拥有有效 `service_matchmaker` 身份。
 
@@ -89,6 +95,7 @@ Content-Type: application/json
 
 ## 变更记录
 
+- 2026-10-11（D-9 敏感操作）：`PATCH /admin/matchmaker/members/{member_id}/assignment`（改派）与 `POST /admin/matchmaker/members/batch-status`（批量改状态）纳入统一敏感操作，强制 `Idempotency-Key` + `confirm=true`，同键重放不重复执行；越权在幂等预占之前拦截。
 - 2026-10-04（D-4 数据范围下沉）：会员列表、统计、详情、改派、改状态、批量改状态、会员实名列表与牵线记录全部叠加后台数据范围（`ALL/SELF/STORE/ORGANIZATION` 四档，未绑定组织 fail-closed 返回 0 条）。越权访问按 `404 会员不存在` 返回；越权写操作不落库。四档定义见 [`docs/api/后台数据范围与敏感操作-2026-10-04.md`](后台数据范围与敏感操作-2026-10-04.md)。
 - 2026-10-04（附带修复）：会员列表原以非聚合子查询关联 `resource_assignment`，一人多单会产生重复行并虚增 `total`，已改为按 `user_id` 聚合；会员统计的 VIP 子查询原统计全平台 VIP，已同口径收口。
 - 2026-09-16：`PATCH /admin/matchmaker/members/{member_id}` 扩展会员基本资料更新字段，新增星座、饮酒、宗教、结婚计划、学校、单位和 `match_status`；`GET /admin/matchmaker/members/{member_id}` 及会员列表同步返回这些字段。向后兼容，旧客户端无需改动。
