@@ -16,6 +16,8 @@ from app.schemas.matchmaker import (
     MatchmakerServiceRequestResponse, MatchmakerCard, MatchmakerAdminServiceRequestUpdate,
 )
 from app.services.matchmaker_admin_auth import login, logout, refresh
+from app.core.security import hash_password, verify_password
+from app.schemas.matchmaker_admin_account import MatchmakerAdminPasswordChange
 from app.services.matchmaker import (
     admin_create_service_product, admin_list_service_requests, admin_update_service_product,
     admin_update_service_request, get_matchmaker, get_service_product, list_matchmakers,
@@ -73,6 +75,31 @@ async def admin_me(current: CurrentMatchmakerAdmin = Depends(get_current_matchma
 @router.post("/auth/logout", status_code=204, summary="退出红娘后台")
 async def admin_logout(current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> None:
     await logout(db, current.session_id)
+
+
+@router.post("/auth/change-password", status_code=204, summary="修改当前后台账号密码")
+async def change_password(
+    body: MatchmakerAdminPasswordChange,
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    row = (await db.execute(
+        text("SELECT password_hash FROM matchmaker_admin_account WHERE id = :id FOR UPDATE"),
+        {"id": current.account.id},
+    )).mappings().first()
+    if not row or not verify_password(body.old_password, row["password_hash"]):
+        raise HTTPException(status_code=400, detail="旧密码不正确")
+    if body.old_password == body.new_password:
+        raise HTTPException(status_code=400, detail="新密码不能与旧密码相同")
+    await db.execute(
+        text("UPDATE matchmaker_admin_account SET password_hash = :password_hash, failed_count = 0, locked_until = NULL, updated_at = UTC_TIMESTAMP() WHERE id = :id"),
+        {"password_hash": hash_password(body.new_password), "id": current.account.id},
+    )
+    await db.execute(
+        text("INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id, reason) VALUES (:actor_id, 'admin_account.password.change', 'matchmaker_admin_account', :resource_id, NULL)"),
+        {"actor_id": current.account.id, "resource_id": current.account.id},
+    )
+    await db.commit()
 
 
 @router.get("/matchmakers", response_model=MatchmakerPage, summary="查询红娘列表")

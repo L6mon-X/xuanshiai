@@ -55,6 +55,7 @@ async def list_accounts(
     status: int | None = None,
     matchmaker_user_id: int | None = None,
     cancellation_status: str | None = None,
+    keyword: str | None = None,
 ) -> MatchmakerAdminAccountPage:
     conditions = ["1 = 1"]
     params: dict[str, object] = {
@@ -67,6 +68,9 @@ async def list_accounts(
     if display_name:
         conditions.append("a.display_name LIKE CONCAT('%', :display_name, '%')")
         params["display_name"] = display_name
+    if keyword:
+        conditions.append("(a.username LIKE CONCAT('%', :keyword, '%') OR a.display_name LIKE CONCAT('%', :keyword, '%'))")
+        params["keyword"] = keyword
     if status is not None:
         conditions.append("a.status = :status")
         params["status"] = status
