@@ -9,8 +9,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.schemas.member_vip_admin import AdminVipUpdate, AdminVipUpdateResponse
 
 
-async def update_vip(db: AsyncSession, admin_id: int, user_id: int, request: AdminVipUpdate) -> AdminVipUpdateResponse:
-    user = await db.execute(text("SELECT id FROM users WHERE id = :id FOR UPDATE"), {"id": user_id})
+async def update_vip(
+    db: AsyncSession,
+    admin_id: int,
+    user_id: int,
+    request: AdminVipUpdate,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, object] | None = None,
+) -> AdminVipUpdateResponse:
+    """开通/续期/取消 VIP。
+
+    ``scope`` 为路由层用 `CurrentMatchmakerAdmin.scope_exists_clause`（D-16）生成的
+    四档谓词；会员不在数据范围内时按「会员不存在」返回 404（不泄露存在性），
+    也保证越权写不落库。
+    """
+    where = ["id = :id"]
+    params: dict[str, object] = {"id": user_id}
+    if scope:
+        params.update(scope_params or {})
+        where.append(f"({scope})")
+    user = await db.execute(text(f"SELECT id FROM users WHERE {' AND '.join(where)} FOR UPDATE"), params)
     if not user.scalar():
         raise HTTPException(404, detail="会员不存在")
 

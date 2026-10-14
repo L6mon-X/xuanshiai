@@ -1,6 +1,7 @@
 """Token and sensitive-value helpers used by authentication services."""
 
 import hashlib
+import hmac
 import secrets
 import base64
 from datetime import UTC, datetime, timedelta
@@ -144,3 +145,17 @@ def encrypt_sensitive(value: str) -> str:
 
 def mask_id_card(value: str) -> str:
     return f"{value[:4]}{'*' * max(0, len(value) - 8)}{value[-4:]}"
+
+
+def payment_callback_signature(order_no: str, transaction_id: str, amount: float | None, secret: str) -> str:
+    """Build the HMAC-SHA256 signature for a payment callback payload (D-21).
+
+    The canonical payload is ``order_no|transaction_id|amount`` where amount uses
+    two decimals (empty string when absent).  WeChat Pay v3 signs the raw
+    notification body; this helper is the local stand-in so both ``mock`` and
+    ``real`` modes share one verification pipeline and only the key source
+    differs.
+    """
+    amount_part = "" if amount is None else f"{float(amount):.2f}"
+    payload = f"{order_no}|{transaction_id}|{amount_part}"
+    return hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()

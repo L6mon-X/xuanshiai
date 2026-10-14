@@ -124,8 +124,39 @@ SELECT
     COALESCE(SUM(DATE_FORMAT(created_at, '%Y-%m')
         = DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 1 MONTH), '%Y-%m')), 0)
         AS last_month_count
-FROM member_follow_up
+FROM member_follow_up f
 """
+
+
+def _apply_scope(
+    where: list[str],
+    params: dict[str, Any],
+    scope: str | None,
+    scope_params: dict[str, Any] | None,
+) -> None:
+    """把四档数据范围谓词并入查询（D-16）。
+
+    `member_follow_up` 自身不带归属列，归属在会员（`f.user_id`）的
+    ``resource_assignment``；谓词由路由层用
+    `CurrentMatchmakerAdmin.scope_exists_clause`（唯一实现）生成后下传。
+    """
+    if not scope:
+        return
+    params.update(scope_params or {})
+    where.append(f"({scope})")
+
+
+async def _member_visible(
+    db: AsyncSession,
+    user_id: int,
+    scope: str | None,
+    scope_params: dict[str, Any] | None,
+) -> bool:
+    """会员是否存在且在当前账号的数据范围内（D-16，越权返回 False -> 404）。"""
+    where = ["id = :id"]
+    params: dict[str, Any] = {"id": user_id}
+    _apply_scope(where, params, scope, scope_params)
+    return bool(await db.scalar(text(f"SELECT 1 FROM users WHERE {' AND '.join(where)}"), params))
 
 
 def _to_int(value: Any) -> int:
@@ -165,10 +196,14 @@ async def list_follow_ups(
     intention_level: int | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> MemberFollowUpListPage:
     """跟进全览分页列表。keyword 匹配昵称/手机号/实名/会员编号。"""
     conditions = ["1=1"]
     params: dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size}
+    _apply_scope(conditions, params, scope, scope_params)
     if keyword:
         conditions.append(
             "(u.nickname LIKE CONCAT('%', :keyword, '%')"
@@ -207,9 +242,19 @@ async def list_follow_ups(
     )
 
 
-async def follow_up_summary(db: AsyncSession) -> MemberFollowUpSummary:
+async def follow_up_summary(
+    db: AsyncSession,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> MemberFollowUpSummary:
     """跟进全览 8 个时间统计卡计数。"""
-    row = (await db.execute(text(_SUMMARY_SQL))).mappings().one()
+    where = ["1=1"]
+    params: dict[str, Any] = {}
+    _apply_scope(where, params, scope, scope_params)
+    row = (
+        await db.execute(text(f"{_SUMMARY_SQL} WHERE {' AND '.join(where)}"), params)
+    ).mappings().one()
     return MemberFollowUpSummary(
         all=_to_int(row["all_count"]),
         today=_to_int(row["today_count"]),
@@ -350,6 +395,9 @@ async def import_follow_ups(
     account_id: int,
     data: bytes,
     filename: str,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> MemberFollowUpImportResult:
     """解析上传的 Excel，按手机号匹配会员后批量写入历史跟进记录。
 
@@ -397,9 +445,12 @@ async def import_follow_ups(
             errors.append(f"第 {excel_row} 行：缺少跟进内容")
             continue
 
+        lookup_where = ["phone = :phone", "status = 1"]
+        lookup_params: dict[str, Any] = {"phone": phone}
+        _apply_scope(lookup_where, lookup_params, scope, scope_params)
         user_id = await db.scalar(
-            text("SELECT id FROM users WHERE phone = :phone AND status = 1 LIMIT 1"),
-            {"phone": phone},
+            text(f"SELECT id FROM users WHERE {' AND '.join(lookup_where)} LIMIT 1"),
+            lookup_params,
         )
         if not user_id:
             failed += 1
@@ -592,14 +643,21 @@ def _sign_follow_up_media(item: MemberFollowUp, viewer: int) -> MemberFollowUp:
 
 
 async def get_member_follow_ups(
-    db: AsyncSession, member_id: int, page: int, page_size: int, *, viewer: int
+    db: AsyncSession,
+    member_id: int,
+    page: int,
+    page_size: int,
+    *,
+    viewer: int,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> MemberFollowUpPage:
     """查询单个会员的跟进记录（含图片/录音与跟进红娘称呼），倒序分页。
 
     ``viewer`` 为当前后台账号 id：附件 URL 按其重签，挂载层验签时校验该
-    账号仍处于启用状态。
+    账号仍处于启用状态。越权访问（会员不在数据范围内）统一 404，不泄露存在性。
     """
-    if not await db.scalar(text("SELECT 1 FROM users WHERE id = :id"), {"id": member_id}):
+    if not await _member_visible(db, member_id, scope, scope_params):
         raise HTTPException(404, detail="会员不存在")
     params: dict[str, Any] = {"uid": member_id, "limit": page_size, "offset": (page - 1) * page_size}
     rows = await db.execute(
@@ -627,14 +685,18 @@ async def create_follow_up_with_media(
     voice: UploadFile | None,
     voice_duration_sec: int | None,
     actor_id: int,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> MemberFollowUp:
     """新增跟进记录，支持文字 + 图片（转 webp，最多 9 张）+ 录音。
 
     ``matchmaker_id`` 为空时记录当前操作账号；提供时必须是启用中的后台账号。
     图片存 ``{upload_dir}/{member_id}/follow-up-img-{uuid}.webp``，录音存
     ``follow-up-voice-{uuid}.{ext}``；URL 形如 ``/storage/uploads/{member_id}/...``。
+    越权（会员不在数据范围内）返回 404，不落库（D-16）。
     """
-    if not await db.scalar(text("SELECT 1 FROM users WHERE id = :id"), {"id": member_id}):
+    if not await _member_visible(db, member_id, scope, scope_params):
         raise HTTPException(404, detail="会员不存在")
 
     normalized_content = (content or "").strip()

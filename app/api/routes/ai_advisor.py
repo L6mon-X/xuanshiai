@@ -30,8 +30,11 @@ async def create_advisor_session(
     body: AdvisorSessionCreate = Body(...),
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    idempotency_key: str = Header(
+        ..., alias="Idempotency-Key", min_length=8, max_length=128
+    ),
 ) -> AdvisorSessionResponse:
-    return await create_session(db, current.id, body)
+    return await create_session(db, current.id, body, idempotency_key=idempotency_key)
 
 
 @router.get("/sessions", response_model=AdvisorSessionPage, summary="查询情感军师会话")

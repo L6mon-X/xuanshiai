@@ -93,7 +93,8 @@ Content-Type: application/json
 - 输出边界：Provider 回复同样是不可信输入。服务端会在返回前拒绝冒充本人、代替
   本人作出关系同意/意愿/承诺、联系方式/住址、超过 600 字或命中内容过滤规则的文本；
   拒绝返回 422 并归还本次额度，客户端不得用本地资料代答。
-- 限流：按查看者 UTC 日计数，默认 `AI_DAILY_AVATAR_LIMIT=20`；模型、格式或保存
+- 限流：按查看者 UTC 日计数，默认 `AI_AVATAR_DAILY_LIMIT=20`；运行时配置字段为
+  `ai_avatar_daily_limit`，Redis key 前缀为 `ai-avatar`。模型、格式或保存
   前错误会归还本次额度。接口无写入业务记录，因此不需要 `Idempotency-Key`。
 - 状态与并发：答复无状态；授权/可见性任一变化会使后续请求重新 fail closed。缓存键
   含查看者、目标、投影版本和 privacy revision；当前授权会在使用缓存前复验。

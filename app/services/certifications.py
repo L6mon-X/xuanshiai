@@ -40,7 +40,7 @@ def _sign_cert_material(material: str | None, viewer: int, kind: str) -> str | N
     )
 
 
-async def list_certification_reviews(db: AsyncSession, *, page: int, page_size: int, viewer: int, kind: str | None = None, status: int | None = None, search: str | None = None) -> CertificationReviewPage:
+async def list_certification_reviews(db: AsyncSession, *, page: int, page_size: int, viewer: int, kind: str | None = None, status: int | None = None, search: str | None = None, scope: str | None = None, scope_params: dict[str, object] | None = None) -> CertificationReviewPage:
     """认证审核列表：UNION ALL 单条 SQL 完成
     跨 kind 过滤 + 全局排序 + 分页（排序键与原 Python 实现逐项一致：
     submitted_at NULL 置后、submitted_at、user_id，kind 为跨 kind 平局决胜）；
@@ -54,12 +54,14 @@ async def list_certification_reviews(db: AsyncSession, *, page: int, page_size: 
     if any(value not in fields for value in kinds):
         raise HTTPException(422, detail="不支持的认证类型")
 
-    filter_params: dict[str, object] = {}
+    filter_params: dict[str, object] = dict(scope_params or {})
     branches: list[str] = []
     count_branches: list[str] = []
     for current_kind in kinds:
         status_field, material_field, submitted_field, reviewed_field, reason_field = fields[current_kind]
         where = f"ua.{material_field} IS NOT NULL"
+        if scope:
+            where += f" AND ({scope})"
         if status is not None:
             where += f" AND ua.{status_field} = :status"
         if search:

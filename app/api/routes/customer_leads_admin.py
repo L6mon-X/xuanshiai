@@ -14,6 +14,23 @@ router = APIRouter(prefix="/admin/customer-leads")
 _XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
+def _lead_scope(current: CurrentMatchmakerAdmin, *, alias: str = "") -> tuple[str, dict[str, object]]:
+    """生成客源线索的四档作用域谓词（D-16）。
+
+    唯一实现在 `CurrentMatchmakerAdmin.scope_clause`，此处仅按资源列名调用：
+    ``matchmaker_id`` 为个人归属（SELF），``organization_id`` 为组织归属
+    （STORE / ORGANIZATION）。``alias`` 供 JOIN 查询（弃海列表）限定列前缀，
+    避免同名列歧义。
+    """
+    params: dict[str, object] = {}
+    scope = current.scope_clause(
+        params,
+        user_column=f"{alias}matchmaker_id",
+        organization_column=f"{alias}organization_id",
+    )
+    return scope, params
+
+
 @declare_permission("customer_lead.manage")
 @router.get("", response_model=CustomerLeadPage, summary="查询客源线索")
 async def lead_list(
@@ -24,10 +41,10 @@ async def lead_list(
     matchmaker_id: int | None = Query(None, ge=1),
     search: str | None = Query(None, max_length=64),
     intention_level: int | None = Query(None, ge=1, le=3, description="意向程度 1低 2中 3高"),
-    start_date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="录入时间起（含）"),
-    end_date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="录入时间止（含）"),
-    assign_start: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="分派时间起（含）"),
-    assign_end: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="分派时间止（含）"),
+    start_date: str | None = Query(None, max_length=10, description="录入时间起（含，兼容前端空字符串）"),
+    end_date: str | None = Query(None, max_length=10, description="录入时间止（含，兼容前端空字符串）"),
+    assign_start: str | None = Query(None, max_length=10, description="分派时间起（含，兼容前端空字符串）"),
+    assign_end: str | None = Query(None, max_length=10, description="分派时间止（含，兼容前端空字符串）"),
     promoter_id: int | None = Query(None, ge=1, description="推广红娘 users.id"),
     xiangqin_status: int | None = Query(None, ge=1, le=5, description="相亲状态 1公开相亲 2委托红娘 3完全私密 4关闭相亲 5已经脱单"),
     bind_mode: str | None = Query(None, pattern="^(bind|auto|custom)$", description="落户方式 bind绑定已有账号/auto自动生成账号/custom自定义创建"),
@@ -51,9 +68,12 @@ async def lead_list(
     db: AsyncSession = Depends(get_db),
 ) -> CustomerLeadPage:
     current.require("customer_lead.manage")
+    scope, scope_params = _lead_scope(current)
     return await list_leads(
         db, page, page_size, status, source, matchmaker_id, search,
         redaction_level_from_permissions(current.permissions),
+        scope=scope,
+        scope_params=scope_params,
         intention_level=intention_level,
         start_date=start_date,
         end_date=end_date,
@@ -85,21 +105,27 @@ async def lead_list(
 @router.post("", response_model=CustomerLead, status_code=201, summary="录入客源线索")
 async def lead_create(body: CustomerLeadCreate, current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> CustomerLead:
     current.require("customer_lead.manage")
-    return await create_lead(db, current.account.id, body, redaction_level_from_permissions(current.permissions))
+    params: dict[str, object] = {}
+    assignment_scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = users.id")
+    return await create_lead(db, current.account.id, body, redaction_level_from_permissions(current.permissions), assignment_scope=assignment_scope, assignment_scope_params=params)
 
 
 @declare_permission("customer_lead.manage")
 @router.get("/statistics", response_model=CustomerLeadStatistics, summary="查询客源线索统计")
 async def lead_stats(current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> CustomerLeadStatistics:
     current.require("customer_lead.manage")
-    return await lead_statistics(db)
+    # 统计只聚合 customer_lead 自身行，归属列在表上，用 _lead_scope 即可；
+    # 不需要 resource_assignment 的 EXISTS 包装。
+    scope, scope_params = _lead_scope(current)
+    return await lead_statistics(db, scope=scope, scope_params=scope_params)
 
 
 @declare_permission("customer_lead.manage")
 @router.get("/options", response_model=CustomerLeadOptions, summary="客源线索下拉字典")
 async def lead_dict(current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> CustomerLeadOptions:
     current.require("customer_lead.manage")
-    return await lead_options(db)
+    scope, scope_params = _lead_scope(current)
+    return await lead_options(db, scope=scope, scope_params=scope_params)
 
 
 @declare_permission("customer_lead.manage")
@@ -117,14 +143,16 @@ async def lead_import_template(current: CurrentMatchmakerAdmin = Depends(get_cur
 @router.get("/abandoned", response_model=list[CustomerLeadAbandonment], summary="查询弃海客源")
 async def abandoned_list(current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> list[CustomerLeadAbandonment]:
     current.require("customer_lead.manage")
-    return await list_abandonments(db, True)
+    scope, scope_params = _lead_scope(current, alias="cl.")
+    return await list_abandonments(db, True, scope=scope, scope_params=scope_params)
 
 
 @declare_permission("customer_lead.manage")
 @router.get("/abandonments", response_model=list[CustomerLeadAbandonment], summary="查询弃海记录")
 async def abandonment_list(current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> list[CustomerLeadAbandonment]:
     current.require("customer_lead.manage")
-    return await list_abandonments(db, False)
+    scope, scope_params = _lead_scope(current, alias="cl.")
+    return await list_abandonments(db, False, scope=scope, scope_params=scope_params)
 
 
 @declare_permission("customer_lead.manage")
@@ -142,6 +170,10 @@ async def lead_import(
 ) -> CustomerLeadImportSummary:
     current.require("customer_lead.manage")
     tags = [item.strip() for item in default_tags.split(",") if item.strip()]
+    # 导入可指定默认红娘/推广红娘，属写操作，必须先按四档数据范围校验目标用户
+    # （与 lead_create 同口径，D-16）。
+    params: dict[str, object] = {}
+    assignment_scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = users.id")
     return await import_leads_file(
         db,
         current.account.id,
@@ -153,6 +185,8 @@ async def lead_import(
         default_promoter_id=default_promoter_id,
         default_tags=tags,
         dup_mode=dup_mode,
+        assignment_scope=assignment_scope,
+        assignment_scope_params=params,
     )
 
 
@@ -165,6 +199,7 @@ async def lead_convert(
     db: AsyncSession = Depends(get_db),
 ) -> CustomerLeadConvertResult:
     current.require("customer_lead.manage")
+    scope, scope_params = _lead_scope(current)
     lead, user_id, replayed = await convert_lead(
         db,
         current.account.id,
@@ -172,6 +207,8 @@ async def lead_convert(
         current.account.matchmaker_user_id,
         lead_id,
         body,
+        scope=scope,
+        scope_params=scope_params,
     )
     return CustomerLeadConvertResult(lead=lead, user_id=user_id, replayed=replayed)
 
@@ -180,21 +217,24 @@ async def lead_convert(
 @router.get("/{lead_id}", response_model=CustomerLead, summary="查询客源线索详情")
 async def lead_detail(lead_id: int = Path(..., ge=1), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> CustomerLead:
     current.require("customer_lead.manage")
-    return await get_lead(db, lead_id, redaction_level_from_permissions(current.permissions))
+    scope, scope_params = _lead_scope(current)
+    return await get_lead(db, lead_id, redaction_level_from_permissions(current.permissions), scope=scope, scope_params=scope_params)
 
 
 @declare_permission("customer_lead.manage")
 @router.patch("/{lead_id}", response_model=CustomerLead, summary="修改客源线索")
 async def lead_update(lead_id: int = Path(..., ge=1), body: CustomerLeadUpdate = ..., current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> CustomerLead:
     current.require("customer_lead.manage")
-    return await update_lead(db, current.account.id, lead_id, body, redaction_level_from_permissions(current.permissions))
+    scope, scope_params = _lead_scope(current)
+    return await update_lead(db, current.account.id, lead_id, body, redaction_level_from_permissions(current.permissions), scope=scope, scope_params=scope_params)
 
 
 @declare_permission("customer_lead.manage")
 @router.get("/{lead_id}/follow-ups", response_model=list[CustomerLeadFollowUp], summary="查询线索跟进记录")
 async def follow_up_list(lead_id: int = Path(..., ge=1), page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=100), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> list[CustomerLeadFollowUp]:
     current.require("customer_lead.manage")
-    return await list_follow_ups(db, lead_id, page, page_size)
+    scope, scope_params = _lead_scope(current)
+    return await list_follow_ups(db, lead_id, page, page_size, scope=scope, scope_params=scope_params)
 
 
 @declare_permission("customer_lead.manage")
@@ -205,32 +245,38 @@ async def batch_import(
     db: AsyncSession = Depends(get_db),
 ) -> CustomerLeadBatchImportResult:
     current.require("customer_lead.manage")
-    return await batch_import_leads(db, current.account.id, request.rows, request.dup_mode)
+    params: dict[str, object] = {}
+    assignment_scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = users.id")
+    return await batch_import_leads(db, current.account.id, request.rows, request.dup_mode, assignment_scope=assignment_scope, assignment_scope_params=params)
 
 
 @declare_permission("customer_lead.manage")
 @router.post("/{lead_id}/follow-ups", response_model=CustomerLeadFollowUp, status_code=201, summary="新增线索跟进记录")
 async def follow_up_create(lead_id: int = Path(..., ge=1), body: CustomerLeadFollowUpCreate = ..., current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> CustomerLeadFollowUp:
     current.require("customer_lead.manage")
-    return await add_follow_up(db, current.account.id, lead_id, body)
+    scope, scope_params = _lead_scope(current)
+    return await add_follow_up(db, current.account.id, lead_id, body, scope=scope, scope_params=scope_params)
 
 
 @declare_permission("customer_lead.manage")
 @router.patch("/{lead_id}/assignment", response_model=CustomerLead, summary="分配客源线索")
 async def lead_assignment(lead_id: int = Path(..., ge=1), body: CustomerLeadAssignment = ..., current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> CustomerLead:
     current.require("customer_lead.manage")
-    return await assign_lead(db, current.account.id, lead_id, body, redaction_level_from_permissions(current.permissions))
+    scope, scope_params = _lead_scope(current)
+    return await assign_lead(db, current.account.id, lead_id, body, redaction_level_from_permissions(current.permissions), scope=scope, scope_params=scope_params)
 
 
 @declare_permission("customer_lead.manage")
 @router.post("/{lead_id}/abandon", response_model=CustomerLeadAbandonment, status_code=201, summary="放入弃海池")
 async def lead_abandon(lead_id: int = Path(..., ge=1), body: CustomerLeadAbandonRequest = ..., current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> CustomerLeadAbandonment:
     current.require("customer_lead.manage")
-    return await abandon_lead(db, current.account.id, lead_id, body.reason)
+    scope, scope_params = _lead_scope(current)
+    return await abandon_lead(db, current.account.id, lead_id, body.reason, scope=scope, scope_params=scope_params)
 
 
 @declare_permission("customer_lead.manage")
 @router.post("/{lead_id}/restore", response_model=CustomerLead, summary="从弃海池恢复")
 async def lead_restore(lead_id: int = Path(..., ge=1), body: CustomerLeadRestoreRequest = ..., current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> CustomerLead:
     current.require("customer_lead.manage")
-    return await restore_lead(db, current.account.id, lead_id, body.reason, redaction_level_from_permissions(current.permissions))
+    scope, scope_params = _lead_scope(current)
+    return await restore_lead(db, current.account.id, lead_id, body.reason, redaction_level_from_permissions(current.permissions), scope=scope, scope_params=scope_params)

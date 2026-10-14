@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 import secrets
 from datetime import UTC, datetime, timedelta
@@ -10,6 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.security import payment_callback_signature
 from app.schemas.membership import (
     CreateMembershipOrderRequest,
     MembershipHistoryItem,
@@ -18,6 +20,8 @@ from app.schemas.membership import (
     MembershipPackage,
     MembershipStatus,
 )
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_RIGHTS = {
     "apply_daily_limit": 3,
@@ -243,20 +247,81 @@ async def pay_order_with_balance(db: AsyncSession, user_id: int, order_no: str, 
     return MembershipOrderResponse(order_no=order["order_no"], package_code=order["code"], product_name=order["product_name"], amount=float(amount), pay_type=2, status=1, expire_at=order["expire_at"], payment_required=False)
 
 
-async def handle_wechat_callback(db: AsyncSession, body) -> None:
-    if settings.wechat_payment_mode == "real":
-        raise HTTPException(503, detail="WeChat payment callback verification is not configured")
+def _payment_sign_secret() -> str:
+    """Resolve the callback verification key (D-21).
 
-    async with db.begin():
-        result = await db.execute(text("SELECT po.id,po.user_id,po.amount,po.status,po.order_no,cp.code,cp.duration_days FROM payment_order po JOIN config_membership_package cp ON cp.code=po.product_type WHERE po.order_no=:order_no AND po.type=1 FOR UPDATE"), {"order_no": body.order_no})
-        order = result.mappings().first()
-        if not order:
-            raise HTTPException(404, detail="Membership order not found")
-        if order["status"] == 1:
-            return
-        if order["status"] != 0:
-            raise HTTPException(409, detail="Membership order cannot be paid")
-        start_at = datetime.now(UTC).replace(tzinfo=None)
-        end_at = start_at + timedelta(days=int(order["duration_days"]))
-        await db.execute(text("UPDATE payment_order SET status=1,pay_time=UTC_TIMESTAMP(),transaction_id=:transaction_id WHERE id=:id"), {"transaction_id": body.transaction_id, "id": order["id"]})
-        await db.execute(text("INSERT INTO user_membership (user_id,package_type,amount,order_no,start_at,end_at,status) VALUES (:user_id,:package_type,:amount,:order_no,:start_at,:end_at,1)"), {"user_id": order["user_id"], "package_type": order["code"], "amount": order["amount"], "order_no": order["order_no"], "start_at": start_at, "end_at": end_at})
+    ``real`` mode requires an explicitly configured key (fail-closed 503 when
+    missing); ``mock`` mode uses the local mock secret and is rejected outright
+    in production by settings validation.
+    """
+    if settings.wechat_payment_mode == "real":
+        key = settings.wechat_payment_sign_key
+        if key is None or not key.get_secret_value().strip():
+            raise HTTPException(503, detail="微信支付回调验签密钥未配置")
+        return key.get_secret_value()
+    return settings.wechat_payment_mock_secret
+
+
+def verify_payment_callback(body) -> None:
+    """Verify callback signature (D-21).
+
+    Both mock and real modes run through this single check so the fulfillment
+    pipeline is identical; only the key source differs.
+    """
+    if settings.wechat_payment_mode == "real":
+        raise HTTPException(503, detail="微信支付 v3 通知验签尚未实现，real 模式已关闭")
+    expected = payment_callback_signature(body.order_no, body.transaction_id, body.amount, _payment_sign_secret())
+    if not secrets.compare_digest(expected, body.signature):
+        raise HTTPException(401, detail="支付回调签名校验失败")
+
+
+async def _record_callback_anomaly(db: AsyncSession, body, reason: str) -> None:
+    """Persist a post-verification anomaly for reconciliation and alerting (D-21).
+
+    Only reached after the signature checks out, so it cannot be spammed by an
+    anonymous caller who lacks the signing key.
+    """
+    await db.execute(text("""INSERT INTO business_audit_log
+        (actor_user_id, action, resource_type, resource_id, reason)
+        VALUES (NULL, 'payment.callback.rejected', 'payment_order', NULL, :reason)"""), {"reason": reason[:255]})
+    await db.commit()
+
+
+async def handle_wechat_callback(db: AsyncSession, body) -> None:
+    """微信支付回调：验签 → 金额一致性 → 订单归属/状态 → 幂等履约（D-21）。
+
+    编排顺序（mock / real 共用）：
+    1. HMAC 验签失败 → 401，仅记日志（避免匿名写库放大攻击面）；
+    2. 订单不存在 → 404；金额与订单不一致 → 409；均落业务审计；
+    3. 已支付订单重复回调 → 直接返回（幂等）；
+    4. 非待支付状态 → 409。
+    """
+    try:
+        verify_payment_callback(body)
+    except HTTPException as exc:
+        logger.warning(
+            "wechat payment callback rejected: signature invalid order_no=%s", body.order_no
+        )
+        raise exc
+    try:
+        async with db.begin():
+            result = await db.execute(text("SELECT po.id,po.user_id,po.amount,po.type,po.status,po.order_no,cp.code,cp.duration_days FROM payment_order po JOIN config_membership_package cp ON cp.code=po.product_type WHERE po.order_no=:order_no AND po.type=1 FOR UPDATE"), {"order_no": body.order_no})
+            order = result.mappings().first()
+            if not order:
+                raise HTTPException(404, detail="Membership order not found")
+            if order["status"] == 1:
+                return
+            if order["status"] != 0:
+                raise HTTPException(409, detail="Membership order cannot be paid")
+            if settings.wechat_payment_mode == "real" and body.amount is None:
+                raise HTTPException(409, detail="支付回调缺少金额，无法完成一致性校验")
+            if body.amount is not None and Decimal(str(body.amount)) != Decimal(str(order["amount"])):
+                raise HTTPException(409, detail="支付回调金额与订单金额不一致")
+            start_at = datetime.now(UTC).replace(tzinfo=None)
+            end_at = start_at + timedelta(days=int(order["duration_days"]))
+            await db.execute(text("UPDATE payment_order SET status=1,pay_time=UTC_TIMESTAMP(),transaction_id=:transaction_id WHERE id=:id"), {"transaction_id": body.transaction_id, "id": order["id"]})
+            await db.execute(text("INSERT INTO user_membership (user_id,package_type,amount,order_no,start_at,end_at,status) VALUES (:user_id,:package_type,:amount,:order_no,:start_at,:end_at,1)"), {"user_id": order["user_id"], "package_type": order["code"], "amount": order["amount"], "order_no": order["order_no"], "start_at": start_at, "end_at": end_at})
+    except HTTPException as exc:
+        if exc.status_code in (404, 409):
+            await _record_callback_anomaly(db, body, f"{exc.status_code}:{exc.detail}")
+        raise

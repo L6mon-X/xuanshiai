@@ -82,8 +82,8 @@ async def _assert_public_avatar_reply_safe(db: AsyncSession, reply: str) -> None
 
 
 async def _consume_quota(viewer_user_id: int) -> str:
-    key = daily_quota_key("ai:avatar", viewer_user_id)
-    if not await consume_daily(key, settings.ai_daily_avatar_limit):
+    key = daily_quota_key("ai-avatar", viewer_user_id)
+    if not await consume_daily(key, settings.ai_avatar_daily_limit):
         raise HTTPException(429, detail="今日 AI 分身使用次数已用完")
     return key
 

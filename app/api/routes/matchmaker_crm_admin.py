@@ -7,9 +7,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies import CurrentMatchmakerAdmin, get_current_matchmaker_admin
+from app.api.dependencies import CurrentMatchmakerAdmin, get_current_matchmaker_admin, require_sensitive_operation
 from app.core.sensitive_fields import mask_contact, redaction_level_from_permissions
 from app.db.session import get_db
+from app.services.sensitive_operations import (
+    abort_sensitive_operation,
+    begin_sensitive_operation,
+    finish_sensitive_operation,
+)
 from app.schemas.matchmaker_crm_admin import MatchRecordCreate, MatchRecordItem, MatchRecordPage, MatchRecordResponse, MemberAssignmentResponse, MemberAssignmentUpdate, MemberDetail, MemberListItem, MemberPage, MemberStatistics, MemberStatusResponse, MemberStatusUpdate
 from app.schemas.admin import CertificationReviewRequest, RealnameReviewRequest
 from app.services.auth import list_realname_reviews, review_realname
@@ -212,10 +217,10 @@ async def members(
     activity_signup: bool | None = Query(None),
     wechat_added: int | None = Query(None, ge=0, le=2, description="加微信结果 0未添加 1已加上 2没加上"),
     behavior_type: str | None = Query(None, pattern="^(viewed|viewed_by|favorited|boosted|boosted_by|gift_sent|gift_received)$"),
-    created_start: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
-    created_end: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
-    assigned_start: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
-    assigned_end: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    created_start: str | None = Query(None, max_length=10, description="建档时间起（含，兼容前端空字符串）"),
+    created_end: str | None = Query(None, max_length=10, description="建档时间止（含，兼容前端空字符串）"),
+    assigned_start: str | None = Query(None, max_length=10, description="分派时间起（含，兼容前端空字符串）"),
+    assigned_end: str | None = Query(None, max_length=10, description="分派时间止（含，兼容前端空字符串）"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> MemberPage:
@@ -272,18 +277,43 @@ async def member_statistics(current: CurrentMatchmakerAdmin = Depends(get_curren
 @router.post("/members/batch-status")
 async def batch_member_status(
     body: MemberBatchStatus,
+    idempotency_key: str = Depends(require_sensitive_operation),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     ids = list(dict.fromkeys(body.member_ids))
+    # D-9：批量写操作必须幂等（同键重放不重复改状态）。
+    reservation, replayed = await begin_sensitive_operation(
+        db,
+        actor_id=current.account.id,
+        operation="matchmaker.member.batch_status",
+        idempotency_key=idempotency_key,
+        payload={"body": body.model_dump(mode="json")},
+    )
+    if replayed is not None:
+        return replayed
     placeholders = ",".join(f":id_{index}" for index in range(len(ids)))
     params = {f"id_{index}": value for index, value in enumerate(ids)}
     params.update({"status": body.status, "actor": current.account.id, "reason": body.reason})
     # 批量写操作必须同口径收口，否则可越过单条改状态的越权防线。
     scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = users.id")
-    result = await db.execute(text(f"UPDATE users SET status=:status, updated_at=UTC_TIMESTAMP() WHERE id IN ({placeholders}) AND ({scope})"), params)
-    await db.commit()
-    return {"updated": int(result.rowcount or 0), "status": body.status}
+    try:
+        eligible_rows = await db.execute(text(f"SELECT id FROM users WHERE id IN ({placeholders}) AND ({scope}) FOR UPDATE"), params)
+        updated_ids = [int(row[0]) for row in eligible_rows.all()]
+        await db.execute(text(f"UPDATE users SET status=:status, updated_at=UTC_TIMESTAMP() WHERE id IN ({placeholders}) AND ({scope})"), params)
+        await db.commit()
+    except Exception:
+        await abort_sensitive_operation(db, reservation)
+        raise
+    updated_set = set(updated_ids)
+    response = {
+        "updated": len(updated_set),
+        "updated_ids": sorted(updated_set),
+        "rejected_ids": [member_id for member_id in ids if member_id not in updated_set],
+        "status": body.status,
+    }
+    await finish_sensitive_operation(db, reservation, response)
+    return response
 
 
 @router.get("/members/auth")
@@ -323,7 +353,9 @@ async def member_realname_reviews(
 ) -> dict:
     if status is not None and status not in (1, 4):
         raise HTTPException(422, detail="实名认证状态只支持审核中或人工复核")
-    return (await list_realname_reviews(db, page=page, page_size=page_size, status=status, search=search)).model_dump()
+    params: dict[str, object] = {}
+    scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = u.id")
+    return (await list_realname_reviews(db, page=page, page_size=page_size, status=status, search=search, scope=scope, scope_params=params)).model_dump()
 
 
 @router.patch("/members/{member_id}/realname/review")
@@ -333,6 +365,8 @@ async def review_member_realname(
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    from app.api.routes.member_records_admin import _ensure_member
+    await _ensure_member(db, member_id, current)
     return (await review_realname(db, member_id, body.status, body.reason, current.account.id)).model_dump()
 
 
@@ -346,7 +380,9 @@ async def member_certification_reviews(
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    return (await list_certification_reviews(db, page=page, page_size=page_size, viewer=current.account.id, kind=kind, status=status, search=search)).model_dump()
+    params: dict[str, object] = {}
+    scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = u.id")
+    return (await list_certification_reviews(db, page=page, page_size=page_size, viewer=current.account.id, kind=kind, status=status, search=search, scope=scope, scope_params=params)).model_dump()
 
 
 @router.patch("/members/{member_id}/certifications/{kind}/review")
@@ -357,6 +393,8 @@ async def review_member_certification(
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    from app.api.routes.member_records_admin import _ensure_member
+    await _ensure_member(db, member_id, current)
     return (await review_certification(db, member_id, kind, body)).model_dump()
 
 
@@ -419,13 +457,15 @@ async def member_detail(member_id: int = Path(..., ge=1), current: CurrentMatchm
     return MemberDetail(**data)
 
 
-@router.patch("/members/{member_id}/assignment", response_model=MemberAssignmentResponse, summary="修改会员服务红娘")
+@router.patch("/members/{member_id}/assignment", response_model=MemberAssignmentResponse, summary="修改会员服务红娘（幂等 + 二次确认）")
 async def member_assignment(
     member_id: int = Path(..., ge=1),
     body: MemberAssignmentUpdate = ...,
+    idempotency_key: str = Depends(require_sensitive_operation),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> MemberAssignmentResponse:
+    # 先做作用域守卫（越权直接 404，且不写任何幂等/业务行），再做幂等预占。
     guard_params: dict[str, object] = {"id": member_id}
     scope = current.scope_exists_clause(guard_params, correlation="scope_assignment.user_id = u.id")
     if not (await db.execute(text(f"SELECT u.id FROM users u WHERE u.id = :id AND ({scope})"), guard_params)).scalar():
@@ -433,24 +473,40 @@ async def member_assignment(
     if body.matchmaker_id is not None and not (await db.execute(text("""SELECT 1 FROM user_role
         WHERE user_id = :id AND role_code = 'service_matchmaker' AND status = 1 LIMIT 1"""), {"id": body.matchmaker_id})).scalar():
         raise HTTPException(422, detail="指定用户不是有效的服务红娘")
-    await db.execute(text("""UPDATE resource_assignment SET status = 2,
-        ended_at = UTC_TIMESTAMP(), end_reason = 'reassigned'
-        WHERE user_id = :user_id AND status = 1"""), {"user_id": member_id})
-    if body.matchmaker_id is not None:
-        await db.execute(text("""INSERT INTO resource_assignment
-            (user_id, organization_id, matchmaker_id, source, assigned_by)
-            VALUES (:user_id, :organization_id, :matchmaker_id, 'manual', :assigned_by)"""), {
-            "user_id": member_id, "organization_id": current.account.organization_id,
-            "matchmaker_id": body.matchmaker_id, "assigned_by": current.account.id,
+    # D-9：改派是写归属的高影响操作，纳入统一幂等 + 二次确认。
+    reservation, replayed = await begin_sensitive_operation(
+        db,
+        actor_id=current.account.id,
+        operation="matchmaker.member.reassign",
+        idempotency_key=idempotency_key,
+        payload={"member_id": member_id, "body": body.model_dump(mode="json")},
+    )
+    if replayed is not None:
+        return MemberAssignmentResponse(**replayed)
+    try:
+        await db.execute(text("""UPDATE resource_assignment SET status = 2,
+            ended_at = UTC_TIMESTAMP(), end_reason = 'reassigned'
+            WHERE user_id = :user_id AND status = 1"""), {"user_id": member_id})
+        if body.matchmaker_id is not None:
+            await db.execute(text("""INSERT INTO resource_assignment
+                (user_id, organization_id, matchmaker_id, source, assigned_by)
+                VALUES (:user_id, :organization_id, :matchmaker_id, 'manual', :assigned_by)"""), {
+                "user_id": member_id, "organization_id": current.account.organization_id,
+                "matchmaker_id": body.matchmaker_id, "assigned_by": current.account.id,
+            })
+        await db.execute(text("""INSERT INTO business_audit_log
+            (actor_user_id, action, resource_type, resource_id, reason)
+            VALUES (:actor, 'member.assignment.update', 'user', :user_id, :reason)"""), {
+            "actor": current.account.id, "user_id": member_id,
+            "reason": f"matchmaker_id={body.matchmaker_id}",
         })
-    await db.execute(text("""INSERT INTO business_audit_log
-        (actor_user_id, action, resource_type, resource_id, reason)
-        VALUES (:actor, 'member.assignment.update', 'user', :user_id, :reason)"""), {
-        "actor": current.account.id, "user_id": member_id,
-        "reason": f"matchmaker_id={body.matchmaker_id}",
-    })
-    await db.commit()
-    return MemberAssignmentResponse(user_id=member_id, matchmaker_id=body.matchmaker_id)
+        await db.commit()
+    except Exception:
+        await abort_sensitive_operation(db, reservation)
+        raise
+    result = MemberAssignmentResponse(user_id=member_id, matchmaker_id=body.matchmaker_id)
+    await finish_sensitive_operation(db, reservation, result.model_dump(mode="json"))
+    return result
 
 
 @router.patch("/members/{member_id}/status", response_model=MemberStatusResponse, summary="修改会员状态")

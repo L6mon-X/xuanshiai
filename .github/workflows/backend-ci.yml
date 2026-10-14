@@ -74,6 +74,8 @@ jobs:
           tests/test_voice_cleanup.py -q
 
   # 审计整改（脱敏 / 数据范围 / 事务 / 报名软删除）：全部为不依赖 DB 的单元契约。
+  # 2026-10-14 补齐 PR #49 新增的 7 个测试文件（此前未挂任何 job，CI 里从不执行，
+  # 导致「新增回归测试」实际没有门禁）；同批补齐了配套的 Ruff 文件列表。
   admin-scope-unit:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -103,6 +105,10 @@ jobs:
           tests/test_finance_commission_anchor.py tests/test_matchmaker_crm_data_scope.py
           tests/test_member_admin_scope_params.py tests/test_message_admin_redaction.py
           tests/test_sensitive_operations.py tests/test_wechat_field_redaction.py
+          tests/test_admin_data_scope_d16.py tests/test_admin_date_query_contract.py
+          tests/test_legacy_matchmaker_scope_d10.py tests/test_payment_callback_verification.py
+          tests/test_permission_code_seed_coverage.py tests/test_realname_face_unification.py
+          tests/test_refund_membership_revoke.py
       - name: Admin scope, redaction and soft delete contracts
         env:
           UPLOAD_DIR: ${{ runner.temp }}/xuanshiai-admin-uploads
@@ -117,7 +123,14 @@ jobs:
           tests/test_crm_reassign_org_ownership.py
           tests/test_finance_commission_anchor.py
           tests/test_activity_signup_soft_delete.py
-          tests/test_matchmaker_crm_data_scope.py -q
+          tests/test_matchmaker_crm_data_scope.py
+          tests/test_admin_data_scope_d16.py
+          tests/test_admin_date_query_contract.py
+          tests/test_legacy_matchmaker_scope_d10.py
+          tests/test_payment_callback_verification.py
+          tests/test_permission_code_seed_coverage.py
+          tests/test_realname_face_unification.py
+          tests/test_refund_membership_revoke.py -q
 
   # 画像会话契约（master 活动槽抢占与复用、会话状态终态守卫、journey/start 响应
   # 字段）：全部为不依赖 DB 的内存假库单元契约。test_master_session.py 与

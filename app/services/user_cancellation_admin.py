@@ -15,12 +15,14 @@ from typing import Any
 
 from fastapi import HTTPException
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas.user_cancellation_admin import (
     UserCancellationItem,
     UserCancellationPage,
     UserCancellationStatistics,
+    UserCancellationSelfResponse,
 )
 from app.services.revisions import RevisionKind, increment_revision_and_enqueue
 
@@ -240,3 +242,77 @@ async def cancellation_statistics(db: AsyncSession) -> UserCancellationStatistic
         approved_today=approved_today,
         cancelled_today=cancelled_today,
     )
+
+
+def _self_item(row: Any) -> UserCancellationSelfResponse:
+    return UserCancellationSelfResponse.model_validate(dict(row))
+
+
+async def get_current_user_cancellation(
+    db: AsyncSession, user_id: int
+) -> UserCancellationSelfResponse | None:
+    row = (
+        await db.execute(
+            text(
+                "SELECT id, status, reason, created_at, updated_at, reviewed_at, review_note "
+                "FROM user_cancellation WHERE user_id = :user_id ORDER BY id DESC LIMIT 1"
+            ),
+            {"user_id": user_id},
+        )
+    ).mappings().first()
+    return _self_item(row) if row else None
+
+
+async def request_user_cancellation(
+    db: AsyncSession, user_id: int, reason: str | None, requested_ip: str | None
+) -> UserCancellationSelfResponse:
+    existing = await get_current_user_cancellation(db, user_id)
+    if existing and existing.status == "pending":
+        return existing
+    try:
+        result = await db.execute(
+            text(
+                "INSERT INTO user_cancellation (user_id, requested_ip, reason, status) "
+                "VALUES (:user_id, :requested_ip, :reason, 'pending')"
+            ),
+            {"user_id": user_id, "requested_ip": requested_ip, "reason": reason},
+        )
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        existing = await get_current_user_cancellation(db, user_id)
+        if existing and existing.status == "pending":
+            return existing
+        raise HTTPException(409, detail="注销申请状态冲突，请稍后重试") from exc
+    row = (
+        await db.execute(
+            text(
+                "SELECT id, status, reason, created_at, updated_at, reviewed_at, review_note "
+                "FROM user_cancellation WHERE id = :id"
+            ),
+            {"id": int(result.lastrowid)},
+        )
+    ).mappings().one()
+    return _self_item(row)
+
+
+async def cancel_user_cancellation(
+    db: AsyncSession, user_id: int
+) -> UserCancellationSelfResponse:
+    result = await db.execute(
+        text(
+            "UPDATE user_cancellation SET status = 'cancelled', reviewed_at = UTC_TIMESTAMP(), "
+            "updated_at = UTC_TIMESTAMP() WHERE user_id = :user_id AND status = 'pending'"
+        ),
+        {"user_id": user_id},
+    )
+    if not result.rowcount:
+        current = await get_current_user_cancellation(db, user_id)
+        if current and current.status == "cancelled":
+            return current
+        raise HTTPException(409, detail="当前没有可取消的注销申请")
+    await db.commit()
+    current = await get_current_user_cancellation(db, user_id)
+    if current is None:
+        raise HTTPException(503, detail="注销申请状态暂时不可用")
+    return current

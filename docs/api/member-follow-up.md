@@ -44,6 +44,18 @@
 
 > 「是否由系统自动生成的记录」当前 `member_follow_up` **无标记列**，故 `note` 字段**恒为 `null`**（前端不展示该行提示）。
 
+### 1.3 数据范围（D-16 收口，2026-10-12 批次 B）
+
+本模块**全部后台端点**已接入 `get_current_matchmaker_admin` 的**四档数据范围**（`ALL / SELF / STORE / ORGANIZATION`）：
+
+| 资源 | 归属锚点 | 关联 |
+|---|---|---|
+| 跟进记录（全览 / 汇总） | `member_follow_up.user_id` | `scope_assignment.user_id = f.user_id` |
+| 会员校验（单会员跟进 / 导入选人） | `users.id` | `scope_assignment.user_id = u.id` |
+| 行为统计 | `users.id` | `scope_assignment.user_id = u.id` |
+
+`_SUMMARY_SQL` 已改为 `FROM member_follow_up f` 以支持别名谓词；越权访问的会员一律按「不存在」处理（404）。写路径（新增跟进 / 批量导入）先带 scope 校验会员可见性再落库。完整口径见 `后台数据范围与敏感操作-2026-10-04.md` §1.3.1。
+
 ---
 
 ## 2. 跟进全览

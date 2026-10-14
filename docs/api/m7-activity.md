@@ -31,10 +31,11 @@
 |---|---|---|
 | `/admin/activities/*` | `community.activity.read` | `community.activity.manage` |
 | `/admin/activity-signups/*` | `community.activity.read` | `community.activity.manage` |
-| `/admin/mutual-activities/*` | `community.mutual.read` | `community.mutual.manage` |
+| `/admin/mutual-activities/*` | `community.activity.read` | `community.activity.manage` |
+| `/admin/mutual-records/*` | `community.activity.read` | `community.activity.manage` |
 | 配置域 `tools_active` / `tools_active_alliance` | `platform.config.read` | `platform.config.write` |
 
-`/mutual-activities` 不含 `/activities` 子串，路径映射互不干扰。
+`/mutual-activities` 与 `/mutual-records` 均命中 `/mutual-` 关键词映射，与 `/activities`、`/activity-signups` 同口径（`community.activity.read/manage`），无权限冲突。
 
 ### 1.3 响应与异常
 
@@ -241,13 +242,17 @@
 
 ---
 
-## 五、互选记录
+## 五、互选记录（`/api/v1/admin/mutual-records`）
 
 独立表 `mutual_selection_pick` 存储每条 `pick` 记录（`from_user_id` 选 `to_user_id`）。
 
-### 5.1 列表 `GET /api/v1/admin/matchmaker/mutual-picks`
+> D-7 修正：本节早期写为 `/api/v1/admin/matchmaker/mutual-picks`，与代码不符。
+> 实际路由前缀为 `record_router = APIRouter(prefix="/admin/mutual-records")`
+> （`app/api/routes/mutual_selection_admin.py:21`）。以下以代码为准。
 
-参数：`activity_id` / `from_user_id` / `to_user_id` / `mutual_only`（true 只看互选成功） / `page` / `page_size`。
+### 5.1 列表 `GET /api/v1/admin/mutual-records`
+
+参数：`activity_id` / `actor_id` / `keyword` / `result`（`success|fail|none`） / `page` / `page_size`。
 
 | 字段 | 说明 |
 |---|---|
@@ -258,12 +263,16 @@
 | `is_mutual` | 是否互选成功 |
 | `created_at` | |
 
-### 5.2 删除 `DELETE /api/v1/admin/matchmaker/mutual-picks/{pick_id}` → 204
+### 5.2 筛选下拉字典 `GET /api/v1/admin/mutual-records/options`
 
-### 5.3 标记超级喜欢 `POST /api/v1/admin/matchmaker/mutual-picks/{pick_id}/super`
-专供运营手动置顶互选记录，写入审计。
+### 5.3 删除 / 标记超级喜欢 —— 未实现
 
-> 注：互选记录页面走 `/active-signupmanager` 红娘管理账号可创建 pick，后端对 C 端走 `/api/v1/matchmaker/mutual-picks`。两个接口共用 `mutual_selection_pick` 表。
+> 早期文档声明的 `DELETE /api/v1/admin/matchmaker/mutual-picks/{pick_id}` 与
+> `POST .../mutual-picks/{pick_id}/super` 在代码中**不存在对应路由**（`mutual_selection_admin.py`
+> 的 `record_router` 仅注册 `GET ""` 与 `GET /options` 两条）。如需运营侧删除/置顶，请另立需求。
+
+> 注：C 端**没有** `/api/v1/matchmaker/mutual-picks` 路由（全仓无 `mutual-picks` 命中）；
+> 运营侧互选记录一律走本节 `/admin/mutual-records`。
 
 ---
 

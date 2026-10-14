@@ -194,9 +194,14 @@ async def admin_list_matchmaker_applications(
     application_type: str | None = None,
     status: int | None = None,
     search: str | None = None,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     where = ["1 = 1"]
-    params: dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size}
+    params: dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size, **(scope_params or {})}
+    if scope:
+        # D-10：按后台账号的四档数据范围收口（申请人须在账号作用域内的资源归属中）。
+        where.append(f"({scope})")
     if application_type:
         where.append("application_type = :application_type")
         params["application_type"] = application_type
@@ -222,10 +227,19 @@ async def admin_list_matchmaker_applications(
     }
 
 
-async def admin_get_matchmaker_application(db: AsyncSession, application_id: int) -> dict[str, Any]:
-    row = (await db.execute(text("""SELECT id, application_type, status, real_name, phone, intro,
+async def admin_get_matchmaker_application(
+    db: AsyncSession,
+    application_id: int,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    clause = f" AND ({scope})" if scope else ""
+    row = (await db.execute(text(f"""SELECT id, application_type, status, real_name, phone, intro,
         cert_images, application_details, fail_reason, created_at, reviewed_at
-        FROM user_matchmaker_apply WHERE id = :id"""), {"id": application_id})).mappings().first()
+        FROM user_matchmaker_apply WHERE id = :id{clause}"""),
+        {**(scope_params or {}), "id": application_id})).mappings().first()
     if not row:
+        # 越权访问按「不存在」处理（404），避免通过状态码差异枚举他组织申请。
         raise HTTPException(404, detail="申请不存在")
     return application_response(row)
