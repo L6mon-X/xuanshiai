@@ -123,7 +123,9 @@ def _item_to_row(item: ContentItem) -> dict[str, Any]:
 # 域特有筛选项（落地页 type、内容单页 qrcode_type、落地页/自由表单 xiangqin_status）。
 # 这些字段按 admin_content_item 的设计存放在 extra_json，因此筛选走 JSON_EXTRACT；
 # 键名与接口参数同名，前端写入 extra 时需要用相同的键。
-EXTRA_FILTER_KEYS: frozenset[str] = frozenset({"type", "qrcode_type", "xiangqin_status"})
+EXTRA_FILTER_KEYS: frozenset[str] = frozenset(
+    {"type", "qrcode_type", "xiangqin_status", "good_news_status", "matchmaker_id"}
+)
 
 # 搜索方式（search_type）：仅在域内定义过的键才会生效，未定义时退回 title/subtitle/extra_json
 # 全字段模糊匹配（历史行为）。键名取自各域 extra 的写入约定。
@@ -168,7 +170,10 @@ async def list_items(
     for key, value in (extra_filters or {}).items():
         # 键名来自服务端白名单，不拼接用户输入；取值走绑定参数。
         if key in EXTRA_FILTER_KEYS and value:
-            conditions.append(f"JSON_UNQUOTE(JSON_EXTRACT(extra_json, '$.{key}')) = :extra_{key}")
+            if key in {"good_news_status", "matchmaker_id"} and domain != "good_news":
+                continue
+            json_key = "status" if key == "good_news_status" else key
+            conditions.append(f"JSON_UNQUOTE(JSON_EXTRACT(extra_json, '$.{json_key}')) = :extra_{key}")
             params[f"extra_{key}"] = value
     where = " AND ".join(conditions)
 

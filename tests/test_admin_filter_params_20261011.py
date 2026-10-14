@@ -453,6 +453,37 @@ async def test_content_extra_filter_keys_are_whitelisted() -> None:
 
 
 @pytest.mark.asyncio
+async def test_good_news_filters_map_to_safe_extra_json_keys() -> None:
+    db = StubDB([StubResult(scalar=0), StubResult(rows=[])])
+    await admin_content.list_items(
+        db,
+        "good_news",
+        1,
+        20,
+        None,
+        None,
+        {"good_news_status": "牵手成功", "matchmaker_id": "12"},
+    )
+    sql = db.sql()
+    assert "$.status" in sql
+    assert "$.matchmaker_id" in sql
+    assert db.statements[0][1]["extra_good_news_status"] == "牵手成功"
+    assert db.statements[0][1]["extra_matchmaker_id"] == "12"
+
+    other_domain = StubDB([StubResult(scalar=0), StubResult(rows=[])])
+    await admin_content.list_items(
+        other_domain,
+        "activity",
+        1,
+        20,
+        None,
+        None,
+        {"good_news_status": "牵手成功", "matchmaker_id": "12"},
+    )
+    assert "extra_json" not in other_domain.sql()
+
+
+@pytest.mark.asyncio
 async def test_content_search_type_maps_to_extra_key() -> None:
     db = StubDB([StubResult(scalar=0), StubResult(rows=[])])
     await admin_content.list_items(db, "free_pay_order", 1, 20, "FP20261011", None, None, "order_no")
