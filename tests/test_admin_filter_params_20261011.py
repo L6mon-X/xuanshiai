@@ -484,6 +484,24 @@ async def test_good_news_filters_map_to_safe_extra_json_keys() -> None:
 
 
 @pytest.mark.asyncio
+async def test_group_signup_filters_are_structured_and_nickname_is_partial() -> None:
+    db = StubDB([StubResult(scalar=0), StubResult(rows=[])])
+    await admin_content.list_items(
+        db,
+        "group_signup",
+        1,
+        20,
+        None,
+        None,
+        {"group_id": "3", "pay": "paid", "nick": "小雅"},
+    )
+    sql = db.sql()
+    assert "$.group_id" in sql and "$.pay" in sql and "$.nick" in sql
+    assert "LIKE :extra_nick" in sql
+    assert db.statements[0][1]["extra_nick"] == "%小雅%"
+
+
+@pytest.mark.asyncio
 async def test_content_search_type_maps_to_extra_key() -> None:
     db = StubDB([StubResult(scalar=0), StubResult(rows=[])])
     await admin_content.list_items(db, "free_pay_order", 1, 20, "FP20261011", None, None, "order_no")

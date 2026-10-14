@@ -124,7 +124,16 @@ def _item_to_row(item: ContentItem) -> dict[str, Any]:
 # 这些字段按 admin_content_item 的设计存放在 extra_json，因此筛选走 JSON_EXTRACT；
 # 键名与接口参数同名，前端写入 extra 时需要用相同的键。
 EXTRA_FILTER_KEYS: frozenset[str] = frozenset(
-    {"type", "qrcode_type", "xiangqin_status", "good_news_status", "matchmaker_id"}
+    {
+        "type",
+        "qrcode_type",
+        "xiangqin_status",
+        "good_news_status",
+        "matchmaker_id",
+        "group_id",
+        "pay",
+        "nick",
+    }
 )
 
 # 搜索方式（search_type）：仅在域内定义过的键才会生效，未定义时退回 title/subtitle/extra_json
@@ -172,9 +181,12 @@ async def list_items(
         if key in EXTRA_FILTER_KEYS and value:
             if key in {"good_news_status", "matchmaker_id"} and domain != "good_news":
                 continue
+            if key in {"group_id", "pay", "nick"} and domain != "group_signup":
+                continue
             json_key = "status" if key == "good_news_status" else key
-            conditions.append(f"JSON_UNQUOTE(JSON_EXTRACT(extra_json, '$.{json_key}')) = :extra_{key}")
-            params[f"extra_{key}"] = value
+            operator = "LIKE" if key == "nick" else "="
+            conditions.append(f"JSON_UNQUOTE(JSON_EXTRACT(extra_json, '$.{json_key}')) {operator} :extra_{key}")
+            params[f"extra_{key}"] = f"%{value}%" if key == "nick" else value
     where = " AND ".join(conditions)
 
     total = int(
