@@ -114,8 +114,8 @@ async def lead_create(body: CustomerLeadCreate, current: CurrentMatchmakerAdmin 
 @router.get("/statistics", response_model=CustomerLeadStatistics, summary="查询客源线索统计")
 async def lead_stats(current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> CustomerLeadStatistics:
     current.require("customer_lead.manage")
-    params: dict[str, object] = {}
-    assignment_scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = users.id")
+    # 统计只聚合 customer_lead 自身行，归属列在表上，用 _lead_scope 即可；
+    # 不需要 resource_assignment 的 EXISTS 包装。
     scope, scope_params = _lead_scope(current)
     return await lead_statistics(db, scope=scope, scope_params=scope_params)
 
@@ -170,6 +170,10 @@ async def lead_import(
 ) -> CustomerLeadImportSummary:
     current.require("customer_lead.manage")
     tags = [item.strip() for item in default_tags.split(",") if item.strip()]
+    # 导入可指定默认红娘/推广红娘，属写操作，必须先按四档数据范围校验目标用户
+    # （与 lead_create 同口径，D-16）。
+    params: dict[str, object] = {}
+    assignment_scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = users.id")
     return await import_leads_file(
         db,
         current.account.id,

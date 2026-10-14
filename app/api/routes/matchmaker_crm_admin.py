@@ -300,7 +300,7 @@ async def batch_member_status(
     try:
         eligible_rows = await db.execute(text(f"SELECT id FROM users WHERE id IN ({placeholders}) AND ({scope}) FOR UPDATE"), params)
         updated_ids = [int(row[0]) for row in eligible_rows.all()]
-        result = await db.execute(text(f"UPDATE users SET status=:status, updated_at=UTC_TIMESTAMP() WHERE id IN ({placeholders}) AND ({scope})"), params)
+        await db.execute(text(f"UPDATE users SET status=:status, updated_at=UTC_TIMESTAMP() WHERE id IN ({placeholders}) AND ({scope})"), params)
         await db.commit()
     except Exception:
         await abort_sensitive_operation(db, reservation)
