@@ -23,6 +23,7 @@ from app.api.routes import (
     ai_avatar,
     auth,
     ai,
+    compatibility,
     ai_advisor,
     app_version,
     certifications,
@@ -94,6 +95,7 @@ api_router.include_router(live_host.router, tags=["直播相亲"])
 api_router.include_router(live_admin.router, tags=["直播相亲管理"])
 api_router.include_router(live_ws.router, tags=["直播相亲"])
 api_router.include_router(health.router, tags=["系统"])
+api_router.include_router(compatibility.router, tags=["系统"])
 api_router.include_router(app_version.router, tags=["系统"])
 api_router.include_router(auth.router, tags=["账号与认证"])
 api_router.include_router(ai.router, tags=["AI能力"])
