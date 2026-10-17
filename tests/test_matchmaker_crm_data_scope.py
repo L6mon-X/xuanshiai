@@ -400,7 +400,36 @@ async def test_member_auth_list_is_scoped() -> None:
 @pytest.mark.asyncio
 async def test_match_records_are_scoped_by_from_user() -> None:
     db = StubDB([StubResult(rows=[]), StubResult(scalar=0)])
-    page = await crm.match_records(page=1, page_size=20, search=None, current=_admin("SELF"), db=db)
+    page = await crm.match_records(
+        page=1, page_size=20, search=None, date_from=None, date_to=None,
+        matchmaker_id=None, current=_admin("SELF"), db=db,
+    )
     assert page.total == 0
     assert "scope_assignment.user_id = a.from_user_id" in db.statements[0][0]
     assert "scope_matchmaker_user_id" in db.statements[1][0]
+
+
+@pytest.mark.asyncio
+async def test_match_records_filter_by_date_and_matchmaker() -> None:
+    """牵线记录页的日期区间与红娘筛选必须落到真实列上。
+
+    回归点：`ra`（归属红娘派生表）原先只加在 SELECT 段，COUNT 查询没有它，
+    一旦按红娘筛选，计数 SQL 就会因缺 join 直接报错。
+    """
+    db = StubDB([StubResult(rows=[]), StubResult(scalar=0)])
+    await crm.match_records(
+        page=1, page_size=20, search=None,
+        date_from="2026-01-01", date_to="2026-12-31", matchmaker_id=5,
+        current=_admin("SELF"), db=db,
+    )
+    rows_sql, rows_params = db.statements[0]
+    count_sql, count_params = db.statements[1]
+    assert "a.created_at >= :date_from" in rows_sql
+    # 结束日按「含当日」处理，补到次日 00:00 前
+    assert "a.created_at < DATE_ADD(:date_to, INTERVAL 1 DAY)" in rows_sql
+    assert "ra.matchmaker_id = :matchmaker_id" in rows_sql
+    assert rows_params["date_from"] == "2026-01-01" and rows_params["matchmaker_id"] == 5
+    # COUNT 必须同样带 join，否则按红娘筛选时计数报错
+    assert "resource_assignment" in count_sql
+    assert "ra.matchmaker_id = :matchmaker_id" in count_sql
+    assert count_params["matchmaker_id"] == 5

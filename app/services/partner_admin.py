@@ -408,6 +408,10 @@ async def update_partner(
 ) -> PartnerStaffDetail:
     existing = await get_partner(db, team_id, scope=scope, scope_params=scope_params)
     values = body.model_dump(exclude_unset=True)
+    # API 字段名与表列名并非一一对应：请求体用 team_name，partner_team 的列叫 name。
+    # 直接按字段名拼列名会生成 `team_name` = ...，MySQL 报 1054 Unknown column。
+    if "team_name" in values:
+        values["name"] = values.pop("team_name")
     if values:
         assignments = ", ".join(f"`{key}` = :{key}" for key in values)
         update_where = ["id = :id"]

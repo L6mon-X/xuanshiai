@@ -45,6 +45,9 @@ async def match_records(
     page: int = Query(1, ge=1, le=1000),
     page_size: int = Query(20, ge=1, le=100),
     search: str | None = Query(None, max_length=64),
+    date_from: str | None = Query(None, max_length=10, description="牵线时间起 YYYY-MM-DD（含）"),
+    date_to: str | None = Query(None, max_length=10, description="牵线时间止 YYYY-MM-DD（含）"),
+    matchmaker_id: int | None = Query(None, ge=1, description="按发起方会员归属的服务红娘筛选"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> MatchRecordPage:
@@ -53,15 +56,31 @@ async def match_records(
     if search:
         where.append("(fu.nickname LIKE CONCAT('%', :search, '%') OR tu.nickname LIKE CONCAT('%', :search, '%') OR fu.phone LIKE CONCAT('%', :search, '%') OR tu.phone LIKE CONCAT('%', :search, '%'))")
         params["search"] = search
+    if date_from:
+        where.append("a.created_at >= :date_from")
+        params["date_from"] = date_from
+    if date_to:
+        # 结束日按「含当日」处理，补到次日 00:00 前
+        where.append("a.created_at < DATE_ADD(:date_to, INTERVAL 1 DAY)")
+        params["date_to"] = date_to
+    if matchmaker_id is not None:
+        # 归属红娘取自 resource_assignment 的生效记录（派生表 ra，见下方 base）
+        where.append("ra.matchmaker_id = :matchmaker_id")
+        params["matchmaker_id"] = matchmaker_id
     # 牵线记录会把双方昵称与手机号一并下发，按「发起方（from）会员归属」收口。
     where.append(current.scope_exists_clause(params, correlation="scope_assignment.user_id = a.from_user_id"))
     clause = " AND ".join(where)
-    base = "FROM match_apply a JOIN users fu ON fu.id = a.from_user_id JOIN users tu ON tu.id = a.to_user_id"
+    # ra 必须放进 base：它既要供 SELECT 展示归属红娘，也要供 WHERE 按红娘筛选，
+    # 且 COUNT 查询复用同一个 base，否则按红娘筛选时计数会因缺 join 报错。
+    base = (
+        "FROM match_apply a JOIN users fu ON fu.id = a.from_user_id JOIN users tu ON tu.id = a.to_user_id"
+        " LEFT JOIN (SELECT user_id, MAX(matchmaker_id) AS matchmaker_id FROM resource_assignment"
+        " WHERE status = 1 GROUP BY user_id) ra ON ra.user_id = a.from_user_id"
+    )
     rows = await db.execute(text(f"""SELECT a.id, a.from_user_id, a.to_user_id, a.status, a.created_at, a.responded_at,
         fu.nickname AS from_nickname, tu.nickname AS to_nickname,
         ra.matchmaker_id
-        {base} LEFT JOIN (SELECT user_id, MAX(matchmaker_id) AS matchmaker_id FROM resource_assignment WHERE status = 1 GROUP BY user_id) ra ON ra.user_id = a.from_user_id
-        WHERE {clause} ORDER BY a.created_at DESC, a.id DESC LIMIT :limit OFFSET :offset"""), params)
+        {base} WHERE {clause} ORDER BY a.created_at DESC, a.id DESC LIMIT :limit OFFSET :offset"""), params)
     total = int((await db.execute(text(f"SELECT COUNT(*) {base} WHERE {clause}"), {k: v for k, v in params.items() if k not in ("limit", "offset")})).scalar() or 0)
     return MatchRecordPage(items=[MatchRecordItem(**dict(row)) for row in rows.mappings().all()], page=page, page_size=page_size, total=total, has_more=page * page_size < total)
 

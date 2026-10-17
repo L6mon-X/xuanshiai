@@ -425,9 +425,21 @@
 
 ### 4.1 列表 `GET /api/v1/admin/matchmaker/match-records`
 
-**query**：`page`(1-1000) / `page_size`(1-100) / `search`(≤64，男方或女方昵称/手机 LIKE)。
+**query**：
+
+| 参数 | 类型 | 校验 | 含义 |
+| --- | --- | --- | --- |
+| `page` | int | 1-1000 | 页码 |
+| `page_size` | int | 1-100 | 每页条数 |
+| `search` | string | ≤64 | 男方或女方昵称/手机模糊匹配 |
+| `date_from` | string | ≤10，`YYYY-MM-DD` | 牵线时间起（含当日） |
+| `date_to` | string | ≤10，`YYYY-MM-DD` | 牵线时间止（含当日，内部补到次日 00:00 前） |
+| `matchmaker_id` | int | ≥1 | 按发起方会员归属的服务红娘筛选 |
 
 **返回** `MatchRecordPage`，item 字段：`id` `from_user_id` `to_user_id` `status` `created_at` `responded_at` `from_nickname` `to_nickname` `matchmaker_id`（数据源 `match_apply` + `users`×2，红娘由 `resource_assignment` 派生）。
+
+> 实现注意：`matchmaker_id` 的筛选条件引用派生表 `ra`，该 join 必须同时出现在列表与计数 SQL 中；
+> 早期只加在 SELECT 段，导致按红娘筛选时计数查询缺 join 直接报错。
 
 ### 4.2 新建 `POST /api/v1/admin/matchmaker/match-records`
 
