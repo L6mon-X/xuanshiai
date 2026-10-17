@@ -36,23 +36,25 @@ async def find_conflicting_lead_id(
     exclude_lead_id: int | None = None,
 ) -> int | None:
     """返回占用该联系方式的有效线索 id；phone/wechat 均为空或无冲突时返回 None。"""
-    conditions: list[str] = []
+    contact_conditions: list[str] = []
     params: dict[str, Any] = {}
     if normalize_contact(phone):
-        conditions.append("phone = :conflict_phone")
+        contact_conditions.append("phone = :conflict_phone")
         params["conflict_phone"] = normalize_contact(phone)
     if normalize_contact(wechat):
-        conditions.append("wechat = :conflict_wechat")
+        contact_conditions.append("wechat = :conflict_wechat")
         params["conflict_wechat"] = normalize_contact(wechat)
-    if not conditions:
+    if not contact_conditions:
         return None
+    # 自身排除必须与联系方式组做 AND；并进 OR 组会让条件恒真，导致任何编辑都误判冲突。
+    exclude_clause = ""
     if exclude_lead_id is not None:
-        conditions.append("id != :conflict_exclude_id")
+        exclude_clause = " AND id != :conflict_exclude_id"
         params["conflict_exclude_id"] = exclude_lead_id
     exclusion = ", ".join(f"'{status}'" for status in LEAD_INACTIVE_STATUSES)
     query = (
         f"SELECT id FROM customer_lead WHERE status NOT IN ({exclusion}) "
-        f"AND ({' OR '.join(conditions)}) ORDER BY id LIMIT 1"
+        f"AND ({' OR '.join(contact_conditions)}){exclude_clause} ORDER BY id LIMIT 1"
     )
     return await db.scalar(text(query), params)
 

@@ -161,10 +161,6 @@ def build_member_filter(
         if column("users", "wechat_added"):
             where.append("u.wechat_added = :wechat_added")
             params["wechat_added"] = values["wechat_added"]
-    if values.get("level"):
-        if column("users", "level"):
-            where.append("u.level = :level")
-            params["level"] = values["level"]
     for flag in ("promoted", "newcomer", "activity_signup"):
         value = values.get(flag)
         if value is True and column("users", flag):
@@ -221,6 +217,38 @@ def build_member_filter(
     income = split_values(values.get("income"))
     if income:
         where.append(f"p.income IN ({_placeholders('income', income, params)})")
+    # 界面把收入做成区间下拉（3000以下 / 3000-8000 / 8000以上），精确匹配选不中任何值。
+    if values.get("income_min") is not None:
+        where.append("p.income >= :income_min")
+        params["income_min"] = values["income_min"]
+    if values.get("income_max") is not None:
+        where.append("p.income <= :income_max")
+        params["income_max"] = values["income_max"]
+    # 级别 / 房子 / 民族 / 车子在界面上都标注为「多选」，取值与其它多选维度同口径
+    # （英文逗号分隔 + 绑定占位符），只受理单值会让多选控件选第二个值就查不到。
+    level = split_values(values.get("level"))
+    if level and column("users", "level"):
+        where.append(f"u.level IN ({_placeholders('level', level, params)})")
+    house = split_values(values.get("house"))
+    if house and column("user_profile", "house"):
+        where.append(f"p.house IN ({_placeholders('house', house, params)})")
+    ethnicity = split_values(values.get("ethnicity"))
+    if ethnicity and column("user_profile", "ethnicity"):
+        where.append(f"p.ethnicity IN ({_placeholders('ethnicity', ethnicity, params)})")
+    car = split_values(values.get("car"))
+    if car and column("user_profile", "car"):
+        where.append(f"p.car IN ({_placeholders('car', car, params)})")
+
+    # ---- 单值维度（与 _member_query 的 SELECT 展示列一一对应，否则「看得见筛不了」） ----
+    if values.get("intention_level") is not None:
+        if column("user_profile", "intention_level"):
+            where.append("p.intention_level = :intention_level")
+            params["intention_level"] = values["intention_level"]
+    for key in ("constellation", "zodiac"):
+        if values.get(key):
+            if column("user_profile", key):
+                where.append(f"p.{key} = :{key}")
+                params[key] = values[key]
 
     # ---- 文本维度 ----
     for key, column_name in (("residence", "residence"), ("hometown", "hometown")):
@@ -235,10 +263,6 @@ def build_member_filter(
         if column("user_profile", "religion"):
             where.append("p.religion = :religion")
             params["religion"] = values["religion"]
-    if values.get("car"):
-        if column("user_profile", "car"):
-            where.append("p.car = :car")
-            params["car"] = values["car"]
 
     # ---- 标签（JSON 数组，任一命中） ----
     tags = split_values(values.get("tags"))

@@ -103,8 +103,14 @@ def _row_to_item(row: Any) -> ContentItem:
 
 
 def _item_to_row(item: ContentItem) -> dict[str, Any]:
-    """拍平：extra 字段提升到行顶层，供管理端表格列直接读取。"""
-    row: dict[str, Any] = {
+    """列表行：保持 extra 嵌套结构，业务字段不拍平到顶层。
+
+    早期实现把 extra 的键提升到行顶层，会覆盖同名行级列（如 good_news 的
+    extra.status 是中文状态文案，会把整型 status 列覆盖成字符串），且与
+    docs/api/m8-operational-tools.md 约定的响应结构不符。管理端各页面均按
+    item.extra 读取业务字段。
+    """
+    return {
         "id": item.id,
         "domain": item.domain,
         "title": item.title,
@@ -113,11 +119,10 @@ def _item_to_row(item: ContentItem) -> dict[str, Any]:
         "amount": item.amount,
         "status": item.status,
         "sort": item.sort,
+        "extra": item.extra,
         "created_at": item.created_at.isoformat() if item.created_at else None,
         "updated_at": item.updated_at.isoformat() if item.updated_at else None,
     }
-    row.update(item.extra)
-    return row
 
 
 # 域特有筛选项（落地页 type、内容单页 qrcode_type、落地页/自由表单 xiangqin_status）。

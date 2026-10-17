@@ -49,7 +49,10 @@
 | `marriage_plan` | string/null | 最多 64 字符 | 结婚计划 |
 | `match_status` | integer/null | `1-5` | 交友展示状态：公开相亲、委托红娘、完全私密、停止相亲、已经脱单 |
 | `tags` | array/object/null | 标签数组或分类标签对象 | 会员标签 |
-| `auth_status` / `intention_level` | integer/null | `auth_status` 为 0-3；`intention_level` 为 1-3 | 审核状态、客户意向 |
+| `auth_status` / `intention_level` | integer/null | `auth_status` 为 0-3；`intention_level` 为 1-3（1低 2中 3高） | 审核状态、客户意向 |
+| `wechat` | string/null | 最多 128 字符 | 微信号；提交掩码值（含 `***`）会被丢弃，不会覆盖真实号 |
+| `wechat_added` | integer/null | `0` 未添加、`1` 已加上、`2` 没加上 | 加微信结果 |
+| `phone` | string/null | 正则 `^1\d{10}$` | 手机号。登录标识，全局唯一；与其它会员重复返回 409 |
 
 **请求示例**：
 
@@ -64,6 +67,8 @@ Content-Type: application/json
 **返回示例**：返回会员摘要 `{id,nickname,phone_masked,gender,status,is_vip,vip_end_at,matchmaker_id,created_at,updated_at}`。敏感手机号仅返回脱敏值；实名姓名和身份证不属于该接口可编辑字段。
 
 **业务规则与错误**：操作在事务中完成并记录审计日志；资料写入 `users`、`user_profile`、`user_auth` 和 `user_privacy` 的既有归属表，重复提交同一值无副作用。会员不存在返回 404，枚举、日期、长度或范围非法返回 422，未登录返回 401，数据库缺少兼容字段返回 503。旧客户端不传新增字段即可继续使用。
+
+**手机号改号的额外约束**：`phone` 是会员登录标识与唯一键。服务端先排除会员自身再查重，命中其它会员返回 `409 {"detail":"手机号已被其他会员占用"}`；格式不合 `^1\d{10}$` 返回 422。改号不迁移登录态，会员需重新登录。
 
 ### PATCH `/admin/matchmaker/members/{member_id}/assignment`
 
@@ -95,6 +100,7 @@ Content-Type: application/json
 
 ## 变更记录
 
+- 2026-10-17：`PATCH /admin/matchmaker/members/{member_id}` 新增 `phone`（11 位、全局唯一、撞号 409）与 `wechat_added`（0/1/2）。此前会员抽屉里手机号与微信号的「修改」、以及「加上了？」下拉都没有可写字段，是死控件。
 - 2026-10-11（D-9 敏感操作）：`PATCH /admin/matchmaker/members/{member_id}/assignment`（改派）与 `POST /admin/matchmaker/members/batch-status`（批量改状态）纳入统一敏感操作，强制 `Idempotency-Key` + `confirm=true`，同键重放不重复执行；越权在幂等预占之前拦截。
 - 2026-10-04（D-4 数据范围下沉）：会员列表、统计、详情、改派、改状态、批量改状态、会员实名列表与牵线记录全部叠加后台数据范围（`ALL/SELF/STORE/ORGANIZATION` 四档，未绑定组织 fail-closed 返回 0 条）。越权访问按 `404 会员不存在` 返回；越权写操作不落库。四档定义见 [`docs/api/后台数据范围与敏感操作-2026-10-04.md`](后台数据范围与敏感操作-2026-10-04.md)。
 - 2026-10-04（附带修复）：会员列表原以非聚合子查询关联 `resource_assignment`，一人多单会产生重复行并虚增 `total`，已改为按 `user_id` 聚合；会员统计的 VIP 子查询原统计全平台 VIP，已同口径收口。

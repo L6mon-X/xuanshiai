@@ -363,6 +363,79 @@ Authorization: Bearer <token>
 
 ## 4. 媒体写操作
 
+### 4.0 `POST /api/v1/admin/members/{user_id}/media`
+
+#### 基本信息
+
+- 用途：后台为会员新增一条媒体（相册照片 / 视频 / 头像）。此前只有改/删，抽屉里
+  「照片视频」的上传按钮没有可调用的创建入口，属于死按钮。
+- 权限：`matchmaker.member.manage`。
+- 成功状态：`201 Created`。
+- 数据范围：按当前账号的 `resource_assignment` 作用域校验，越权会员统一返回 404「会员不存在」，
+  避免用本接口探测他人会员 ID。
+
+#### 请求参数
+
+| 参数 | 位置 | 类型 | 必填 | 校验 | 含义 |
+| --- | --- | --- | --- | --- | --- |
+| `user_id` | path | int | 是 | ≥1 | 会员用户 ID |
+| `media_type` | body | string | 否 | `avatar`/`photo`/`video` | 媒体类型，默认 `photo` |
+| `file_url` | body | string | 是 | 1–512 字符 | 文件地址；先用 `POST /admin/common/upload` 拿到 |
+| `thumbnail_url` | body | string\|null | 否 | ≤512 | 缩略图地址 |
+| `mime_type` | body | string\|null | 否 | ≤128 | MIME 类型，如 `image/jpeg` |
+| `file_size` | body | int\|null | 否 | ≥0 | 文件字节数 |
+| `duration_seconds` | body | int\|null | 否 | 0–3600 | 视频时长（秒），仅视频有意义 |
+
+#### 请求示例
+
+```json
+{ "media_type": "photo", "file_url": "/uploads/photo/2026/10/a.jpg",
+  "mime_type": "image/jpeg", "file_size": 204800 }
+```
+
+非法示例（`media_type` 越界）：
+
+```json
+{ "media_type": "gif", "file_url": "/uploads/a.gif" }
+```
+
+返回 `422`。
+
+#### 返回参数
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `id` | int | 新建媒体记录主键 |
+| `user_id` | int | 所属会员 |
+| `media_type` | string | 媒体类型 |
+| `file_url` | string | 文件地址 |
+| `review_status` | int | 固定 `0` 待审核 |
+
+#### 返回示例
+
+```json
+{ "id": 9001, "user_id": 5, "media_type": "photo",
+  "file_url": "/uploads/photo/2026/10/a.jpg", "review_status": 0 }
+```
+
+#### 使用方法与业务规则
+
+1. 先 `POST /api/v1/admin/common/upload` 上传文件拿到 URL，再调用本接口落库；
+   接口只接收地址，不做文件转存。
+2. 新记录一律 `review_status=0` 待审核，由审核流程决定是否通过，后台不能直接建成「已通过」。
+3. `media_type=avatar` 时同时回写 `users.avatar`，并把该会员此前的头像记录软删除
+   （`deleted_at` 置位），保证「当前头像」只有一条。
+4. 每次创建写一条审计 `member.media.create`，`after_json` 记录会员、类型与地址。
+
+#### 错误
+
+| 状态码 | 场景 | 前端处理建议 |
+| --- | --- | --- |
+| 401 | 未登录 / 令牌过期 | 跳登录页 |
+| 403 | 缺少 `matchmaker.member.manage` | 提示无权限 |
+| 404 | 会员不存在，或不在当前账号数据范围内 | 提示「会员不存在」 |
+| 422 | `file_url` 为空 / 超长，`media_type` 越界，`file_size` 为负，`duration_seconds` 超 3600 | 就地提示校验信息 |
+
 ### 4.1 `PATCH /api/v1/admin/members/media/{media_id}`
 
 #### 基本信息
@@ -526,6 +599,7 @@ Authorization: Bearer <token>
 | PUT | `/api/v1/admin/members/media/intros/{user_id}` | matchmaker.member.manage |
 | GET | `/api/v1/admin/members/media` | matchmaker.member.read |
 | GET | `/api/v1/admin/members/media/{user_id}/history` | matchmaker.member.read |
+| POST | `/api/v1/admin/members/{user_id}/media` | matchmaker.member.manage |
 | PATCH | `/api/v1/admin/members/media/{media_id}` | matchmaker.member.manage |
 | PUT | `/api/v1/admin/members/media/{media_id}` | matchmaker.member.manage |
 | DELETE | `/api/v1/admin/members/media/{media_id}` | matchmaker.member.manage |
@@ -539,3 +613,4 @@ Authorization: Bearer <token>
 | 日期 | 变更 | 变更前 | 变更后 | 影响范围 |
 |---|---|---|---|---|
 | 2026-10-11 | 搜索方式补全 | `GET /admin/members/media` 与 `GET /admin/members/media/intros` 的 `keyword` 固定匹配「昵称 + 手机（+ 会员编号）」 | 两个接口新增 `search_type`（`phone` 按手机搜 / `code` 按会员编号搜 / `nickname` 按昵称搜）；不传时沿用原有的综合匹配 | 非破坏性；完整契约见 `docs/api/后台筛选参数补全-2026-10-11.md` |
+| 2026-10-17 | 补后台新增媒体入口 | 媒体只有 `PATCH`/`PUT`/`DELETE`，没有创建路由，会员抽屉里「照片视频」的上传按钮无接口可调 | 新增 `POST /admin/members/{user_id}/media`，新记录待审；`media_type=avatar` 时回写 `users.avatar` 并软删旧头像记录 | 新端点，不影响既有接口 |

@@ -207,6 +207,35 @@ async def match_quota(
     return MemberMatchQuotaResponse(**dict(row))
 
 
+@router.get("/{member_id}/match-quota/history", summary="会员牵线次数的变更历史")
+async def match_quota_history(
+    member_id: int = Path(..., ge=1, description="会员 ID"),
+    page: int = _paging()[0],
+    page_size: int = _paging()[1],
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """读取该会员牵线次数的后台调整记录。
+
+    数据源是写次数时留下的审计 ``member.match_quota.update``；此前界面上「历史明细」
+    没有任何可查接口，属于死按钮。
+    """
+    current.require("matchmaker.member.read")
+    await _ensure_member(db, member_id, current)
+    return await _page(
+        db,
+        """SELECT id, actor_user_id, action, reason, before_json, after_json, created_at
+        FROM business_audit_log
+        WHERE resource_type = 'matchmaker_service_quota' AND resource_id = :id
+          AND action = 'member.match_quota.update'
+        ORDER BY id DESC LIMIT :limit OFFSET :offset""",
+        """SELECT COUNT(*) FROM business_audit_log
+        WHERE resource_type = 'matchmaker_service_quota' AND resource_id = :id
+          AND action = 'member.match_quota.update'""",
+        member_id, page, page_size,
+    )
+
+
 @router.patch("/{member_id}/match-quota", response_model=MemberMatchQuotaResponse, summary="修改会员剩余牵线次数")
 async def update_match_quota(
     member_id: int = Path(..., ge=1, description="会员 ID"),

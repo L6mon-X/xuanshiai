@@ -26,6 +26,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.services.media_access import MEDIA_CATEGORY_FOLLOW_UP, sign_media_url
 from app.schemas.member_follow_up_admin import (
+    MemberCallRecordListPage,
+    MemberCallRecordRow,
     MemberFollowUp,
     MemberFollowUpImportResult,
     MemberFollowUpListPage,
@@ -40,6 +42,19 @@ _METHOD_LABELS: dict[str, str] = {
     "WECHAT": "微信",
     "VISIT": "面谈",
     "OTHER": "其他",
+}
+
+# 通话方向库内枚举 -> 中文
+_CALL_DIRECTION_LABELS: dict[str, str] = {
+    "INBOUND": "呼入",
+    "OUTBOUND": "呼出",
+}
+
+# 通话状态库内枚举 -> 中文
+_CALL_STATUS_LABELS: dict[str, str] = {
+    "COMPLETED": "已完成",
+    "MISSED": "未接听",
+    "FAILED": "失败",
 }
 
 # 导入模板表头（顺序即模板列顺序）
@@ -167,6 +182,27 @@ def _method_label(method: str | None) -> str:
     return _METHOD_LABELS.get(str(method or "").upper(), "其他")
 
 
+def _call_row(payload: dict[str, Any]) -> MemberCallRecordRow:
+    """数据库行 -> 通话记录列表行。"""
+    direction = str(payload.get("direction") or "OUTBOUND").upper()
+    status = str(payload.get("status") or "COMPLETED").upper()
+    duration = payload.get("duration_seconds")
+    return MemberCallRecordRow(
+        id=int(payload["id"]),
+        user_id=int(payload["user_id"]),
+        member_code=payload.get("member_code") or f"G{int(payload['user_id']):06d}",
+        nickname=payload.get("nickname"),
+        matchmaker_name=payload.get("matchmaker_name") or "admin",
+        direction=direction,
+        direction_label=_CALL_DIRECTION_LABELS.get(direction, "呼出"),
+        status=status,
+        status_label=_CALL_STATUS_LABELS.get(status, "已完成"),
+        duration_seconds=int(duration) if duration is not None else None,
+        remark=payload.get("remark"),
+        created_at=payload.get("created_at"),
+    )
+
+
 def _row(payload: dict[str, Any]) -> MemberFollowUpRow:
     """数据库行 -> 列表行。"""
     method = str(payload.get("method") or "OTHER")
@@ -194,6 +230,7 @@ async def list_follow_ups(
     page_size: int,
     keyword: str | None = None,
     intention_level: int | None = None,
+    wechat_added: int | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
     *,
@@ -215,6 +252,9 @@ async def list_follow_ups(
     if intention_level is not None:
         conditions.append("p.intention_level = :intention_level")
         params["intention_level"] = intention_level
+    if wechat_added is not None:
+        conditions.append("u.wechat_added = :wechat_added")
+        params["wechat_added"] = wechat_added
     if start_date:
         conditions.append("f.created_at >= :start_date")
         params["start_date"] = start_date
@@ -235,6 +275,72 @@ async def list_follow_ups(
     )
     return MemberFollowUpListPage(
         items=[_row(dict(row)) for row in rows.mappings().all()],
+        page=page,
+        page_size=page_size,
+        total=total,
+        has_more=page * page_size < total,
+    )
+
+
+_CALL_LIST_BODY = """
+SELECT c.id, c.user_id, c.direction, c.status, c.duration_seconds, c.remark, c.created_at,
+       u.nickname,
+       CONCAT('G', LPAD(u.id, 6, '0')) AS member_code,
+       COALESCE(acc.display_name, mk.nickname, 'admin') AS matchmaker_name
+FROM member_call_record c
+JOIN users u ON u.id = c.user_id
+LEFT JOIN matchmaker_admin_account acc ON acc.id = c.created_by
+LEFT JOIN users mk ON mk.id = c.created_by
+"""
+
+_CALL_COUNT_BODY = """
+FROM member_call_record c
+JOIN users u ON u.id = c.user_id
+"""
+
+
+async def list_call_records(
+    db: AsyncSession,
+    page: int,
+    page_size: int,
+    keyword: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> MemberCallRecordListPage:
+    """通话记录跨会员分页列表（跟进全览页签）。keyword 匹配昵称/手机号/实名/会员编号。"""
+    conditions = ["1=1"]
+    params: dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size}
+    _apply_scope(conditions, params, scope, scope_params)
+    if keyword:
+        conditions.append(
+            "(u.nickname LIKE CONCAT('%', :keyword, '%')"
+            " OR u.phone LIKE CONCAT('%', :keyword, '%')"
+            " OR CONCAT('G', LPAD(u.id, 6, '0')) LIKE CONCAT('%', :keyword, '%'))"
+        )
+        params["keyword"] = keyword
+    if start_date:
+        conditions.append("c.created_at >= :start_date")
+        params["start_date"] = start_date
+    if end_date:
+        conditions.append("c.created_at < DATE_ADD(:end_date, INTERVAL 1 DAY)")
+        params["end_date"] = end_date
+    where = " AND ".join(conditions)
+    rows = await db.execute(
+        text(
+            f"{_CALL_LIST_BODY} WHERE {where}"
+            " ORDER BY c.created_at DESC, c.id DESC LIMIT :limit OFFSET :offset"
+        ),
+        params,
+    )
+    count_params = {k: v for k, v in params.items() if k not in ("limit", "offset")}
+    total = _to_int(
+        (await db.scalar(text(f"SELECT COUNT(*) {_CALL_COUNT_BODY} WHERE {where}"), count_params))
+    )
+    return MemberCallRecordListPage(
+        items=[_call_row(dict(row)) for row in rows.mappings().all()],
         page=page,
         page_size=page_size,
         total=total,

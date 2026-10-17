@@ -15,6 +15,16 @@ router = APIRouter(prefix="/admin/members")
 _MEMBER_CORRELATION = "scope_assignment.user_id = users.id"
 _USER_CORRELATION = "scope_assignment.user_id = u.id"
 
+# 线上VIP 列表的表头排序白名单：值全部由服务端写死，不拼接用户输入。
+_VIP_SORT_SQL = {
+    # 默认：未过期在前，按到期日升序（快过期的先看）
+    "expire_soon": "m.end_at IS NULL, m.end_at ASC, m.id DESC",
+    "opened_at": "m.start_at DESC, m.id DESC",
+    "expire_latest": "m.end_at IS NULL, m.end_at DESC, m.id DESC",
+    "amount": "m.amount DESC, m.id DESC",
+    "member": "u.id DESC",
+}
+
 
 def _scope(current: CurrentMatchmakerAdmin, correlation: str) -> tuple[str, dict[str, object]]:
     """生成四档数据范围谓词；唯一判定在 `CurrentMatchmakerAdmin.scope_clause`（D-16）。"""
@@ -30,7 +40,7 @@ async def update_member_vip(member_id: int = Path(..., ge=1), body: AdminVipUpda
 
 
 @router.get("/vip", response_model=AdminVipPage, summary="查询 VIP 会员")
-async def vip_members(page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=100), expiring_within_days: int | None = Query(None, ge=1, le=3650), search: str | None = Query(None, max_length=64), vip_level: str | None = Query(None, max_length=64), open_method: str | None = Query(None, pattern="^(admin|self)$"), open_nature: str | None = Query(None, pattern="^(first|renew|upgrade|again)$"), vip_status: str | None = Query(None, pattern="^(active|expired)$"), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> AdminVipPage:
+async def vip_members(page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=100), expiring_within_days: int | None = Query(None, ge=1, le=3650), search: str | None = Query(None, max_length=64), vip_level: str | None = Query(None, max_length=64), open_method: str | None = Query(None, pattern="^(admin|self)$"), open_nature: str | None = Query(None, pattern="^(first|renew|upgrade|again)$"), vip_status: str | None = Query(None, pattern="^(active|expired)$"), sort_by: str | None = Query(None, pattern="^(expire_soon|opened_at|expire_latest|amount|member)$", description="表头排序：expire_soon 最快到期 / opened_at 开通时间 / expire_latest 最晚到期 / amount 支付金额 / member 会员ID"), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> AdminVipPage:
     current.require("matchmaker.member.read")
     where = ["m.status <> 3"]
     params: dict = {"limit": page_size, "offset": (page - 1) * page_size}
@@ -62,7 +72,8 @@ async def vip_members(page: int = Query(1, ge=1, le=1000), page_size: int = Quer
         where.append(f"({nature}) = :open_nature")
         params["open_nature"] = open_nature
     clause = " AND ".join(where)
-    rows = await db.execute(text(f"SELECT m.id membership_id, m.user_id, u.nickname, u.phone, m.package_type, m.amount, m.order_no, m.start_at, m.end_at, m.status, {method} open_method, {nature} open_nature, 0 line_total, 0 line_remaining {base} WHERE {clause} ORDER BY m.end_at IS NULL, m.end_at ASC, m.id DESC LIMIT :limit OFFSET :offset"), params)
+    order = _VIP_SORT_SQL.get(str(sort_by), _VIP_SORT_SQL["expire_soon"])
+    rows = await db.execute(text(f"SELECT m.id membership_id, m.user_id, u.nickname, u.phone, m.package_type, m.amount, m.order_no, m.start_at, m.end_at, m.status, {method} open_method, {nature} open_nature, 0 line_total, 0 line_remaining {base} WHERE {clause} ORDER BY {order} LIMIT :limit OFFSET :offset"), params)
     count = await db.execute(text(f"SELECT COUNT(*) {base} WHERE {clause}"), {k: v for k, v in params.items() if k not in ("limit", "offset")})
     total = int(count.scalar() or 0)
     return AdminVipPage(items=[AdminVipItem(**dict(row)) for row in rows.mappings().all()], page=page, page_size=page_size, total=total, has_more=page * page_size < total)

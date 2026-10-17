@@ -134,9 +134,26 @@ class MemberStatistics(BaseModel):
     follow_due_today: int = 0
 
 
+class MemberOption(BaseModel):
+    """下拉字典项：value 为接口筛选值，label 为界面展示文案。"""
+
+    value: str
+    label: str
+
+
+class MemberOptions(BaseModel):
+    """会员资料页筛选下拉的可选项。
+
+    门店/推广红娘在原界面里是写死的空下拉（选项未填充），这里按当前账号的数据
+    范围动态给值，避免「看得见选不了」。
+    """
+
+    organizations: list[MemberOption] = []
+    promoters: list[MemberOption] = []
+
+
 class MemberAssignmentUpdate(BaseModel):
     matchmaker_id: int | None = Field(default=None, ge=1, description="服务红娘用户 ID；传 null 表示取消分派")
-
 
 class MemberAssignmentResponse(BaseModel):
     user_id: int

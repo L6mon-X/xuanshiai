@@ -17,6 +17,7 @@ from app.schemas.member_media_admin import (
     MemberIntroItem,
     MemberIntroPage,
     MemberIntroUpdate,
+    MemberMediaCreate,
     MemberMediaPage,
     MemberMediaReplace,
     MemberMediaReview,
@@ -214,6 +215,23 @@ async def member_met_members(
 
 
 # ─── 媒体（头像/照片/视频） ─────────────────────────────────────
+
+
+@router.post("/{user_id}/media", response_model=dict, status_code=201, summary="后台为会员新增媒体")
+async def media_create(
+    user_id: int = Path(..., ge=1),
+    body: MemberMediaCreate = ...,
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    current.require("matchmaker.member.manage")
+    scope_params: dict[str, object] = {}
+    scope = current.scope_exists_clause(
+        scope_params, correlation="scope_assignment.user_id = u.id",
+    )
+    return await service.create_media(
+        db, user_id, body, current.account.id, scope=scope, scope_params=scope_params,
+    )
 
 
 @router.get("/media", response_model=MemberMediaPage, summary="媒体审核列表（头像/照片/视频）")

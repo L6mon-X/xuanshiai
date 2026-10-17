@@ -19,6 +19,8 @@ class MatchmakerMemberCreate(BaseModel):
     birthday: date | None = None
     is_married: Literal[1, 2, 3] | None = None
     avatar: str | None = Field(default=None, max_length=255)
+    # 会员登记来源，写入 users.source；后台建档默认「后台添加」。
+    source: str | None = Field(default="后台添加", max_length=32)
     remark: str | None = Field(default=None, max_length=2000)
 
     @model_validator(mode="after")
@@ -68,10 +70,13 @@ class MatchmakerMemberUpdate(BaseModel):
     )
     intention_level: Literal[1, 2, 3] | None = Field(default=None, description="客户意向：1低、2中、3高")
     auth_status: Literal[0, 1, 2, 3] | None = Field(default=None, description="认证审核状态：0待审、1审核中、2通过、3未通过")
+    wechat_added: Literal[0, 1, 2] | None = Field(default=None, description="加微信结果：0未添加、1已加上、2没加上")
     tags: dict[str, list[str]] | list[str] | None = None
     self_intro: str | None = Field(default=None, max_length=500)
     ideal_partner: str | None = Field(default=None, max_length=2000)
     wechat: str | None = Field(default=None, max_length=128)
+    # 手机号是登录标识与唯一键，改它会影响会员登录，因此单独做唯一性校验（见 update_member）。
+    phone: str | None = Field(default=None, pattern=r"^1\d{10}$", description="11 位手机号")
     remark: str | None = Field(default=None, max_length=2000)
 
     @model_validator(mode="after")

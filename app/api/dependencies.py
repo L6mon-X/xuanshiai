@@ -352,6 +352,10 @@ PERMISSION_ATTR = "__matchmaker_permission__"
 PERMISSION_EXEMPT_SUFFIXES: tuple[str, ...] = (
     "/admin/matchmaker/auth/me",
     "/admin/matchmaker/auth/logout",
+    # 改密同样是「只作用于当前登录态」的自助端点：它只按 token 里的 account.id 更新本人
+    # 密码，不涉及任何他人数据。此前不在白名单，又未命中 URL 关键词映射，被 fail-closed
+    # 分支整体拒绝（403 后台接口缺少权限声明），前端改密弹窗实际是死按钮。
+    "/admin/matchmaker/auth/change-password",
 )
 
 

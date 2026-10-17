@@ -81,6 +81,31 @@ class MemberFollowUpImportResult(BaseModel):
     errors: list[str] = Field(default_factory=list)
 
 
+class MemberCallRecordRow(BaseModel):
+    """通话记录列表行：与前端「跟进全览」通话记录页签表格列对齐。"""
+
+    id: int
+    user_id: int
+    member_code: str = Field(description="会员编号：G + user_id 左补零到 6 位")
+    nickname: str | None = None
+    matchmaker_name: str = Field(description="拨打人称呼，取后台账号 display_name，取不到回退 admin")
+    direction: str = Field(description="INBOUND 呼入 / OUTBOUND 呼出")
+    direction_label: str = Field(description="通话方向中文：呼入/呼出")
+    status: str = Field(description="COMPLETED/MISSED/FAILED")
+    status_label: str = Field(description="通话状态中文：已完成/未接听/失败")
+    duration_seconds: int | None = Field(default=None, description="通话时长（秒）")
+    remark: str | None = Field(default=None, description="通话备注")
+    created_at: datetime | None = None
+
+
+class MemberCallRecordListPage(BaseModel):
+    items: list[MemberCallRecordRow]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
+
+
 class MemberBehaviorItem(BaseModel):
     event_type: Literal["login", "browse", "favorite", "swipe", "apply"]
     event_id: int

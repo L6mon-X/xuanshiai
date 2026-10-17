@@ -31,11 +31,15 @@ NEW_MEMBER_FILTER_DEFAULTS: dict[str, object] = {
     "realname": None, "cert_status": None, "organization_id": None, "matchmaker_id": None,
     "promoter_id": None, "age_min": None, "age_max": None, "height_min": None,
     "height_max": None, "marriage": None, "education": None, "occupation": None,
-    "income": None, "residence": None, "hometown": None, "hukou": None, "religion": None,
+    "income": None, "income_min": None, "income_max": None,
+    "residence": None, "hometown": None, "hukou": None, "religion": None,
     "car": None, "level": None, "tags": None, "offline_vip": None, "promoted": None,
     "newcomer": None, "activity_signup": None, "wechat_added": None, "behavior_type": None,
     "created_start": None, "created_end": None, "assigned_start": None, "assigned_end": None,
     "order": None,
+    # 2026-10-16/17 新增：列表可见但无查询参数的列，以及收入上下限。
+    "intention_level": None, "house": None, "ethnicity": None,
+    "constellation": None, "zodiac": None,
 }
 
 

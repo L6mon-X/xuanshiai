@@ -11,6 +11,7 @@ from app.db.session import get_db
 from app.schemas.member_follow_up_admin import (
     MemberBehaviorItem,
     MemberBehaviorPage,
+    MemberCallRecordListPage,
     MemberFollowUp,
     MemberFollowUpCreate,
     MemberFollowUpImportResult,
@@ -28,6 +29,7 @@ _XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.
 # 会员/跟进记录均无组织列，归属只存在于 resource_assignment，统一用 EXISTS 包装（D-16）。
 _MEMBER_CORRELATION = "scope_assignment.user_id = users.id"
 _FOLLOW_UP_CORRELATION = "scope_assignment.user_id = f.user_id"
+_CALL_CORRELATION = "scope_assignment.user_id = c.user_id"
 _BEHAVIOR_CORRELATION = "scope_assignment.user_id = u.id"
 
 
@@ -43,6 +45,7 @@ async def all_follow_ups(
     page_size: int = Query(20, ge=1, le=100),
     keyword: str | None = Query(None, max_length=64, description="会员昵称/姓名/手机号/会员编号"),
     intention_level: int | None = Query(None, ge=1, le=3, description="客户意向 1低 2中 3高"),
+    wechat_added: int | None = Query(None, ge=0, le=2, description="加微信结果 0未添加 1已加上 2没加上"),
     start_date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="跟进时间起（含）"),
     end_date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="跟进时间止（含）"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
@@ -51,7 +54,7 @@ async def all_follow_ups(
     current.require("matchmaker.member.read")
     scope, scope_params = _scope(current, _FOLLOW_UP_CORRELATION)
     return await service.list_follow_ups(
-        db, page, page_size, keyword, intention_level, start_date, end_date,
+        db, page, page_size, keyword, intention_level, wechat_added, start_date, end_date,
         scope=scope, scope_params=scope_params,
     )
 
@@ -64,6 +67,24 @@ async def follow_up_summary(
     current.require("matchmaker.member.read")
     scope, scope_params = _scope(current, _FOLLOW_UP_CORRELATION)
     return await service.follow_up_summary(db, scope=scope, scope_params=scope_params)
+
+
+@router.get("/call-records", response_model=MemberCallRecordListPage, summary="通话记录全览")
+async def all_call_records(
+    page: int = Query(1, ge=1, le=1000),
+    page_size: int = Query(20, ge=1, le=100),
+    keyword: str | None = Query(None, max_length=64, description="会员昵称/姓名/手机号/会员编号"),
+    start_date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="通话时间起（含）"),
+    end_date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="通话时间止（含）"),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MemberCallRecordListPage:
+    current.require("matchmaker.member.read")
+    scope, scope_params = _scope(current, _CALL_CORRELATION)
+    return await service.list_call_records(
+        db, page, page_size, keyword, start_date, end_date,
+        scope=scope, scope_params=scope_params,
+    )
 
 
 @router.get("/follow-ups/import-template", summary="下载历史跟进导入模板")

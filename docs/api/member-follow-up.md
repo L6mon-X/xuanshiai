@@ -80,6 +80,7 @@
 | `page_size` | query | int | 否 | `20` | `ge=1, le=100` | 每页条数 |
 | `keyword` | query | string | 否 | — | `max_length=64` | 关键字，匹配会员昵称 / 手机号 / 实名 / 会员编号 |
 | `intention_level` | query | int | 否 | — | `ge=1, le=3` | 客户意向筛选：1 低 / 2 中 / 3 高 |
+| `wechat_added` | query | int | 否 | — | `ge=0, le=2` | 加微信结果筛选：0 未添加 / 1 已加上 / 2 没加上；取自 `users.wechat_added` |
 | `start_date` | query | string | 否 | — | 正则 `^\d{4}-\d{2}-\d{2}$` | 跟进时间起（**含**，按天） |
 | `end_date` | query | string | 否 | — | 正则 `^\d{4}-\d{2}-\d{2}$` | 跟进时间止（**含**，按天，后端换算为 `< end_date + 1 天`） |
 
@@ -88,7 +89,7 @@
 合法：
 
 ```http
-GET /api/v1/admin/members/follow-ups?page=1&page_size=20&keyword=G396140&intention_level=2&start_date=2026-09-01&end_date=2026-09-11
+GET /api/v1/admin/members/follow-ups?page=1&page_size=20&keyword=G396140&intention_level=2&wechat_added=1&start_date=2026-09-01&end_date=2026-09-11
 Authorization: Bearer <access_token>
 ```
 
@@ -102,6 +103,12 @@ GET /api/v1/admin/members/follow-ups?start_date=2026/09/01
 
 ```http
 GET /api/v1/admin/members/follow-ups?intention_level=5
+```
+
+非法示例（加微信结果越界 → 422）：
+
+```http
+GET /api/v1/admin/members/follow-ups?wechat_added=3
 ```
 
 #### 返回参数
@@ -170,6 +177,7 @@ GET /api/v1/admin/members/follow-ups?intention_level=5
 
 - 排序固定为 `f.created_at DESC, f.id DESC`（最新在前）。
 - `start_date` / `end_date` 为**闭区间**（含首尾当天）；仅传 `start_date` 表示「该日起至今」，仅传 `end_date` 表示「截止该日」。
+- `wechat_added` 过滤的是**会员身上**的加微信结果（`users.wechat_added`），不是这条跟进记录本身的字段；不传即不限。
 - 前端 8 个时间快捷卡（今天/昨天/最近3天/本周/上周/本月/上月）在本页**由前端换算为 `start_date`/`end_date`** 后请求本接口；若用户又手动选择了日期范围，以手动日期优先。
 - `keyword` 为模糊匹配（`LIKE %kw%`），同时覆盖昵称、手机号、实名、会员编号。
 - 分页为空时返回 `items: []`、`total: 0`，不报错。
@@ -180,7 +188,7 @@ GET /api/v1/admin/members/follow-ups?intention_level=5
 |---|---|---|---|
 | 401 | 未携带 / Token 失效 | `adminApi` 自动清 token 并跳 `/login` | `{"detail":"未认证"}` |
 | 403 | 无 `matchmaker.member.read` | 展示「无权限」 | `{"detail":"无权限访问"}` |
-| 422 | 日期格式非 `YYYY-MM-DD`、`intention_level` 越界、`page_size > 100` | 校正筛选条件后重试 | `{"detail":[{"loc":["query","intention_level"],"msg":"Input should be less than or equal to 3","type":"less_than_equal"}]}` |
+| 422 | 日期格式非 `YYYY-MM-DD`、`intention_level` 或 `wechat_added` 越界、`page_size > 100` | 校正筛选条件后重试 | `{"detail":[{"loc":["query","intention_level"],"msg":"Input should be less than or equal to 3","type":"less_than_equal"}]}` |
 
 #### 文档完成自检清单
 
@@ -278,6 +286,135 @@ Authorization: Bearer <access_token>
 - [x] 返回示例（含空数据示例）
 - [x] 使用方法与业务规则（含「口径不互斥」说明）
 - [x] 错误表
+
+---
+
+### 2.3 `GET /api/v1/admin/members/call-records`
+
+#### 基本信息
+
+| 项 | 内容 |
+|---|---|
+| 路径 | `/api/v1/admin/members/call-records` |
+| 方法 | `GET` |
+| 权限 | `matchmaker.member.read` |
+| 用途 | 跨会员分页查询通话记录，供「跟进全览」页的**通话记录**页签渲染 |
+| 返回 | `MemberCallRecordListPage` |
+
+#### 请求参数
+
+| 参数名 | 位置 | 类型 | 必填 | 默认值 | 校验 | 业务含义 |
+|---|---|---|---|---|---|---|
+| `page` | query | int | 否 | `1` | `ge=1, le=1000` | 页码 |
+| `page_size` | query | int | 否 | `20` | `ge=1, le=100` | 每页条数 |
+| `keyword` | query | string | 否 | — | `max_length=64` | 关键字，匹配会员昵称 / 手机号 / 会员编号 |
+| `start_date` | query | string | 否 | — | 正则 `^\d{4}-\d{2}-\d{2}$` | 通话时间起（**含**，按天） |
+| `end_date` | query | string | 否 | — | 正则 `^\d{4}-\d{2}-\d{2}$` | 通话时间止（**含**，按天，后端换算为 `< end_date + 1 天`） |
+
+> 与 `GET /api/v1/admin/members/{member_id}/call-records`（单个会员的通话记录）互补：本接口不带 `member_id`，是**全平台聚合**视图。
+
+#### 请求示例
+
+合法：
+
+```http
+GET /api/v1/admin/members/call-records?page=1&page_size=20&keyword=G396140&start_date=2026-09-01&end_date=2026-09-11
+Authorization: Bearer <access_token>
+```
+
+非法示例（日期格式错误 → 422）：
+
+```http
+GET /api/v1/admin/members/call-records?start_date=2026/09/01
+```
+
+#### 返回参数
+
+`MemberCallRecordListPage`：
+
+| 字段 | 类型 | 必返 | 业务含义 |
+|---|---|---|---|
+| `items` | `MemberCallRecordRow[]` | 是 | 当前页数据 |
+| `page` | int | 是 | 当前页码 |
+| `page_size` | int | 是 | 每页条数 |
+| `total` | int | 是 | 符合条件的总条数 |
+| `has_more` | bool | 是 | 是否还有下一页 |
+
+`MemberCallRecordRow`：
+
+| 字段 | 类型 | 可为空 | 业务含义 | 前端列 |
+|---|---|---|---|---|
+| `id` | int | 否 | 通话记录 ID | — |
+| `user_id` | int | 否 | 会员用户 ID | — |
+| `member_code` | string | 否 | 会员编号，`G`+6 位 | 「会员」副标题 |
+| `nickname` | string | 是 | 会员昵称 | 「会员」主标题 |
+| `matchmaker_name` | string | 否 | 拨打人称呼，取后台账号 `display_name`，取不到回退 `admin` | 「拨打人」列 |
+| `direction` | string | 否 | 通话方向原始枚举 `INBOUND/OUTBOUND` | — |
+| `direction_label` | string | 否 | 通话方向中文：呼入 / 呼出 | 「方向」列 |
+| `status` | string | 否 | 通话状态原始枚举 `COMPLETED/MISSED/FAILED` | — |
+| `status_label` | string | 否 | 通话状态中文：已完成 / 未接听 / 失败 | 「状态」列 |
+| `duration_seconds` | int | 是 | 通话时长（秒） | 「时长」列 |
+| `remark` | string | 是 | 通话备注 | 「备注」列 |
+| `created_at` | datetime | 是 | 通话时间 | 「通话时间」列 |
+
+#### 返回示例
+
+```json
+{
+  "items": [
+    {
+      "id": 1,
+      "user_id": 396140,
+      "member_code": "G396140",
+      "nickname": "普浩芸",
+      "matchmaker_name": "芸希老师",
+      "direction": "OUTBOUND",
+      "direction_label": "呼出",
+      "status": "COMPLETED",
+      "status_label": "已完成",
+      "duration_seconds": 125,
+      "remark": "已沟通，约定周六到店",
+      "created_at": "2026-09-01T14:48:54"
+    }
+  ],
+  "page": 1,
+  "page_size": 20,
+  "total": 1,
+  "has_more": false
+}
+```
+
+空数据示例：
+
+```json
+{ "items": [], "page": 1, "page_size": 20, "total": 0, "has_more": false }
+```
+
+#### 使用方法与业务规则
+
+- 排序固定为 `c.created_at DESC, c.id DESC`（最新在前）。
+- `start_date` / `end_date` 为**闭区间**（含首尾当天），语义与 `2.1` 一致。
+- 通话方向 / 状态的中文由后端映射（`INBOUND→呼入`、`OUTBOUND→呼出`、`COMPLETED→已完成`、`MISSED→未接听`、`FAILED→失败`）；遇到库内未知枚举时回退为「呼出」/「已完成」，不报错。
+- 数据范围（D-16）按**通话所属会员**收敛：谓词为 `scope_assignment.user_id = c.user_id`，不可见会员的通话记录直接不返回。
+- 前端「通话记录」页签与「跟进记录」页签共用 `keyword` 与日期区间，但各自独立分页。
+
+#### 错误
+
+| HTTP | 触发条件 | 前端处理建议 | 错误响应 |
+|---|---|---|---|
+| 401 | 未携带 / Token 失效 | `adminApi` 自动清 token 并跳 `/login` | `{"detail":"未认证"}` |
+| 403 | 无 `matchmaker.member.read` | 展示「无权限」 | `{"detail":"无权限访问"}` |
+| 422 | 日期格式非 `YYYY-MM-DD`、`page_size > 100` | 校正筛选条件后重试 | `{"detail":[{"loc":["query","start_date"],"msg":"String should match pattern '^\\d{4}-\\d{2}-\\d{2}$'","type":"string_pattern_mismatch"}]}` |
+
+#### 文档完成自检清单
+
+- [x] 基本信息（路径 / 方法 / 权限 / 用途 / 返回）
+- [x] 请求参数表（含位置 / 类型 / 必填 / 默认 / 校验 / 业务含义）
+- [x] 请求示例（含 1 个非法示例）
+- [x] 返回参数表（分页 + 行，逐字段业务含义 + 前端列）
+- [x] 返回示例（含空数据示例）
+- [x] 使用方法与业务规则（含枚举回退与 D-16 数据范围）
+- [x] 错误表（状态码 + 触发条件 + 前端建议 + 响应 JSON）
 
 ---
 

@@ -51,6 +51,9 @@ ALL_COLUMNS: frozenset[tuple[str, str]] = frozenset(
         ("users", "wechat_added"), ("users", "promoted"), ("users", "newcomer"),
         ("users", "activity_signup"), ("users", "level"), ("users", "fetched_at"),
         ("user_profile", "car"), ("user_profile", "household"), ("user_profile", "religion"),
+        ("user_profile", "intention_level"), ("user_profile", "house"),
+        ("user_profile", "ethnicity"), ("user_profile", "constellation"),
+        ("user_profile", "zodiac"),
     }
 )
 
@@ -201,9 +204,9 @@ def test_member_filter_applies_columns_when_available() -> None:
     assert "u.promoted = 1" in clause
     assert "u.newcomer = 0" in clause
     assert "u.activity_signup = 1" in clause
-    assert "u.level = :level" in clause
+    assert "u.level IN (:level_0)" in clause
     assert "p.household LIKE" in clause
-    assert "p.car = :car" in clause
+    assert "p.car IN (:car_0)" in clause
     assert "p.religion = :religion" in clause
     assert params["source"] == "推广" and params["region"] == "mainland"
 
@@ -211,6 +214,49 @@ def test_member_filter_applies_columns_when_available() -> None:
 def test_member_filter_region_rejects_unknown_value() -> None:
     clause, params = build_member_filter({"region": "火星"}, ALL_COLUMNS)
     assert "u.region" not in clause
+    assert params == {}
+
+
+@pytest.mark.parametrize(
+    ("key", "column"),
+    [("level", "u.level"), ("house", "p.house"), ("ethnicity", "p.ethnicity"), ("car", "p.car")],
+)
+def test_member_filter_multi_value_dims_expand(key: str, column: str) -> None:
+    """界面上标「（多选）」的四列必须真的按多值展开，而不是只认第一个值。"""
+    clause, params = build_member_filter({key: "甲,乙"}, ALL_COLUMNS)
+    assert f"{column} IN (:{key}_0, :{key}_1)" in clause
+    assert params[f"{key}_0"] == "甲" and params[f"{key}_1"] == "乙"
+
+
+def test_member_filter_single_value_dims_match_exactly() -> None:
+    clause, params = build_member_filter(
+        {"intention_level": 3, "constellation": "天秤座", "zodiac": "龙"}, ALL_COLUMNS,
+    )
+    assert "p.intention_level = :intention_level" in clause
+    assert "p.constellation = :constellation" in clause
+    assert "p.zodiac = :zodiac" in clause
+    assert params["intention_level"] == 3
+
+
+def test_member_filter_income_range_expands_to_bounds() -> None:
+    """界面把收入做成区间下拉，必须落到上下限两个参数上，精确匹配选不中任何值。"""
+    clause, params = build_member_filter({"income_min": 3000, "income_max": 8000}, ALL_COLUMNS)
+    assert "p.income >= :income_min" in clause
+    assert "p.income <= :income_max" in clause
+    assert params == {"income_min": 3000, "income_max": 8000}
+
+    # 区间只给一端时，另一端不应凭空产生条件
+    clause, params = build_member_filter({"income_max": 3000}, ALL_COLUMNS)
+    assert "p.income <= :income_max" in clause
+    assert "income_min" not in params
+
+
+def test_member_filter_new_dims_skip_missing_columns() -> None:
+    values = {"intention_level": 1, "house": "有房", "ethnicity": "汉族",
+              "constellation": "天秤座", "zodiac": "龙"}
+    clause, params = build_member_filter(values, frozenset())
+    for token in ("p.intention_level", "p.house", "p.ethnicity", "p.constellation", "p.zodiac"):
+        assert token not in clause, token
     assert params == {}
 
 
@@ -548,7 +594,12 @@ def test_member_route_exposes_new_filter_params() -> None:
                  "residence", "hometown", "hukou", "religion", "car", "level", "tags",
                  "offline_vip", "promoted", "newcomer", "activity_signup", "wechat_added",
                  "behavior_type", "created_start", "created_end", "assigned_start",
-                 "assigned_end", "order"):
+                 "assigned_end", "order",
+                 # 2026-10-16：会员资料页「客户意向 / 房子 / 民族 / 星座 / 属相」五列
+                 # 在列表里可见却无查询参数，补参数前进不了筛选。
+                 # 2026-10-17：另补收入的上下限（界面是区间下拉，不是精确匹配）。
+                 "intention_level", "house", "ethnicity", "constellation", "zodiac",
+                 "income_min", "income_max"):
         assert name in names, name
 
 
@@ -573,3 +624,49 @@ def test_other_routes_expose_new_params() -> None:
     assert "search_type" in _query_params(media_routes.media_list)
     assert "search_type" in _query_params(media_routes.intro_list)
     assert "cancellation_status" in _query_params(account_routes.accounts)
+
+
+# --------------------------------------------------------------------------- #
+# 4. 会员筛选下拉字典（门店 / 推广红娘）
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_member_options_return_scoped_stores_and_promoters() -> None:
+    """下拉字典只给当前账号数据范围内的门店，推广红娘只认清招牌应用记录。"""
+    from types import SimpleNamespace
+
+    from app.services.matchmaker_member_admin import member_options
+
+    def scope_organization_clause(params, *, column):
+        params["scope_org"] = 7
+        return f"{column} IN (:scope_org)"
+
+    admin = SimpleNamespace(scope_organization_clause=scope_organization_clause)
+    db = StubDB([
+        StubResult(rows=[{"id": 3, "label": "总店"}]),
+        StubResult(rows=[{"id": 9, "label": "张三"}]),
+    ])
+    result = await member_options(db, admin=admin)
+
+    assert [o.value for o in result.organizations] == ["3"]
+    assert [o.label for o in result.organizations] == ["总店"]
+    assert [o.value for o in result.promoters] == ["9"]
+    # 门店查询必须真的带上数据范围谓词与其绑定参数，不能只取谓词丢掉参数。
+    store_sql, store_params = db.statements[0]
+    assert "o.org_type = 'store'" in store_sql
+    assert "o.id IN (:scope_org)" in store_sql
+    assert store_params["scope_org"] == 7
+    assert "application_type = 'promoter'" in db.statements[1][0]
+
+
+def test_member_options_route_is_registered_before_member_id() -> None:
+    """静态路径 /options 必须排在 /{member_id} 之前，否则会被当成会员 ID 解析。"""
+    from app.api.routes import matchmaker_member_admin as routes
+
+    paths = [route.path for route in routes.router.routes]
+    assert "/admin/matchmaker/members/options" in paths
+    assert paths.index("/admin/matchmaker/members/options") < paths.index(
+        "/admin/matchmaker/members/{member_id}"
+    )
+

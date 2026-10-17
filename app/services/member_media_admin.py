@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.schemas.member_media_admin import (
     MemberIntroItem,
     MemberIntroPage,
+    MemberMediaCreate,
     MemberMediaItem,
     MemberMediaPage,
     MemberMediaReplace,
@@ -839,6 +840,76 @@ async def review_media(db: AsyncSession, media_id: int, body: MemberMediaReview,
     )
     await db.commit()
     return {"id": media_id, "review_status": body.review_status}
+
+
+async def create_media(
+    db: AsyncSession, user_id: int, body: MemberMediaCreate, actor_id: int, *,
+    scope: str | None = None, scope_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """后台为会员新增媒体（相册照片/视频/头像），新记录一律待审核。
+
+    ``scope`` 与其它会员写接口同口径：越权会员按 404 返回，避免用媒体上传接口
+    探测他人会员 ID 是否存在。
+    """
+    guard = ["id = :user_id"]
+    guard_params: dict[str, Any] = {"user_id": user_id}
+    if scope:
+        guard.append(scope)
+        guard_params.update(scope_params or {})
+    exists = await db.execute(text(f"SELECT id FROM users WHERE {' AND '.join(guard)}"), guard_params)
+    if not exists.scalar():
+        raise HTTPException(404, detail="会员不存在")
+
+    thumbnail = body.thumbnail_url
+    if body.media_type == "avatar":
+        thumbnail = thumbnail or None
+    result = await db.execute(
+        text(
+            "INSERT INTO user_media (user_id, media_type, file_url, thumbnail_url, mime_type, "
+            "file_size, duration_seconds, review_status) "
+            "VALUES (:user_id, :media_type, :file_url, :thumbnail, :mime, :size, :duration, 0)"
+        ),
+        {
+            "user_id": user_id,
+            "media_type": body.media_type,
+            "file_url": body.file_url,
+            "thumbnail": thumbnail,
+            "mime": body.mime_type,
+            "size": body.file_size,
+            "duration": body.duration_seconds,
+        },
+    )
+    media_id = int(result.lastrowid)
+
+    # 头像同时回写 users.avatar，否则列表/抽屉仍显示旧头像。
+    if body.media_type == "avatar":
+        await db.execute(
+            text("UPDATE users SET avatar = :url, updated_at = UTC_TIMESTAMP() WHERE id = :user_id"),
+            {"url": body.file_url, "user_id": user_id},
+        )
+        await db.execute(
+            text("UPDATE user_media SET deleted_at = UTC_TIMESTAMP() WHERE user_id = :user_id "
+                 "AND media_type = 'avatar' AND id <> :id AND deleted_at IS NULL"),
+            {"user_id": user_id, "id": media_id},
+        )
+
+    await db.execute(
+        text(
+            "INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id, after_json) "
+            "VALUES (:actor, 'member.media.create', 'user_media', :rid, :after)"
+        ),
+        {
+            "actor": actor_id,
+            "rid": media_id,
+            "after": json.dumps(
+                {"user_id": user_id, "media_type": body.media_type, "file_url": body.file_url},
+                ensure_ascii=False,
+            ),
+        },
+    )
+    await db.commit()
+    return {"id": media_id, "user_id": user_id, "media_type": body.media_type,
+            "file_url": body.file_url, "review_status": 0}
 
 
 async def replace_media(db: AsyncSession, media_id: int, body: MemberMediaReplace, actor_id: int) -> dict[str, Any]:

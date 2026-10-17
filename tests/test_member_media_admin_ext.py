@@ -43,6 +43,8 @@ def test_new_member_media_routes_are_registered() -> None:
     assert "patch" in paths[dynamic]
     assert "put" in paths[dynamic]
     assert "delete" in paths[dynamic]
+    # 2026-10-17：后台新增媒体（此前只有改/删，抽屉里的上传按钮全部点不动）
+    assert "post" in paths[f"{BASE}/{{user_id}}/media"]
 
 
 def test_new_member_media_routes_require_authentication() -> None:
@@ -55,6 +57,8 @@ def test_new_member_media_routes_require_authentication() -> None:
     assert client.patch(f"{BASE}/media/1", json={"review_status": 2}).status_code == 401
     assert client.put(f"{BASE}/media/1", json={"file_url": "/a.jpg"}).status_code == 401
     assert client.delete(f"{BASE}/media/1").status_code == 401
+    # 新增媒体同样是写接口
+    assert client.post(f"{BASE}/1/media", json={"file_url": "/a.jpg"}).status_code == 401
 
 
 # ─── 入参模型校验 ───────────────────────────────────────────────
@@ -102,6 +106,26 @@ def test_media_replace_file_url_required_and_non_empty() -> None:
 def test_media_replace_too_long() -> None:
     with pytest.raises(ValidationError):
         MemberMediaReplace(file_url="x" * 513)
+
+
+def test_media_create_defaults_and_validation() -> None:
+    """后台新增媒体：默认 photo、默认待审由服务层置 0；type 与尺寸走白名单。"""
+    from app.schemas.member_media_admin import MemberMediaCreate
+
+    body = MemberMediaCreate(file_url="/uploads/photo/1.jpg")
+    assert body.media_type == "photo"
+    assert body.thumbnail_url is None
+
+    with pytest.raises(ValidationError):
+        MemberMediaCreate()  # file_url 必填
+    with pytest.raises(ValidationError):
+        MemberMediaCreate(file_url="")
+    with pytest.raises(ValidationError):
+        MemberMediaCreate(file_url="/a.jpg", media_type="gif")
+    with pytest.raises(ValidationError):
+        MemberMediaCreate(file_url="/a.jpg", file_size=-1)
+    with pytest.raises(ValidationError):
+        MemberMediaCreate(file_url="/a.jpg", duration_seconds=3601)
 
 
 # ─── 返回模型可构造 ─────────────────────────────────────────────

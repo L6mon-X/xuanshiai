@@ -450,10 +450,13 @@ async def assign_lead(
 ) -> CustomerLead:
     await get_lead(db, lead_id, scope=scope, scope_params=scope_params)
     await _validate_owner(db, request)
+    # 只写调用方显式给出的归属人：只改红娘时不能把门店冲成 NULL。
+    values = request.model_dump(exclude_unset=True)
     assign_where = ["id = :id"]
-    assign_params: dict[str, Any] = {**request.model_dump(), "id": lead_id}
+    assign_params: dict[str, Any] = {**values, "id": lead_id}
     _merge_scope(assign_where, assign_params, scope, scope_params)
-    await db.execute(text(f"UPDATE customer_lead SET matchmaker_id = :matchmaker_id, organization_id = :organization_id, updated_at = UTC_TIMESTAMP() WHERE {' AND '.join(assign_where)}"), assign_params)
+    set_clause = ", ".join(f"{key} = :{key}" for key in values)
+    await db.execute(text(f"UPDATE customer_lead SET {set_clause}, updated_at = UTC_TIMESTAMP() WHERE {' AND '.join(assign_where)}"), assign_params)
     await db.execute(text("INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id) VALUES (:actor, 'customer_lead.assign', 'customer_lead', :id)"), {"actor": account_id, "id": lead_id})
     await db.commit()
     return await get_lead(db, lead_id, redaction_level, scope=scope, scope_params=scope_params)

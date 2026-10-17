@@ -13,10 +13,12 @@ from app.schemas.matchmaker_member_admin import (
     MatchmakerMemberUpdate,
     MemberAuditLogItem,
 )
+from app.schemas.matchmaker_crm_admin import MemberOptions
 from app.services.matchmaker_member_admin import (
     certification_detail,
     create_member,
     member_audit_logs,
+    member_options,
     update_member,
 )
 
@@ -48,6 +50,15 @@ async def create(
         organization_id=current.account.organization_id,
         matchmaker_user_id=current.account.matchmaker_user_id,
     )
+
+
+@router.get("/options", response_model=MemberOptions, summary="会员筛选下拉字典")
+async def options(
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MemberOptions:
+    # 静态路径必须先于 /{member_id} 系列注册，否则 "options" 会被当作会员 ID 解析。
+    return await member_options(db, admin=current)
 
 
 @router.patch("/{member_id}", response_model=MatchmakerMemberAdminItem)

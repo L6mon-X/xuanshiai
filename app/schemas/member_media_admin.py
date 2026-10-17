@@ -89,6 +89,22 @@ class MemberMediaReplace(BaseModel):
     thumbnail_url: str | None = Field(None, max_length=512)  # 新缩略图地址（可选）
 
 
+class MemberMediaCreate(BaseModel):
+    """后台为会员新增一条媒体。
+
+    此前只有 PUT/PATCH/DELETE，没有创建入口，抽屉里「照片视频 / 认证信息 / 私密信息」
+    的上传按钮全部点不动。这里按 user_media 的必填列收口，新上传一律 review_status=0
+    待审，与 App 侧上传口径一致。
+    """
+
+    media_type: Literal["avatar", "photo", "video"] = "photo"
+    file_url: str = Field(..., min_length=1, max_length=512)
+    thumbnail_url: str | None = Field(None, max_length=512)
+    mime_type: str | None = Field(None, max_length=128)
+    file_size: int | None = Field(None, ge=0)
+    duration_seconds: int | None = Field(None, ge=0, le=3600)
+
+
 # ─── 资料扩展字段（性格/爱好/MBTI/自我介绍/红娘说） ─────────────
 
 
