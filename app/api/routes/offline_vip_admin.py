@@ -56,6 +56,8 @@ async def list_offline_vips(
         description="服务状态：active 服务期内 / expired 已过期 / no_refund_risk 无退费风险"),
     sort_by: str | None = Query(None, pattern=_SORT_BY_PATTERN,
         description="统计排序：member_last_paid 会员最近一次付费 / member_history_paid 会员历史付费 / monthly_sales 月度销售额 / yearly_sales 年度销售额 / monthly_champion 每月销冠"),
+    column_sort: str | None = Query(None, pattern="^(sign_date|package|progress|last_follow|amount|matchmaker|id)$",
+        description="表头列排序：点击表头时传，优先于 sort_by"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> OfflineVipPage:
@@ -74,6 +76,7 @@ async def list_offline_vips(
         keyword,
         service_status,
         sort_by,
+        column_sort,
         scope=scope,
         scope_params=scope_params,
     )

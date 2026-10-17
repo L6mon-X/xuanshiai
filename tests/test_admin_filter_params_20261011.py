@@ -238,6 +238,16 @@ def test_member_filter_single_value_dims_match_exactly() -> None:
     assert params["intention_level"] == 3
 
 
+def test_member_update_flags_are_writable() -> None:
+    """超级管理的「置顶推荐 / 新人推荐」开关要真的能写，否则只是本地 state。"""
+    from app.schemas.matchmaker_member_admin import MatchmakerMemberUpdate
+
+    body = MatchmakerMemberUpdate(promoted=True, newcomer=False)
+    assert body.promoted is True and body.newcomer is False
+    # 未传时为 None，保持「不改这一列」的语义
+    assert MatchmakerMemberUpdate(nickname="x").promoted is None
+
+
 def test_member_filter_income_range_expands_to_bounds() -> None:
     """界面把收入做成区间下拉，必须落到上下限两个参数上，精确匹配选不中任何值。"""
     clause, params = build_member_filter({"income_min": 3000, "income_max": 8000}, ALL_COLUMNS)

@@ -124,7 +124,11 @@ async def update_member(
         )).scalar()
         if taken:
             raise HTTPException(409, detail="手机号已被其他会员占用")
-    user_values = {key: values.pop(key) for key in ("nickname", "gender", "birthday", "is_married", "avatar", "wechat_added") if key in values}
+    user_values = {key: values.pop(key) for key in ("nickname", "gender", "birthday", "is_married", "avatar", "wechat_added", "promoted", "newcomer") if key in values}
+    # 两列在库里是 tinyint，bool 需要显式转成 1/0，驱动不会替我们做。
+    for flag in ("promoted", "newcomer"):
+        if flag in user_values and user_values[flag] is not None:
+            user_values[flag] = 1 if user_values[flag] else 0
     if phone is not None:
         user_values["phone"] = phone
     auth_values = {key: values.pop(key) for key in ("education", "school", "job", "company", "auth_status") if key in values}

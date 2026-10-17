@@ -52,6 +52,7 @@
 | `auth_status` / `intention_level` | integer/null | `auth_status` 为 0-3；`intention_level` 为 1-3（1低 2中 3高） | 审核状态、客户意向 |
 | `wechat` | string/null | 最多 128 字符 | 微信号；提交掩码值（含 `***`）会被丢弃，不会覆盖真实号 |
 | `wechat_added` | integer/null | `0` 未添加、`1` 已加上、`2` 没加上 | 加微信结果 |
+| `promoted` / `newcomer` | boolean/null | `true` / `false` | 超级管理的「置顶推荐」「新人推荐」开关，写入 `users.promoted` / `users.newcomer`（库内为 tinyint，服务端转 1/0） |
 | `phone` | string/null | 正则 `^1\d{10}$` | 手机号。登录标识，全局唯一；与其它会员重复返回 409 |
 
 **请求示例**：

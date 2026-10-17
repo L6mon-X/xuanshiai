@@ -175,6 +175,20 @@ _SORT_BY_SQL = {
     "monthly_champion": "COALESCE(_month.amount, 0) DESC, COALESCE(_year.amount, 0) DESC, v.id DESC",
 }
 
+# 表头列排序白名单（与上面的统计维度 sort_by 是两回事）：
+# 值全部由服务端写死，不拼接用户输入。
+COLUMN_SORT_SQL = {
+    "sign_date": "v.sign_date DESC, v.id DESC",
+    "package": "v.package_name ASC, v.id DESC",
+    "progress": "v.progress ASC, v.id DESC",
+    # last_follow_at 是 SELECT 里的子查询别名，MySQL 不允许在 ORDER BY 里引用，
+    # 这里把同一个子查询再写一遍。
+    "last_follow": "COALESCE((SELECT MAX(f.created_at) FROM member_follow_up f WHERE f.user_id = v.user_id), '1970-01-01') DESC, v.id DESC",
+    "amount": "v.contract_amount DESC, v.id DESC",
+    "matchmaker": "v.service_matchmaker_id ASC, v.id DESC",
+    "id": "v.id DESC",
+}
+
 # 销售额排序要额外左连接当月/当年已支付订单汇总，未选这些维度时不附加 join。
 _SALES_JOIN = """
 LEFT JOIN (SELECT v2.sales_matchmaker_id AS matchmaker_id, SUM(po.amount) AS amount
@@ -207,6 +221,7 @@ async def list_vips(
     keyword: str | None = None,
     service_status: str | None = None,
     sort_by: str | None = None,
+    column_sort: str | None = None,
     *,
     scope: str | None = None,
     scope_params: dict[str, Any] | None = None,
@@ -242,6 +257,9 @@ async def list_vips(
     # 销售额维度需要带汇总 join；其余排序不附加 join，避免改变既有查询计划。
     join = _SALES_JOIN if sort_by in ("monthly_sales", "yearly_sales", "monthly_champion") else ""
     order_by = _SORT_BY_SQL.get(sort_by or "", "v.id DESC")
+    # 表头点击排序优先：它更贴近用户的即时意图，未点表头时沿用原统计维度排序。
+    if column_sort in COLUMN_SORT_SQL:
+        order_by = COLUMN_SORT_SQL[column_sort]
     rows = await db.execute(
         text(f"{_SELECT_BODY}{join} WHERE {where} ORDER BY {order_by} LIMIT :limit OFFSET :offset"),
         params,
