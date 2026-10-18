@@ -15,10 +15,10 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -27,9 +27,9 @@ from app.services.revisions import RevisionVector
 logger = logging.getLogger(__name__)
 
 # 租约时长统一来源：与 ai_task.claim_tasks 一致使用 settings.ai_lease_seconds。
-# TODO(heartbeat): 当前 run_cleanup_consumer_round 是一次性批量消费，无心跳续租；
-# 若未来改为长租约消费者进程，需在独立消费者循环中实现 lease 续租（参考
-# tasks.py 的 lease 续租路径），避免长耗时 handler 超过租约后被重复 claim。
+# 心跳续租由 ``renew_outbox_leases`` 提供：批量消费超过半租约时长时，
+# ``run_cleanup_consumer_round`` 为剩余事件续租（参考 tasks.py 的
+# heartbeat_lease），避免长耗时 handler 超过租约后被其他 worker 重复 claim。
 def _lease_seconds() -> int:
     return int(settings.ai_lease_seconds)
 
@@ -178,6 +178,36 @@ async def claim_outbox_events(
             )
         )
     return claimed_events
+
+
+async def renew_outbox_leases(
+    db: AsyncSession,
+    event_ids: list[str],
+    worker_id: str,
+    now: datetime,
+) -> int:
+    """Extend the lease of outbox rows still owned by this worker.
+
+    与 tasks.py 的 heartbeat_lease 同一模式：只续租仍归本 worker 且处于
+    ``processing`` 的行，返回实际续租行数。函数不提交，由调用方事务负责
+    （``run_cleanup_consumer_round`` 在 claim 提交后用同一 session 续租并提交）。
+    """
+    if not event_ids:
+        return 0
+    lease_until = now + timedelta(seconds=_lease_seconds())
+    result = await db.execute(
+        text(
+            "UPDATE derivation_outbox SET lease_until = :lease_until "
+            "WHERE status = 'processing' AND lease_owner = :worker_id "
+            "AND event_id IN :event_ids"
+        ).bindparams(bindparam("event_ids", expanding=True)),
+        {
+            "lease_until": lease_until,
+            "worker_id": worker_id,
+            "event_ids": event_ids,
+        },
+    )
+    return int(result.rowcount or 0)
 
 
 async def consume_outbox_event(
@@ -1128,7 +1158,19 @@ async def run_cleanup_consumer_round(
         await db.commit()
     # Each event is consumed in a fresh, independent session so that a
     # failure on one event rolls back only that event's work, not the batch.
-    for event in events:
+    # 心跳续租：批量 handler 总耗时超过半租约时，为尚未消费的事件续租，
+    # 防止长批量被其他 worker 在租约过期后重复 claim。
+    heartbeat_at = time.monotonic()
+    for index, event in enumerate(events):
+        if time.monotonic() - heartbeat_at > _lease_seconds() / 2:
+            await renew_outbox_leases(
+                db,
+                [item.event_id for item in events[index:]],
+                worker_id,
+                datetime.now(UTC).replace(tzinfo=None),
+            )
+            await db.commit()
+            heartbeat_at = time.monotonic()
         try:
             await _consume_one_independent(event, _CLEANUP_CONSUMER, stats)
         except Exception:

@@ -15,6 +15,7 @@ import json
 import logging
 import re
 from collections.abc import Callable, Iterable
+from contextvars import ContextVar
 from typing import Any
 
 from pydantic import SecretStr, ValidationError
@@ -69,6 +70,44 @@ from app.services.ai.prompts.search_parse import build_search_parse_prompt
 from app.services.ai.prompts.voice_reply import build_voice_reply_messages
 
 logger = logging.getLogger(__name__)
+
+# Provider → Gateway 的 token 用量透传通道（AI-09）。ContextVar 是 asyncio
+# 任务本地的，共享 provider 实例在并发调用间不会串扰。Gateway 在每次调用前
+# 复位为 None、成功返回后读取；None 表示供应商未返回用量（显式"未知"，
+# 不得当作零成本）。
+last_token_usage: ContextVar[dict[str, Any] | None] = ContextVar(
+    "ai_provider_last_token_usage", default=None
+)
+
+
+def _usage_token_count(value: Any) -> int | None:
+    """只接受真整数 token 计数；其余（缺失、字符串、mock 对象）一律视为未知。
+
+    审计记录会写入数据库，非整数值既无法核算成本，也可能带进不可序列化的对象，
+    因此这里严格收窄：非法值降级为 ``None``（未知），绝不臆造为 0。
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 0 else None
+
+
+def _usage_from_response(response: Any, model: str) -> dict[str, Any] | None:
+    """从 OpenAI 兼容响应提取 token 用量；供应商未返回时保持 None（未知）。"""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    prompt_tokens = _usage_token_count(getattr(usage, "prompt_tokens", None))
+    completion_tokens = _usage_token_count(getattr(usage, "completion_tokens", None))
+    total_tokens = _usage_token_count(getattr(usage, "total_tokens", None))
+    if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+        return None
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "source": "provider",
+        "model": model,
+    }
 
 # OpenAI SDK 异常类与客户端构造（DeepSeek 兼容 OpenAI API）。
 #
@@ -1031,6 +1070,7 @@ class _OpenAICompatProvider:
         ) as exc:
             raise self._map_openai_exception(exc) from exc
 
+        last_token_usage.set(_usage_from_response(response, self._model))
         if not response.choices:
             raise ProviderError(
                 code="AI_INPUT_INVALID",
@@ -1068,6 +1108,7 @@ class _OpenAICompatProvider:
             _APIError,
         ) as exc:
             raise self._map_openai_exception(exc) from exc
+        last_token_usage.set(_usage_from_response(response, self._model))
         if not response.choices:
             raise ProviderError(
                 code="AI_INPUT_INVALID",
@@ -1162,6 +1203,7 @@ class _OpenAICompatProvider:
             _APIError,
         ) as exc:
             raise self._map_openai_exception(exc) from exc
+        last_token_usage.set(_usage_from_response(response, self._model))
         if not response.choices:
             raise ProviderError(
                 code="AI_INPUT_INVALID",

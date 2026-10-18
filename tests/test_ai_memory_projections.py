@@ -17,7 +17,6 @@ import pytest
 
 from app.schemas.ai_memory_projection import MEMORY_PROJECTION_ENTRY_ALLOWLIST
 from app.services.ai.memory.projection_policy import (
-    ProjectionFeatureNotEnabled,
     ProjectionPolicyDenied,
 )
 from app.services.ai.memory.projections import (

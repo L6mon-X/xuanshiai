@@ -494,7 +494,7 @@ async def test_redis_broken_pubsub_falls_back_to_polling(monkeypatch) -> None:
         return pubsub
 
     monkeypatch.setattr(voice_moxiang, "_open_task_pubsub", fake_open)
-    db = _watch_mocks(monkeypatch, ["running", "running", "succeeded"])
+    _watch_mocks(monkeypatch, ["running", "running", "succeeded"])
     monkeypatch.setattr(
         voice_moxiang, "_TASK_EVENT_POLL_SCHEDULE", (0.01,) * 6, raising=False
     )
@@ -516,7 +516,7 @@ async def test_redis_unavailable_uses_pure_polling(monkeypatch) -> None:
         return None
 
     monkeypatch.setattr(voice_moxiang, "_open_task_pubsub", fake_open)
-    db = _watch_mocks(monkeypatch, ["running", "succeeded"])
+    _watch_mocks(monkeypatch, ["running", "succeeded"])
     monkeypatch.setattr(
         voice_moxiang, "_TASK_EVENT_POLL_SCHEDULE", (0.01,) * 4, raising=False
     )

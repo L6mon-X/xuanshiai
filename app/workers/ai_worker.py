@@ -980,10 +980,20 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.dry_run:
         # 安全空转：不建立会话、不写任何数据。
+        # stdout 摘要保持机器可解析（运行手册 `--once --dry-run` 活性检查依赖它），
+        # 同时补结构化日志，使一次性摘要也能被日志采集（FIX-08）。
         if args.consumers:
             print("claimed=0 applied=0 superseded=0 duplicate=0 skipped=0")
+            logger.info(
+                "ai_worker_dry_run_summary consumers=true claimed=0 applied=0 "
+                "superseded=0 duplicate=0 skipped=0"
+            )
         else:
             print("claimed=0 completed=0 failed=0")
+            logger.info(
+                "ai_worker_dry_run_summary consumers=false claimed=0 "
+                "completed=0 failed=0"
+            )
         return 0
     worker_id = _worker_id()
     try:
@@ -1000,6 +1010,15 @@ def main(argv: list[str] | None = None) -> int:
                         stats["skipped"],
                     )
                 )
+                logger.info(
+                    "ai_worker_once_summary consumers=true claimed=%d applied=%d "
+                    "superseded=%d duplicate=%d skipped=%d",
+                    stats["claimed"],
+                    stats["applied"],
+                    stats["superseded"],
+                    stats["duplicate"],
+                    stats["skipped"],
+                )
                 return 0
             asyncio.run(
                 _run_cleanup_forever(worker_id, args.batch_size, args.idle_seconds)
@@ -1010,6 +1029,13 @@ def main(argv: list[str] | None = None) -> int:
                 _run_task_once_with_retention(worker_id, args.batch_size)
             )
             print(f"claimed={claimed} completed={completed} failed={failed}")
+            logger.info(
+                "ai_worker_once_summary consumers=false claimed=%d completed=%d "
+                "failed=%d",
+                claimed,
+                completed,
+                failed,
+            )
             return 0
         asyncio.run(_run_forever(worker_id, args.batch_size, args.idle_seconds))
         return 0

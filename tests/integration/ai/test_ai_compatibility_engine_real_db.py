@@ -15,7 +15,6 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.ai_schema import ensure_ai_compatibility_engine_columns
-from app.schemas.ai_compatibility import CompatibilitySnapshotStatus
 from app.services.ai.compatibility import (
     BRAND_LABEL,
     CompatibilityResult,

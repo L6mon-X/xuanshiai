@@ -18,8 +18,6 @@ from app.schemas.ai_memory import MemoryEventInput
 from app.services.ai.memory.materializer import MemoryMaterializationError, MemoryMaterializer
 
 from tests.test_ai_memory_ledger import (
-    FakeMemorySession,
-    MemoryStore,
     OBSERVATION_PAYLOAD,
     make_ledger,
     observation_event,
@@ -199,7 +197,7 @@ async def test_claim_correction_updates_value_and_keeps_causal_chain() -> None:
     await ledger.append(claim_event(idempotency_key="seed-claim-050"))
     (claim_row,) = store.claims.values()
     original_claim_id = claim_row["claim_id"]
-    corrected = await ledger.append(
+    await ledger.append(
         claim_event(
             event_type="claim_user_corrected",
             idempotency_key="seed-correct-1",

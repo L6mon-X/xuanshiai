@@ -23,7 +23,6 @@ from app.services.ai.memory.consumers import (
     PersonaMemoryAdapter,
     PERSONA_PUBLIC_FIELD_ALLOWLIST,
 )
-from app.services.ai.memory.ledger import MemoryLedger
 from app.services.ai.memory.projections import MemoryProjectionService
 from app.services.ai.memory.service import MemoryService
 from app.services.ai.profile import PROFILE_POLICY_REVISION as CORE_POLICY_REVISION
@@ -151,7 +150,7 @@ async def test_consumer_input_closed_loop_and_revoke_fail_closed(
 
     await _seed_users(real_db_session, USER_ID, VIEWER_ID)
     await _grant_consent(real_db_session, USER_ID, f"rt-p3-loop-{USER_ID}")
-    claim_id = await _seed_confirmed_claim(
+    await _seed_confirmed_claim(
         real_db_session, USER_ID, "p3loop", "每天喝咖啡"
     )
     # persona 公开 allowlist 需要 structured 身份（field_key 反解为 age）。

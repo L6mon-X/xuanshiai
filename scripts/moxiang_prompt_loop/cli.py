@@ -3,7 +3,7 @@
 ::
 
     python -m scripts.moxiang_prompt_loop.cli \\
-        --transcript tests/fixtures/moxiang/transcripts/30turn-baseline.jsonl \\
+        --transcript tests/fixtures/moxiang/transcripts/24turn-portrait-regression.jsonl \\
         --provider dots \\
         --prompt-versions master=v1.1,extract=v1.1,narrative=v4 \\
         --account e2e-moxiang-test/account1.json \\
