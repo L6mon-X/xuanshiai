@@ -189,3 +189,19 @@ class MatchRecordPage(BaseModel):
     page_size: int
     total: int
     has_more: bool
+
+
+class MatchRecordStatistics(BaseModel):
+    """顶部统计卡口径：待牵线=未分派红娘的待处理，牵线中=已分派红娘的待处理。"""
+
+    total: int
+    pending: int
+    matching: int
+    success: int
+    fail: int
+    closed: int
+
+
+class MatchRecordUpdate(BaseModel):
+    status: Literal[0, 1, 2, 3]
+    reason: str | None = Field(default=None, max_length=255)

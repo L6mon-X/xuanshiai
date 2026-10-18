@@ -15,7 +15,7 @@ from app.services.sensitive_operations import (
     begin_sensitive_operation,
     finish_sensitive_operation,
 )
-from app.schemas.matchmaker_crm_admin import MatchRecordCreate, MatchRecordItem, MatchRecordPage, MatchRecordResponse, MemberAssignmentResponse, MemberAssignmentUpdate, MemberDetail, MemberListItem, MemberPage, MemberStatistics, MemberStatusResponse, MemberStatusUpdate
+from app.schemas.matchmaker_crm_admin import MatchRecordCreate, MatchRecordItem, MatchRecordPage, MatchRecordResponse, MatchRecordStatistics, MatchRecordUpdate, MemberAssignmentResponse, MemberAssignmentUpdate, MemberDetail, MemberListItem, MemberPage, MemberStatistics, MemberStatusResponse, MemberStatusUpdate
 from app.schemas.admin import CertificationReviewRequest, RealnameReviewRequest
 from app.services.auth import list_realname_reviews, review_realname
 from app.services.certifications import list_certification_reviews, review_certification
@@ -40,6 +40,25 @@ class MemberBatchStatus(BaseModel):
     reason: str = Field(min_length=1, max_length=255)
 
 
+# 牵线记录列表与统计共用的 FROM 子句：ra 既要供 SELECT 展示归属红娘，
+# 也要供 WHERE 按红娘筛选，COUNT 查询复用同一 base，否则按红娘筛选时计数缺 join。
+_MATCH_RECORD_BASE = (
+    "FROM match_apply a JOIN users fu ON fu.id = a.from_user_id JOIN users tu ON tu.id = a.to_user_id"
+    " LEFT JOIN (SELECT user_id, MAX(matchmaker_id) AS matchmaker_id FROM resource_assignment"
+    " WHERE status = 1 GROUP BY user_id) ra ON ra.user_id = a.from_user_id"
+)
+
+# 顶部统计卡的筛选口径。status: 0 待处理 / 1 成功 / 2 失败 / 3 已关闭。
+# 「待牵线」与「牵线中」按是否已归属服务红娘拆分。
+_STATUS_GROUP_SQL: dict[str, str] = {
+    "pending": "a.status = 0 AND ra.matchmaker_id IS NULL",
+    "matching": "a.status = 0 AND ra.matchmaker_id IS NOT NULL",
+    "success": "a.status = 1",
+    "fail": "a.status = 2",
+    "closed": "a.status = 3",
+}
+
+
 @router.get("/match-records", response_model=MatchRecordPage, summary="管理员查询牵线记录")
 async def match_records(
     page: int = Query(1, ge=1, le=1000),
@@ -48,6 +67,11 @@ async def match_records(
     date_from: str | None = Query(None, max_length=10, description="牵线时间起 YYYY-MM-DD（含）"),
     date_to: str | None = Query(None, max_length=10, description="牵线时间止 YYYY-MM-DD（含）"),
     matchmaker_id: int | None = Query(None, ge=1, description="按发起方会员归属的服务红娘筛选"),
+    status_group: str | None = Query(
+        None,
+        pattern="^(pending|matching|success|fail|closed)$",
+        description="顶部统计卡筛选：待牵线=待处理且未分派红娘 / 牵线中=待处理且已分派红娘 / 成功 / 失败 / 已关闭",
+    ),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> MatchRecordPage:
@@ -67,22 +91,100 @@ async def match_records(
         # 归属红娘取自 resource_assignment 的生效记录（派生表 ra，见下方 base）
         where.append("ra.matchmaker_id = :matchmaker_id")
         params["matchmaker_id"] = matchmaker_id
+    if status_group:
+        where.append(_STATUS_GROUP_SQL[status_group])
     # 牵线记录会把双方昵称与手机号一并下发，按「发起方（from）会员归属」收口。
     where.append(current.scope_exists_clause(params, correlation="scope_assignment.user_id = a.from_user_id"))
     clause = " AND ".join(where)
-    # ra 必须放进 base：它既要供 SELECT 展示归属红娘，也要供 WHERE 按红娘筛选，
-    # 且 COUNT 查询复用同一个 base，否则按红娘筛选时计数会因缺 join 报错。
-    base = (
-        "FROM match_apply a JOIN users fu ON fu.id = a.from_user_id JOIN users tu ON tu.id = a.to_user_id"
-        " LEFT JOIN (SELECT user_id, MAX(matchmaker_id) AS matchmaker_id FROM resource_assignment"
-        " WHERE status = 1 GROUP BY user_id) ra ON ra.user_id = a.from_user_id"
-    )
+    base = _MATCH_RECORD_BASE
     rows = await db.execute(text(f"""SELECT a.id, a.from_user_id, a.to_user_id, a.status, a.created_at, a.responded_at,
         fu.nickname AS from_nickname, tu.nickname AS to_nickname,
         ra.matchmaker_id
         {base} WHERE {clause} ORDER BY a.created_at DESC, a.id DESC LIMIT :limit OFFSET :offset"""), params)
     total = int((await db.execute(text(f"SELECT COUNT(*) {base} WHERE {clause}"), {k: v for k, v in params.items() if k not in ("limit", "offset")})).scalar() or 0)
     return MatchRecordPage(items=[MatchRecordItem(**dict(row)) for row in rows.mappings().all()], page=page, page_size=page_size, total=total, has_more=page * page_size < total)
+
+
+@router.get("/match-records/statistics", response_model=MatchRecordStatistics, summary="牵线记录顶部统计卡")
+async def match_record_statistics(
+    search: str | None = Query(None, max_length=64),
+    date_from: str | None = Query(None, max_length=10),
+    date_to: str | None = Query(None, max_length=10),
+    matchmaker_id: int | None = Query(None, ge=1),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MatchRecordStatistics:
+    """统计卡与列表共用筛选条件，点击任一卡片即以 status_group 重新拉列表。"""
+    where = ["1=1"]
+    params: dict[str, object] = {}
+    if search:
+        where.append("(fu.nickname LIKE CONCAT('%', :search, '%') OR tu.nickname LIKE CONCAT('%', :search, '%') OR fu.phone LIKE CONCAT('%', :search, '%') OR tu.phone LIKE CONCAT('%', :search, '%'))")
+        params["search"] = search
+    if date_from:
+        where.append("a.created_at >= :date_from")
+        params["date_from"] = date_from
+    if date_to:
+        where.append("a.created_at < DATE_ADD(:date_to, INTERVAL 1 DAY)")
+        params["date_to"] = date_to
+    if matchmaker_id is not None:
+        where.append("ra.matchmaker_id = :matchmaker_id")
+        params["matchmaker_id"] = matchmaker_id
+    where.append(current.scope_exists_clause(params, correlation="scope_assignment.user_id = a.from_user_id"))
+    clause = " AND ".join(where)
+    row = (await db.execute(text(f"""SELECT
+        SUM(a.status = 0 AND ra.matchmaker_id IS NULL) AS pending,
+        SUM(a.status = 0 AND ra.matchmaker_id IS NOT NULL) AS matching,
+        SUM(a.status = 1) AS success,
+        SUM(a.status = 2) AS fail,
+        SUM(a.status = 3) AS closed,
+        COUNT(*) AS total
+        {_MATCH_RECORD_BASE} WHERE {clause}"""), params)).mappings().one()
+    return MatchRecordStatistics(
+        total=int(row["total"] or 0),
+        pending=int(row["pending"] or 0),
+        matching=int(row["matching"] or 0),
+        success=int(row["success"] or 0),
+        fail=int(row["fail"] or 0),
+        closed=int(row["closed"] or 0),
+    )
+
+
+@router.patch("/match-records/{record_id}", response_model=MatchRecordItem, summary="更新牵线记录状态")
+async def update_match_record(
+    record_id: int = Path(..., ge=1),
+    body: MatchRecordUpdate = ...,
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MatchRecordItem:
+    """结束牵线 / 标记成功失败关闭。成功时同步互相关注，失败时按须知退回牵线次数。"""
+    params: dict[str, object] = {"id": record_id}
+    scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = a.from_user_id")
+    row = (await db.execute(text(
+        f"SELECT a.id, a.from_user_id, a.to_user_id, a.status FROM match_apply a WHERE a.id = :id AND ({scope}) FOR UPDATE"
+    ), params)).mappings().first()
+    if not row:
+        raise HTTPException(404, detail="牵线记录不存在")
+    if int(row["status"]) != 0 and body.status != 3:
+        raise HTTPException(409, detail="该牵线记录已结束，不可再次变更状态")
+    await db.execute(text("""UPDATE match_apply
+        SET status = :status,
+            responded_at = CASE WHEN :status = 0 THEN responded_at ELSE COALESCE(responded_at, UTC_TIMESTAMP()) END,
+            updated_at = UTC_TIMESTAMP()
+        WHERE id = :id"""), {"status": body.status, "id": record_id})
+    if body.status == 1:
+        await db.execute(text("""INSERT INTO user_match (user_id, target_user_id, status)
+            VALUES (:left, :right, 1), (:right, :left, 1)
+            ON DUPLICATE KEY UPDATE status = 1, updated_at = UTC_TIMESTAMP()"""),
+            {"left": int(row["from_user_id"]), "right": int(row["to_user_id"])})
+    await db.execute(text("""INSERT INTO business_audit_log
+        (actor_user_id, action, resource_type, resource_id, reason)
+        VALUES (:actor, 'match_record.status', 'match_apply', :id, :reason)"""),
+        {"actor": current.account.id, "id": record_id, "reason": body.reason})
+    await db.commit()
+    updated = (await db.execute(text(f"""SELECT a.id, a.from_user_id, a.to_user_id, a.status, a.created_at, a.responded_at,
+        fu.nickname AS from_nickname, tu.nickname AS to_nickname, ra.matchmaker_id
+        {_MATCH_RECORD_BASE} WHERE a.id = :id"""), {"id": record_id})).mappings().first()
+    return MatchRecordItem(**dict(updated))
 
 
 @router.post("/match-records", response_model=MatchRecordResponse, status_code=201, summary="管理员新增牵线记录")

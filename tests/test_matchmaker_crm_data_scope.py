@@ -402,7 +402,7 @@ async def test_match_records_are_scoped_by_from_user() -> None:
     db = StubDB([StubResult(rows=[]), StubResult(scalar=0)])
     page = await crm.match_records(
         page=1, page_size=20, search=None, date_from=None, date_to=None,
-        matchmaker_id=None, current=_admin("SELF"), db=db,
+        matchmaker_id=None, status_group=None, current=_admin("SELF"), db=db,
     )
     assert page.total == 0
     assert "scope_assignment.user_id = a.from_user_id" in db.statements[0][0]
@@ -419,7 +419,7 @@ async def test_match_records_filter_by_date_and_matchmaker() -> None:
     db = StubDB([StubResult(rows=[]), StubResult(scalar=0)])
     await crm.match_records(
         page=1, page_size=20, search=None,
-        date_from="2026-01-01", date_to="2026-12-31", matchmaker_id=5,
+        date_from="2026-01-01", date_to="2026-12-31", matchmaker_id=5, status_group=None,
         current=_admin("SELF"), db=db,
     )
     rows_sql, rows_params = db.statements[0]

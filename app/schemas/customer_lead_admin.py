@@ -61,6 +61,8 @@ class CustomerLeadUpdate(BaseModel):
     next_follow_at: datetime | None = None
     promoter_id: int | None = Field(default=None, ge=1)
     audit_status: LeadAuditStatus | None = None
+    # 追加标签，不清空已有标签（批量打标签用）。空数组视为不改动标签。
+    tags: list[str] = Field(default_factory=list, max_length=20, description="追加的客源标签名称")
 
     @field_validator("phone", "wechat", mode="before")
     @classmethod
@@ -69,7 +71,7 @@ class CustomerLeadUpdate(BaseModel):
 
     @model_validator(mode="after")
     def require_update(self) -> "CustomerLeadUpdate":
-        if all(value is None for value in (self.name, self.phone, self.wechat, self.intention_level, self.status, self.remark, self.next_follow_at, self.promoter_id, self.audit_status)):
+        if not self.tags and all(value is None for value in (self.name, self.phone, self.wechat, self.intention_level, self.status, self.remark, self.next_follow_at, self.promoter_id, self.audit_status)):
             raise ValueError("至少提供一个需要修改的字段")
         return self
 

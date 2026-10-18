@@ -412,6 +412,8 @@ async def update_lead(
 ) -> CustomerLead:
     current = await get_lead(db, lead_id, redaction_level, scope=scope, scope_params=scope_params)
     values = request.model_dump(exclude_unset=True)
+    # tags 不是 customer_lead 的列，必须先从写入字段里剔除，再单独走标签同步。
+    new_tags = [t.strip() for t in (values.pop("tags", None) or []) if t and t.strip()]
     # 掩码值不写回：表单预填的是脱敏后的展示值，原样落库会把真实微信号毁成 ***
     if is_masked_value(values.get("wechat")):
         values.pop("wechat")
@@ -430,6 +432,11 @@ async def update_lead(
     _merge_scope(update_where, update_params, scope, scope_params)
     try:
         await db.execute(text(f"UPDATE customer_lead SET {set_clause}updated_at = UTC_TIMESTAMP() WHERE {' AND '.join(update_where)}"), update_params)
+        if new_tags:
+            # _sync_tags 会先清空该线索的标签关联，所以传入「已有 + 新增」的并集，
+            # 保持批量打标签的追加语义，而不是覆盖掉原有标签。
+            existing_tags = [n for n in (current.tags or [])]
+            await _sync_tags(db, lead_id, list(dict.fromkeys([*existing_tags, *new_tags])))
         await db.execute(text("INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id) VALUES (:actor, 'customer_lead.update', 'customer_lead', :id)"), {"actor": account_id, "id": lead_id})
         await db.commit()
     except IntegrityError:

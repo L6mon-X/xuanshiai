@@ -70,6 +70,7 @@ ALLOWED_DOMAINS: frozenset[str] = frozenset(
         "tweet_task",
         "sms_broadcast",
         "sms_send_record",
+        "ad_slot",
     }
 )
 
