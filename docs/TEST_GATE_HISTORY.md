@@ -138,3 +138,94 @@
 - 本清单不替代真实 HTTP 消息联调、隔离 MySQL/Redis 集成测试、HBuilderX 构建、微信开发者工具、真机和 HTTPS/部署验收。
 - `scripts/reproduce_upload_exposure.py` 的匿名 `200` 结果仍是 P0 媒体风险证据，不是通过标准。
 - 当前未执行提交、推送、发布或上线。
+
+---
+
+## 2026-10-16 重新基线（AI 模块接手后）
+
+> 记录日期：2026-10-16。基线提交 `f63239d`，工作树含同日 AI 模块改动（FIX-01/04/05/07/09/10）。**上一节的 `2129 passed / 6 failed` 与 `56 errors` 是 2026-09-25 的历史记录，已不代表当前状态**，保留仅供对照；两次失败集合**零重叠**。
+
+| 检查 | 命令 | 结果 | 结论 |
+| --- | --- | --- | --- |
+| 后端全量无集成测试 | `.venv/Scripts/python.exe -m pytest --ignore=tests/integration -q -p no:randomly` | `8 failed, 2650 passed, 13 skipped, 27 warnings in 183.19s` | 8 项失败**全部为环境缺失**，无业务回归 |
+| 全仓 Ruff（app/tests/scripts） | `.venv/Scripts/python.exe -m ruff check app tests scripts` | `All checks passed!` | 已收零；09-25 记录的 `56 errors` 全部处理完毕 |
+
+Python 3.12.7（项目自带 venv `.venv/`），未连接共享开发或生产 MySQL/Redis；13 个 skip 来自显式隔离数据库条件与 `LIVE_API_BASE` 未设置的实时 HTTP 用例，不作为通过证据。
+
+计数口径：FIX 改动落地过程中先测得 `2646 passed`（FIX-01/04/05/07/09/10 的测试已计入），补齐 FIX-05 的 Provider 侧提取用例后为 `2650 passed`（+4）。两次 failed 集合完全相同，均为此处 8 项环境失败。
+
+### 与 09-25 基线的差异
+
+- 09-25 记录的 6 项失败（`m4_m7` 迁移资产、`pricing_config` ×2、资料标签目录、行政区编码归一、语音 WS 门禁夹具）**已全部修复，当前 0 项复现**。历史处置记录见上文对应小节。
+- `test_admin_permission_coverage::test_no_backoffice_route_is_permission_blind` 曾于 2026-10-16 早间为唯一真实回归（改密接口权限盲区），已由 FIX-01 修复收绿。
+
+### 当前 Pytest 失败清单（8 项，全部环境归因）
+
+| # | 测试 | 单行原因 | 归因（非业务） | 解封条件 |
+| --- | --- | --- | --- | --- |
+| 1 | `tests/test_ai_governance_contracts.py::test_ai_product_and_security_decisions_are_frozen` | `FileNotFoundError: PRODUCT.md not found above backend root`（:13） | 缺后端同级 `PRODUCT.md` | 取回 `E:/Xuanshiai/PRODUCT.md` |
+| 2-3 | `tests/test_memory_docs_contract.py::test_product_md_declares_memory_kernel_shadow_scope` / `::test_product_md_declares_deferred_scope` | `required document is missing: E:/Xuanshiai/PRODUCT.md`（:24） | 同上 | 同上 |
+| 4-6 | `tests/test_memory_docs_contract.py::test_architecture_doc_declares_frozen_contract` / `::test_architecture_doc_declares_no_downstream_switch_and_privacy_floor` / `::test_architecture_doc_declares_subject_write_guard` | `required document is missing: E:/Xuanshiai/docs/architecture/ai-memory-kernel-core-v1.md`（:24） | 缺架构文档 | 取回该架构文档 |
+| 7 | `tests/test_community_demo_seed.py::test_member_seed_assets_resolve_to_frontend_files` | `AssertionError: 缺少素材 anime:001`（:100） | 缺兄弟前端仓库 `xuanshiai-vue` | 克隆前端仓库到同级目录 |
+| 8 | `tests/test_voice_cleanup.py::test_symlink_inside_upload_dir_follows_target_expiry` | `assert not True`（:220） | Windows 无符号链接权限（权限不同时该用例在 fail/skip 间浮动） | 以管理员/开发者模式创建符号链接，或在 POSIX 环境运行 |
+
+**这 8 项均不随业务改动而变**：补齐上述缺失资产后应全部转绿。任何后续改动只要仍为这 8 项，即视为未引入回归。
+
+### 归属与边界
+
+- 本次基线对应的业务改动：`app/api/dependencies.py`（改密豁免）、`app/services/ai/gateway.py` + `providers.py`（token 用量透传）、`app/services/voice/gateway.py`（语音时长用量）、`app/services/ai_avatar.py`（分身失败审计）、`app/services/derivation_outbox.py`（心跳续租）、`app/workers/*`（结构化日志）。
+- 本清单**不替代**真实 HTTP 联调、隔离 MySQL/Redis 集成测试、真实 Provider 跑分、真机与部署验收；上述项目在本机仍为 `NOT_RUN`。
+
+---
+
+## 2026-10-16 真实 MySQL 集成验证（FIX-11 解锁）
+
+> 首次在真实 MySQL 上执行 AI 记忆域集成套件。此前该套件**从未在任何环境被实际执行过**（CI 无真实库、本机无 Docker、文档命令一律 `--ignore=tests/integration`）。
+
+| 检查 | 命令 | 结果 | 结论 |
+| --- | --- | --- | --- |
+| FIX-11 六个目标文件 | `$env:AI_TEST_DATABASE_URL="mysql+aiomysql://root:123456@127.0.0.1:3306/xuanshiai_ai_test"` + `pytest {投影/purge围栏/授权代际/清理重授权/记忆/phase3} -q -p no:randomly` | `31 passed in 34.51s` | 记忆域真实库路径打通 |
+| `tests/integration/ai` 全域 | 同上，目录级 | `14 failed, 140 passed, 5 skipped, 6 errors in 242.76s` | 6 ERROR = 缺 Redis；3 SKIP = 缺语音凭证；1 SKIP = Windows 子进程；1 SKIP = 数据依赖；2 失败 = `voice/ws-ticket` 503；3 失败 = 缺真实 Provider；**7 失败待逐项定性** |
+
+### 环境
+
+- 本地 MySQL 8.0.44（`MySQL80` 服务在运行），测试库 `xuanshiai_ai_test`（与开发库 `xuanshiai` 分离）。
+- **无 Redis、无 Docker、无语音凭证、`AI_ENABLED=false` / `AI_PROVIDER=mock`** ⇒ Redis 类、语音类、真实 Provider 类用例仍不可闭环。
+
+### 本次暴露的真实缺陷（已修复）
+
+1. `test_ai_memory_purge_grant_fence_real_db.py`：前置断言基于「同秒 ⇒ 快照相同」，但快照自 `ce72b9e`（10-10）起绑定持久 `grant_id`，恒不相等 ⇒ 断言自 10-10 起恒红且从未被执行。已改为断言代际必然不同。
+2. `test_ai_memory_real_db.py:290`：`ORDER BY id` 引用不存在的列（`ai_memory_observation` 主键为 `observation_id`）⇒ `(1054, "Unknown column 'id' in 'order clause'")`。已改用 `observation_id`。
+
+### 边界
+
+7 项「空结果 / None」失败**未定性**，不得归为环境。真实 Provider 跑分、语音链路、真机验收在本机仍为 `NOT_RUN`，不以 Mock 冒充验收。
+
+---
+
+## 2026-10-18 同步上游 `9f939eb` 后的重新基线
+
+> 触发：`git pull --tags origin main` 报 `local changes ... would be overwritten`（详见 `docs/待完成事项.md` 2026-10-18 节）。同步方式：丢弃与上游逐字重复的 2 处本地改动后 `git pull --ff-only`，**纯快进、无 merge commit**。基线提交 `9f939eb`。
+
+| 检查 | 命令 | 结果 | 结论 |
+| --- | --- | --- | --- |
+| 后端全量无集成测试 | `.venv/Scripts/python.exe -m pytest --ignore=tests/integration -q -p no:randomly` | `7 failed, 2679 passed, 15 skipped in 192.33s` | 7 项**全部为环境缺失**，无业务回归 |
+| 权限覆盖 + 改密契约 | `pytest tests/test_admin_permission_coverage.py tests/test_admin_password_change_contract.py -q` | `15 passed` | 上游 `2e23f11` 的豁免生效，本地 5 例行为测试同时通过 |
+| 记忆域真实 MySQL（FIX-11 六文件） | `AI_TEST_DATABASE_URL=...` + `pytest {六文件} -q` | `31 passed in 34.99s` | 与同步前一致，上游改动未影响记忆域 |
+| 全仓 Ruff | `ruff check app tests scripts` | `All checks passed!` | 0 告警 |
+
+### 失败清单（7 项，全部环境归因）
+
+| 测试 | 归因 | 解封条件 |
+| --- | --- | --- |
+| `test_ai_governance_contracts::test_ai_product_and_security_decisions_are_frozen` | 缺 `E:/Xuanshiai/PRODUCT.md` | 取回同级 `PRODUCT.md` |
+| `test_memory_docs_contract` ×2（`test_product_md_*`） | 同上 | 同上 |
+| `test_memory_docs_contract` ×3（`test_architecture_doc_*`） | 缺 `E:/Xuanshiai/docs/architecture/ai-memory-kernel-core-v1.md` | 取回该架构文档 |
+| `test_community_demo_seed::test_member_seed_assets_resolve_to_frontend_files` | 缺兄弟前端仓库 `xuanshiai-vue` | 克隆到同级目录 |
+
+> 与 2026-10-16 基线的差异：失败数由 8 降为 7、skip 由 13 升为 15。**不是修复了什么业务缺陷**，而是语音符号链接两个用例从"不稳定失败"改为"确定性 skip"（见下）。pass 数 2650 → 2679 的增量来自上游新增测试（`test_admin_common_upload_file` / `test_customer_lead_contact_guard` / `test_member_media_admin_ext` / `test_offline_vip_admin_ext` / `test_m6_partner_ext` 等）。
+
+### 本次修复的两处测试稳定性缺陷
+
+1. **全量偶发卡死定位到具体用例**：`tests/test_voice_cleanup.py::test_worker_forever_loop_schedules_cleanup`。根因是该用例只把 `_run_round` 打桩，却在首轮真实触发了需要 DB 会话的**记忆状态 TTL 清理**（`last_memory_state_cleanup_at = -inf` ⇒ 首轮必然执行），与其 docstring 声称的"避免测试触碰数据库"矛盾。整套件跑到此处时连接池已绑定前序用例的已关闭事件循环，该 await 永不完成；而 `await task` 等的是不可取消的 Future ⇒ 进程 CPU 归零、日志停在该用例、15 分钟无进展。诊断手法：`-o faulthandler_timeout=180` 转储线程栈，可见事件循环空闲于 `select()`。修复：按 `test_ai_memory_ttl_cleanup` 同口径把 `_run_memory_state_ttl_cleanup_round` 打桩为空转，并显式钉住 retention 间隔。
+2. **符号链接两个用例的环境探测无效**：原逻辑只捕获 `os.symlink` 抛出的异常来判断"环境是否支持"，但本机实测该调用**既不抛异常也建不出真链接**（`link.is_symlink()` 为 False），导致两个用例比的是"链接不存在"这一假前提。已在创建后补 `if not link.is_symlink(): pytest.skip(...)`，与 docstring 的"symlink 不可用的环境自动 skip"一致。顺带核实：越界目标文件确实未被删除，删的只是链接本身（且前提不成立），**不存在路径穿越缺陷**。

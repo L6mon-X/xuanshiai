@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -15,6 +16,7 @@ from fastapi import HTTPException
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.logging import request_id_context
 from app.core.profile_tags import display_personal_tags
 from app.core.config import settings
 from app.core.redis import consume_daily, daily_quota_key, refund_daily
@@ -416,6 +418,35 @@ def _extract_provider_reply(payload: Any) -> str:
     return reply
 
 
+async def _record_avatar_audit(
+    request_id: str,
+    *,
+    status: str,
+    started: float,
+    error_code: str | None = None,
+) -> None:
+    # 分身会话使用独立的 ai_avatar_base_url，不能并入主 provider registry。
+    # 这里只补会话级审计，不记录问题、提示词或供应商响应；审计写失败不影响业务。
+    try:
+        await record_generation_audit(
+            GenerationAuditEvent(
+                request_id=request_id,
+                task_id=None,
+                scene="ai_avatar_session",
+                provider=settings.ai_avatar_provider,
+                model=settings.ai_avatar_model,
+                prompt_version="ai-avatar-prompt-v1",
+                schema_version="ai-avatar-v1",
+                status=status,
+                error_code=error_code,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                display_eligible=False,
+            )
+        )
+    except Exception:
+        logger.warning("ai_avatar_session_audit_failed")
+
+
 async def call_ai_provider(
     context: AiAvatarContext,
     history: list[dict[str, str]],
@@ -451,6 +482,12 @@ async def call_ai_provider(
         "stream": False,
     }
     try:
+        # 与入站请求共用同一关联编号；无请求上下文（如后台调用）时现场生成一次，
+        # 成功/失败审计共用该编号，可按同一请求追踪调用终态。
+        request_id = request_id_context.get()
+        if not request_id or request_id == "-":
+            request_id = uuid.uuid4().hex
+        started = time.monotonic()
         async with httpx.AsyncClient(
             timeout=settings.ai_avatar_timeout_seconds,
             trust_env=False,
@@ -460,28 +497,17 @@ async def call_ai_provider(
             reply = _extract_provider_reply(response.json())
     except httpx.TimeoutException as exc:
         logger.warning("AI provider timed out")
+        await _record_avatar_audit(request_id, status="failed", started=started, error_code="AI_TIMEOUT")
         raise HTTPException(504, detail="AI 回答超时，请稍后重试") from exc
-    except (httpx.HTTPError, ValueError, AiProviderError) as exc:
+    except httpx.HTTPError as exc:
         logger.warning("AI provider request failed: error_type=%s", type(exc).__name__)
+        await _record_avatar_audit(request_id, status="failed", started=started, error_code="AI_PROVIDER_ERROR")
         raise HTTPException(503, detail="AI 服务暂时不可用，请稍后重试") from exc
-    # 分身会话使用独立的 ai_avatar_base_url，不能并入主 provider registry。
-    # 这里只补会话级审计，不记录问题、提示词或供应商响应。
-    try:
-        await record_generation_audit(
-            GenerationAuditEvent(
-                request_id=uuid.uuid4().hex,
-                task_id=None,
-                scene="ai_avatar_session",
-                provider=settings.ai_avatar_provider,
-                model=settings.ai_avatar_model,
-                prompt_version="ai-avatar-prompt-v1",
-                schema_version="ai-avatar-v1",
-                status="succeeded",
-                display_eligible=False,
-            )
-        )
-    except Exception:
-        logger.warning("ai_avatar_session_audit_failed")
+    except (ValueError, AiProviderError) as exc:
+        logger.warning("AI provider request failed: error_type=%s", type(exc).__name__)
+        await _record_avatar_audit(request_id, status="failed", started=started, error_code="AI_INVALID_RESPONSE")
+        raise HTTPException(503, detail="AI 服务暂时不可用，请稍后重试") from exc
+    await _record_avatar_audit(request_id, status="succeeded", started=started)
     return reply
 
 

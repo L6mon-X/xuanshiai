@@ -14,7 +14,6 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from app.api import routes as api_routes_module
 from app.api.dependencies import CurrentMatchmakerAdmin, get_current_matchmaker_admin
 from app.api.routes import apportion_config_admin
 from app.main import app
@@ -22,7 +21,6 @@ from app.schemas.matchmaker_admin import (
     ApportionAbandonUpdate,
     ApportionAssignUpdate,
     ApportionConfig,
-    ApportionConfigAuditLogPage,
     MatchmakerAdminAccount,
 )
 

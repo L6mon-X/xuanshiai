@@ -187,6 +187,11 @@ async def test_out_of_bounds_symlink_is_refused(voice_upload_dir, tmp_path) -> N
         os.symlink(outside_secret, link)
     except (NotImplementedError, OSError):
         pytest.skip("当前环境不支持创建符号链接（Windows 需管理员/开发者模式）")
+    if not link.is_symlink():
+        # 部分受限环境（含沙箱/无 SeCreateSymbolicLinkPrivilege）里 os.symlink
+        # 既不抛异常也建不出真链接：此时断言失去意义，按"环境不支持"跳过，
+        # 而不是报一个与产品行为无关的失败。
+        pytest.skip("os.symlink 未真正创建符号链接（受限环境），跳过越界拒绝断言")
 
     stats = await cleanup_expired_voice_audio()
 
@@ -214,6 +219,9 @@ async def test_symlink_inside_upload_dir_follows_target_expiry(
         os.symlink(target, link)
     except (NotImplementedError, OSError):
         pytest.skip("当前环境不支持创建符号链接（Windows 需管理员/开发者模式）")
+    if not link.is_symlink():
+        # 同 test_out_of_bounds_symlink_is_refused：受限环境里链接可能根本没建成。
+        pytest.skip("os.symlink 未真正创建符号链接（受限环境），跳过链接触达过期断言")
 
     stats = await cleanup_expired_voice_audio()
 
@@ -396,6 +404,13 @@ async def test_worker_forever_loop_schedules_cleanup(
     """``_run_forever`` 主循环作为定时任务机制触发语音音频清理（首轮即执行）。
 
     ``_run_round`` 被替换为空转，避免测试触碰数据库；循环随后被取消。
+
+    主循环首轮除语音清理外还会触发两条**需要真实数据库会话**的维护任务：记忆
+    状态 TTL 清理（``last_memory_state_cleanup_at`` 初值 ``-inf``，首轮必然执行）
+    与 retention 清理（以配置间隔节流，首轮不执行）。单测若不隔离前者，就会隐式
+    依赖一个可用的 DB 连接池；实测整套件跑到此处会**永久挂起**（连接池绑定的事
+    件循环已被前序用例关闭，``await task`` 等不到取消送达），CPU 归零、日志停在
+    本用例。故与 ``test_ai_memory_ttl_cleanup`` 同口径地把 TTL 清理轮次打桩为空转。
     """
     from app.workers import ai_worker
 
@@ -407,10 +422,18 @@ async def test_worker_forever_loop_schedules_cleanup(
     async def fake_round(worker_id: str, batch_size: int):
         return 0, 0, 0
 
+    async def fake_memory_state_ttl_cleanup() -> dict[str, int]:
+        return {"expired": 0, "batches": 0, "failed_batches": 0}
+
     monkeypatch.setattr(ai_worker, "_run_round", fake_round)
+    monkeypatch.setattr(
+        ai_worker, "_run_memory_state_ttl_cleanup_round", fake_memory_state_ttl_cleanup
+    )
     monkeypatch.setattr(
         settings, "ai_voice_audio_cleanup_interval_seconds", 3600
     )
+    # 显式钉住 retention 间隔，避免其它用例改动全局 settings 时把 DB 任务带进来。
+    monkeypatch.setattr(settings, "ai_retention_cleanup_interval_seconds", 3600)
 
     task = asyncio.create_task(ai_worker._run_forever("worker-test", 1, 0.01))
     try:

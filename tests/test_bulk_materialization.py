@@ -219,7 +219,6 @@ async def test_recommend_materialize_uses_batch_insert(monkeypatch) -> None:
     session._route = _extended_route
     # executemany 展开发生在 _orig_execute 内部；批量 INSERT 的行由
     # recommend 直接写（测试 store 只需接受单行 upsert 展开）。
-    baseline = len(session.calls)
     # 701 有画像；候选池只有 702。
     # snapshot_id = await recommend_mod.materialize_recommendations(session, 701)
     # （实际调用见下）

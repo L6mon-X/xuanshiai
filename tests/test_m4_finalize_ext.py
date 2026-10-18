@@ -10,7 +10,6 @@
 """
 
 from io import BytesIO
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException

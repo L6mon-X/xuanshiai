@@ -125,11 +125,14 @@ async def test_fenced_purge_keeps_regranted_grant_same_second(db: AsyncSession) 
     await _consent(db, "idem-grant-2")
     await db.commit()
     new_snapshot = await _current_snapshot(db)
-    # 同秒撤回+重授权时快照**相同**（granted_at 仅秒级精度）——这正是清理侧
-    # 无法用 grant 行判断代际的原因，本断言把它固定为事实。
-    assert new_snapshot == old_snapshot, (
-        "若无条件相等被打破，说明授权表新增了可区分代际的列，"
-        "本测试的结论与 purge 的判据需要重新评估"
+    # 快照自 2026-10-10（`ce72b9e`「记忆授权修正」）起绑定持久 `grant_id`
+    # （见 `app/services/ai/memory/projections.py:derive_consent_snapshot_id`
+    # 的 `generation` 字段），因此「撤回 + 重新授权」**无条件**产生不同快照，
+    # 不再依赖 `granted_at` 的秒级精度来区分代际。清理侧按「不属于当前快照」
+    # 判定，同秒与跨秒两种情形下都成立。
+    assert new_snapshot != old_snapshot, (
+        "快照必须绑定持久 grant_id 以区分代际；两代快照若相等，"
+        "清理侧将无法区分新旧授权，需重新评估 purge 判据"
     )
 
     # 新代 grant（upsert 复活同一行）。

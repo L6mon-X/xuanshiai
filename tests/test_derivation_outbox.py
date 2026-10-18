@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -527,3 +528,77 @@ async def test_block_invalidation_covers_both_members_of_the_relationship(
         (11, RevisionKind.RELATIONSHIP, ("block",), "relationship_blocked", 10),
     ]
     assert db.order[-3:] == ["ENQUEUE", "ENQUEUE", "COMMIT"]
+
+
+class _RecordingSession:
+    """记录 SQL 的最小 fake session：仅供心跳续租路径断言。"""
+
+    def __init__(self) -> None:
+        self.statements: list[str] = []
+        self.commits = 0
+
+    def in_transaction(self) -> bool:
+        return False
+
+    async def execute(self, statement: Any, params: dict[str, Any] | None = None) -> Any:
+        self.statements.append(str(statement))
+        return _WriteResult()
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+
+@pytest.mark.asyncio
+async def test_cleanup_round_renews_lease_for_slow_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """慢批量 handler 超过半租约时，剩余事件应被续租且续租随 claim 会话提交。"""
+    from app.services import derivation_outbox as outbox
+
+    events = [
+        DerivationEvent(
+            event_id=f"evt-{index}",
+            aggregate_type="ai_profile",
+            aggregate_id=1,
+            event_type="ai_profile_deleted",
+            changed_fields=(),
+            source_revision=RevisionVector(),
+            occurred_at=datetime.now(UTC).replace(tzinfo=None),
+            priority=0,
+        )
+        for index in range(3)
+    ]
+
+    async def fake_claim(*args: Any, **kwargs: Any) -> list[DerivationEvent]:
+        return events
+
+    async def slow_consume(*args: Any, **kwargs: Any) -> None:
+        await asyncio.sleep(0.05)
+
+    monkeypatch.setattr(outbox, "claim_outbox_events", fake_claim)
+    monkeypatch.setattr(outbox, "_consume_one_independent", slow_consume)
+    monkeypatch.setattr(outbox.settings, "ai_lease_seconds", 1)
+    monkeypatch.setattr(outbox.time, "monotonic", _FakeClock())
+
+    db = _RecordingSession()
+    stats = await outbox.run_cleanup_consumer_round(
+        db, "worker-1", datetime.now(UTC).replace(tzinfo=None), 10
+    )
+
+    assert stats["claimed"] == 3
+    renewals = [
+        statement
+        for statement in db.statements
+        if "UPDATE derivation_outbox SET lease_until" in statement
+    ]
+    assert renewals, "慢批量应触发至少一次租约续期"
+    assert db.commits >= 2  # claim 租约提交 + 至少一次续租提交
+
+
+class _FakeClock:
+    """每次调用前进 0.4s 的单调时钟：三次 handler 后必然越过半租约阈值。"""
+
+    def __init__(self) -> None:
+        self._value = 0.0
+
+    def __call__(self) -> float:
+        self._value += 0.4
+        return self._value

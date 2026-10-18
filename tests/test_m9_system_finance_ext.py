@@ -83,7 +83,6 @@ def test_m9_econtract_config_has_enabled_flag() -> None:
 
 def test_m9_credit_grants_route_registered() -> None:
     """credit-grants 端点已注册"""
-    import app.api.router as r
     from app.api.routes.finance import admin_router
 
     # 取所有注册的路由路径与 method

@@ -13,7 +13,6 @@ Real-database consistency runs in ``tests/integration/ai/``.
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 import pytest

@@ -167,7 +167,7 @@ def test_all_activity_signup_list_validates_filters() -> None:
 
 
 def _activity_payload(**overrides):
-    from datetime import datetime, timedelta
+    from datetime import datetime
 
     base = {
         "title": "7.26 一年内结婚专场",
