@@ -40,6 +40,8 @@ NEW_MEMBER_FILTER_DEFAULTS: dict[str, object] = {
     # 2026-10-16/17 新增：列表可见但无查询参数的列，以及收入上下限。
     "intention_level": None, "house": None, "ethnicity": None,
     "constellation": None, "zodiac": None,
+    # A9/B3：弃海筛选（true仅弃海 / false排除弃海）。
+    "abandoned": None,
 }
 
 
@@ -259,13 +261,16 @@ async def test_member_list_returns_nothing_for_unbound_account() -> None:
 
 @pytest.mark.asyncio
 async def test_member_statistics_scopes_vip_subquery() -> None:
-    keys = ("total", "male", "female", "vip", "active", "unassigned", "never_followed", "follow_due_today")
+    keys = ("total", "male", "female", "vip", "active", "unassigned", "never_followed", "follow_due_today", "abandoned")
     db = StubDB([StubResult(one={key: 0 for key in keys})])
     stats = await crm.member_statistics(current=_admin("STORE"), db=db)
     assert stats.total == 0
+    assert stats.abandoned == 0
     assert db.statements[0][1].get("scope_store_id") == ORGANIZATION_ID
     # VIP 子查询必须使用独立别名同口径收口，禁止统计全平台 VIP。
     assert "vip_scope_assignment.user_id = vm.user_id" in db.sql()
+    # 弃海计数同样必须收口到账号数据范围（A9/B3）。
+    assert "abandoned_scope_assignment.user_id = au.id" in db.sql()
     assert "org_type = 'store'" in db.sql()
 
 

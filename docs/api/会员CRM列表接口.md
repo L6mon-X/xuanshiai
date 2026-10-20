@@ -99,7 +99,26 @@ Content-Type: application/json
 
 新增通话记录。Body：`{"direction":"OUTBOUND","status":"COMPLETED","duration_seconds":60,"remark":"已沟通"}`；`direction` 支持 `INBOUND/OUTBOUND`，`status` 支持 `COMPLETED/MISSED/FAILED`。
 
+## 弃海筛选与统计（B3 / A9）
+
+`GET /admin/matchmaker/members` 新增 query 参数：
+
+| 参数 | 类型 | 必填 | 校验 | 含义 |
+|---|---|---|---|---|
+| `abandoned` | bool | 否 | `true` / `false` | `true` 仅弃海会员；`false` 排除弃海会员；不传不限制 |
+
+- 谓词：`EXISTS (SELECT 1 FROM member_abandonment ma WHERE ma.user_id = u.id AND ma.restored_at IS NULL)`；
+  `false` 时取 `NOT EXISTS`。弃海口径以 `member_abandonment` 表有效行（`restored_at IS NULL`）为准，
+  历史客源 `LOST` 已由迁移回填为 `abandon_type='lead_sync'`。
+- 出参：`MemberListItem` 新增 `abandoned: bool`（默认 `false`）。
+- 统计：`GET /admin/matchmaker/members/statistics` 新增 `abandoned`（默认 `0`），
+  口径已按 `scope_exists_clause` 收口，门店/组织账号不会看到全局规模。
+
+弃海列表、手动弃海与捞回接口见 [`docs/api/member-abandonment.md`](member-abandonment.md)。
+
 ## 变更记录
+
+- 2026-10-20（B3 / A9）：会员列表新增 `abandoned` 筛选参数与出参字段，统计新增 `abandoned` 计数；新增弃海 / 捞回接口。
 
 - 2026-10-17：`PATCH /admin/matchmaker/members/{member_id}` 新增 `phone`（11 位、全局唯一、撞号 409）与 `wechat_added`（0/1/2）。此前会员抽屉里手机号与微信号的「修改」、以及「加上了？」下拉都没有可写字段，是死控件。
 - 2026-10-11（D-9 敏感操作）：`PATCH /admin/matchmaker/members/{member_id}/assignment`（改派）与 `POST /admin/matchmaker/members/batch-status`（批量改状态）纳入统一敏感操作，强制 `Idempotency-Key` + `confirm=true`，同键重放不重复执行；越权在幂等预占之前拦截。

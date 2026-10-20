@@ -609,7 +609,9 @@ def test_member_route_exposes_new_filter_params() -> None:
                  # 在列表里可见却无查询参数，补参数前进不了筛选。
                  # 2026-10-17：另补收入的上下限（界面是区间下拉，不是精确匹配）。
                  "intention_level", "house", "ethnicity", "constellation", "zodiac",
-                 "income_min", "income_max"):
+                 "income_min", "income_max",
+                 # A9/B3：会员侧弃海筛选（true仅弃海 / false排除弃海）。
+                 "abandoned"):
         assert name in names, name
 
 

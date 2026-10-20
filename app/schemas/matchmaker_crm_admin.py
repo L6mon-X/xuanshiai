@@ -63,6 +63,7 @@ class MemberListItem(BaseModel):
     level: str | None = None
     fetched_at: datetime | None = None
     assigned_at: datetime | None = None
+    abandoned: bool = False  # 弃海（member_abandonment 存在未捞回记录）
 
 
 class MemberPage(BaseModel):
@@ -132,6 +133,7 @@ class MemberStatistics(BaseModel):
     unassigned: int = 0
     never_followed: int = 0
     follow_due_today: int = 0
+    abandoned: int = 0
 
 
 class MemberOption(BaseModel):

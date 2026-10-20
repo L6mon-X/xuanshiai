@@ -175,6 +175,19 @@ def build_member_filter(
         where.append(
             "NOT EXISTS (SELECT 1 FROM offline_vip ov WHERE ov.user_id = u.id AND ov.deleted_at IS NULL)"
         )
+    # 会员弃海口径（A9/B3）：以 member_abandonment 中未捞回（restored_at IS NULL）的
+    # 有效记录为准。历史客源侧 status=LOST 的会员由迁移回填成 lead_sync 行，二者统一。
+    abandoned = values.get("abandoned")
+    if abandoned is True:
+        where.append(
+            "EXISTS (SELECT 1 FROM member_abandonment ma"
+            " WHERE ma.user_id = u.id AND ma.restored_at IS NULL)"
+        )
+    elif abandoned is False:
+        where.append(
+            "NOT EXISTS (SELECT 1 FROM member_abandonment ma"
+            " WHERE ma.user_id = u.id AND ma.restored_at IS NULL)"
+        )
 
     # ---- 归属 / 红娘 ----
     if values.get("organization_id") is not None:

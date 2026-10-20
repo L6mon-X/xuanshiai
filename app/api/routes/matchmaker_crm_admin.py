@@ -287,6 +287,8 @@ async def _member_query(
         COALESCE({user_expr('activity_signup')}, 0) AS activity_signup,
         {user_expr('level')} AS level, {user_expr('fetched_at')} AS fetched_at,
         a.assigned_at,
+        EXISTS (SELECT 1 FROM member_abandonment ma
+            WHERE ma.user_id = u.id AND ma.restored_at IS NULL) AS abandoned,
         CASE WHEN v.user_id IS NULL OR (v.vip_end_at IS NOT NULL AND v.vip_end_at <= UTC_TIMESTAMP()) THEN 0 ELSE 1 END AS is_vip
         {base} WHERE {where} ORDER BY {order_by} LIMIT :limit OFFSET :offset"""), params)
     count = await db.execute(text(f"SELECT COUNT(*) {base} WHERE {where}"), {k: v for k, v in params.items() if k not in ("limit", "offset")})
@@ -340,6 +342,7 @@ async def members(
     level: str | None = Query(None, max_length=32, description="会员级别多选，英文逗号分隔，按 users.level 原值精确匹配"),
     tags: str | None = Query(None, max_length=255, description="标签多选，英文逗号分隔，任一命中"),
     offline_vip: bool | None = Query(None),
+    abandoned: bool | None = Query(None, description="弃海状态 true仅弃海会员 / false排除弃海会员"),
     promoted: bool | None = Query(None),
     newcomer: bool | None = Query(None),
     activity_signup: bool | None = Query(None),
@@ -367,6 +370,7 @@ async def members(
         "residence": residence, "hometown": hometown, "hukou": hukou,
         "religion": religion, "car": car, "level": level, "tags": tags,
         "offline_vip": offline_vip, "promoted": promoted, "newcomer": newcomer,
+        "abandoned": abandoned,
         "activity_signup": activity_signup, "wechat_added": wechat_added,
         "behavior_type": behavior_type, "created_start": created_start,
         "created_end": created_end, "assigned_start": assigned_start,
@@ -390,11 +394,20 @@ async def member_statistics(current: CurrentMatchmakerAdmin = Depends(get_curren
         correlation="vip_scope_assignment.user_id = vm.user_id",
         assignment_alias="vip_scope_assignment",
     )
+    # 弃海计数同样必须收口到账号数据范围，否则门店/组织账号能看到全局弃海规模。
+    abandoned_scope = current.scope_exists_clause(
+        params,
+        correlation="abandoned_scope_assignment.user_id = au.id",
+        assignment_alias="abandoned_scope_assignment",
+    )
     row = (await db.execute(text(f"""SELECT COUNT(*) total, SUM(u.gender = 1) male, SUM(u.gender = 2) female,
         SUM(u.status = 1) active,
         SUM(a.matchmaker_id IS NULL) unassigned,
         SUM(f.last_follow_at IS NULL) never_followed,
         SUM(f.next_follow_at >= CURDATE() AND f.next_follow_at < DATE_ADD(CURDATE(), INTERVAL 1 DAY)) follow_due_today,
+        (SELECT COUNT(DISTINCT ma.user_id) FROM member_abandonment ma
+            WHERE ma.restored_at IS NULL
+              AND EXISTS (SELECT 1 FROM users au WHERE au.id = ma.user_id AND ({abandoned_scope}))) abandoned,
         (SELECT COUNT(DISTINCT vm.user_id) FROM user_membership vm
             WHERE vm.status = 1 AND (vm.end_at IS NULL OR vm.end_at > UTC_TIMESTAMP())
               AND ({vip_scope})) vip
@@ -402,7 +415,7 @@ async def member_statistics(current: CurrentMatchmakerAdmin = Depends(get_curren
         LEFT JOIN {_ASSIGNMENT_DISPLAY_DERIVED} a ON a.user_id = u.id
         LEFT JOIN (SELECT user_id, MAX(created_at) last_follow_at, MAX(next_follow_at) next_follow_at FROM member_follow_up GROUP BY user_id) f ON f.user_id = u.id
         WHERE ({scope})"""), params)).mappings().one()
-    return MemberStatistics(**{key: int(row[key] or 0) for key in ("total", "male", "female", "vip", "active", "unassigned", "never_followed", "follow_due_today")})
+    return MemberStatistics(**{key: int(row[key] or 0) for key in ("total", "male", "female", "vip", "active", "unassigned", "never_followed", "follow_due_today", "abandoned")})
 
 
 @router.post("/members/batch-status")

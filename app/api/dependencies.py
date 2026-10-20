@@ -184,6 +184,17 @@ class CurrentMatchmakerAdmin:
             "merchant.read": {"merchant.read", "merchant.manage"},
             "video.read": {"video.read", "video.manage"},
             "matchmaker.system.read": {"matchmaker.system.read", "matchmaker.system.manage"},
+            # 后台运营第三方适配模块（A1–A10）：读码允许写码账号通过。
+            "platform.sms.read": {"platform.sms.read", "platform.sms.write"},
+            "platform.wechat.read": {"platform.wechat.read", "platform.wechat.write"},
+            "finance.contract.read": {"finance.contract.read", "finance.contract.write"},
+            "platform.material.read": {"platform.material.read", "platform.material.write"},
+            "platform.qrcode.read": {"platform.qrcode.read", "platform.qrcode.write"},
+            "platform.outbound.read": {"platform.outbound.read", "platform.outbound.write"},
+            "platform.sales.read": {"platform.sales.read", "platform.sales.write"},
+            "platform.lovecard.read": {"platform.lovecard.read", "platform.lovecard.write"},
+            "platform.interact.read": {"platform.interact.read", "platform.interact.write"},
+            "platform.alliance.read": {"platform.alliance.read", "platform.alliance.write"},
         }
         allowed = aliases.get(permission, {permission})
         if "*" not in self.permissions and not (allowed & self.permissions):
@@ -405,11 +416,32 @@ def _declared_permission(request: Request) -> str | tuple[str, ...] | None:
     return tuple(str(item) for item in declared)
 
 
+# 这些后台前缀的权限由各路由的 ``@declare_permission`` 精确定义。
+# 必须先于下方关键词映射返回 None：否则 ``/admin/wechat/messages/send`` 会命中
+# ``/messages``（message.manage）、``/admin/alliance/activities`` 会命中
+# ``/activities``（community.activity.manage），让无关权限码也能调用这些接口。
+_DECLARED_PERMISSION_PREFIXES = (
+    "/admin/sms",
+    "/admin/wechat",
+    "/admin/e-contract",
+    "/admin/outbound-call",
+    "/admin/materials",
+    "/admin/qrcodes",
+    "/admin/sales-library",
+    "/admin/lovecard-templates",
+    "/admin/interact",
+    "/admin/alliance",
+)
+
+
 def _matchmaker_admin_permission(request: Request) -> str | None:
     path = request.url.path
     method = request.method.upper()
     if _is_permission_exempt(path):
         return None
+    for prefix in _DECLARED_PERMISSION_PREFIXES:
+        if path == f"/api/v1{prefix}" or path.startswith(f"/api/v1{prefix}/"):
+            return None
     if path == "/api/v1/admin/dashboard/stats":
         return "matchmaker.read"
     if path == "/api/v1/admin/matchmaker/statistics":

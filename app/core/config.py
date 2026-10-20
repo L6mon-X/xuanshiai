@@ -93,6 +93,27 @@ class Settings(BaseSettings):
     tencent_live_mix_stream_enabled: bool = False
     tencent_live_css_enabled: bool = False
 
+    # ── 后台运营第三方服务商适配层（密钥仅走环境变量，管理端接口不回显明文）──
+    # 短信模板群发（A1）：厂商未定前保持 disabled，管理端接口 503 明确报错。
+    sms_template_provider: str = "disabled"
+    sms_access_key: str | None = None
+    sms_access_secret: SecretStr | None = None
+    # 微信公众号平台（A2）：凭据通过环境变量注入，库内 wechat_mp 配置只存非敏感项。
+    wechat_mp_app_id: str | None = None
+    wechat_mp_app_secret: SecretStr | None = None
+    wechat_mp_token: SecretStr | None = None
+    wechat_mp_aes_key: str | None = None
+    # 腾讯电子签（A3）：无凭证时合同创建/签署/作废接口 503。
+    tencent_esign_secret_id: str | None = None
+    tencent_esign_secret_key: SecretStr | None = None
+    tencent_esign_operator_open_id: str | None = None
+    # 电话外呼平台（A6）：捷讯 API 未定前保持 disabled。
+    outbound_call_provider: str = "disabled"
+    outbound_call_base_url: str | None = None
+    outbound_call_account: str | None = None
+    outbound_call_secret: SecretStr | None = None
+    outbound_call_timeout_seconds: float = Field(default=10, gt=0, le=60)
+
     # AI avatar calls an OpenAI-compatible chat-completions service from the
     # backend only. API keys must never be exposed to the mini-program.
     ai_avatar_provider: Literal["disabled", "openai_compatible"] = "disabled"
@@ -448,6 +469,12 @@ class Settings(BaseSettings):
             len(self.sms_mock_code) != 6 or not self.sms_mock_code.isdigit()
         ):
             raise ValueError("SMS_MOCK_CODE 必须是6位数字")
+        # A1/A6：运营群发与外呼通道的 Mock 实现只允许开发/测试环境使用。
+        if not self.is_test_mode and "mock" in {
+            self.sms_template_provider.lower(),
+            self.outbound_call_provider.lower(),
+        }:
+            raise ValueError("生产环境禁止启用短信群发或外呼平台的 Mock 服务")
         if (
             self.environment == "production"
             and self.aliyun_content_moderation_enabled

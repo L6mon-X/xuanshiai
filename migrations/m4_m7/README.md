@@ -7,6 +7,7 @@
 | `20260916_01_m4_m7_backoffice_columns_*` | M4–M7 后台运营补列与种子 | 见下文「一、后台运营补列」 |
 | `20261004_01_activity_signup_soft_delete_*` | `activity_signup` 软删除两列 + 索引 | 见下文「二、活动报名软删除」 |
 | `20261012_01_realname_face_backfill_*` | 实名/人脸双写一致性数据回填 | 见下文「三、实名/人脸双写回填」 |
+| `20261020_01_backoffice_field_gaps_*` | B1 门店 5 列 + B2 互选活动 7 列 | 见下文「四、后台字段缺口补列」 |
 
 ---
 
@@ -87,3 +88,32 @@ up 通过 `INFORMATION_SCHEMA` 检查后用 `PREPARE`/`EXECUTE` 执行动态 DDL
 - `tests/test_activity_signup_soft_delete.py`：覆盖 `20261004_01` 的 up/down/verify 结构、软删除列在 `_ensure_m7_columns` 中的齐备性，以及应用层软删除与审计行为。
 - `tests/test_realname_face_unification.py`：覆盖 D-14 的代码侧一致性（两个后台入口都写 `realname_status`）。
 > 测试范围：没有针对回填 SQL 的真实 MySQL 自动化执行测试；`tests/test_realname_face_unification.py` 覆盖代码侧一致性，不覆盖数据回填。`down` 为 no-op，发布前必须完成备份、校验脚本和人工回滚预案，不得把 no-op down 当作可逆迁移。
+
+---
+
+## 四、后台字段缺口补列迁移（2026-10-20，B1 / B2）
+
+`20261020_01_backoffice_field_gaps_up.sql` 逐条镜像 `database_setup_marriage.py` 的
+`_ensure_m5_columns`（B1 门店 5 列）与新增的 `_ensure_mutual_selection_columns`
+（B2 互选活动 7 列），为 `AUTO_INIT_DB=false` 的生产/预发布库补齐
+`后端接口缺失清单.md` 的 B 类字段缺口。
+
+覆盖范围（12 列）：
+
+- **organization（B1，5 列）**：`logo`、`address`、`commission_mode`、`commission_value`、`intro`。
+- **mutual_selection_activity（B2，7 列）**：`signup_start_time`、`signup_end_time`、
+  `mutual_start_time`、`mutual_end_time`、`activity_fee`、`show_wechat_direct`、`show_matchmaker_push`。
+
+**幂等性**：`INFORMATION_SCHEMA` 检查 + `PREPARE`/`EXECUTE` 动态 DDL，可重复执行；
+表不存在时补列跳过。两个 `NOT NULL` 列（`commission_mode`、`show_wechat_direct`、
+`show_matchmaker_push`）都带默认值，存量行自动落默认值，不改写业务数据。
+
+**执行与校验**：
+
+1. 执行 `20261020_01_backoffice_field_gaps_up.sql`。
+2. 执行 `20261020_01_backoffice_field_gaps_verify.sql`，期望：第 1 项缺失列查询返回 0 行；
+   第 2 项返回 12 行；第 3 项返回 0 行。
+3. 再发布依赖这些列的后端版本（先迁移、后发版）。
+
+**回滚**：`20261020_01_backoffice_field_gaps_down.sql` 与既有批次一致，以
+`SQLSTATE 45000` 阻断自动回滚，需按 manifest 定向处理。

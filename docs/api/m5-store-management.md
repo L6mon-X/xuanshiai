@@ -45,6 +45,11 @@
 | `organization` | `link_url` | `varchar(255) NULL` | 分站访问链接 |
 | `organization` | `sort_order` | `int NOT NULL DEFAULT 0` | 显示排序，数字越大越靠前 |
 | `organization` | `qr_code` | `varchar(500) NULL` | 分站链接/二维码图片地址 |
+| `organization` | `logo` | `varchar(500) NULL` | 门店 Logo 图片地址（B1） |
+| `organization` | `address` | `varchar(255) NULL` | 门店详细地址（B1） |
+| `organization` | `commission_mode` | `varchar(16) NOT NULL DEFAULT 'fixed'` | 分成模式：`fixed` 固定金额 / `ratio` 按比例（B1） |
+| `organization` | `commission_value` | `decimal(12,2) NOT NULL DEFAULT 0.00` | 分成值；`ratio` 时表示百分比（0–100）（B1） |
+| `organization` | `intro` | `text NULL` | 门店简介（B1） |
 
 **无新表**。分店红娘复用 `organization_member`（`role_code='store_matchmaker'`）+ `matchmaker_profile`；菜单权限复用已有 `matchmaker_menu_permission` 表。分店分成复用 `commission_entry`（`beneficiary_type='store'`，`beneficiary_id=organization.id`）。
 
@@ -75,6 +80,11 @@
 | `link_url` | string \| null | 分站链接 |
 | `sort_order` | int | 显示排序 |
 | `qr_code` | string \| null | 链接/二维码图片地址 |
+| `logo` | string \| null | 门店 Logo 图片地址（B1） |
+| `address` | string \| null | 门店详细地址（B1） |
+| `commission_mode` | `fixed` \| `ratio` | 分成模式（B1） |
+| `commission_value` | string（Decimal） | 分成值；`ratio` 时为百分比 0–100（B1） |
+| `intro` | string \| null | 门店简介（B1） |
 | `status` | 1 \| 2 \| 3 | 状态 |
 | `auto_redirect` | bool | 自动跳转 |
 | `member_count` | int | 有效成员数（`organization_member.status=1`） |
@@ -97,8 +107,23 @@
 | `sort_order` | int | 否 | 0-9999，默认 0 | 显示排序 |
 | `qr_code` | string \| null | 否 | ≤500 | 二维码图片地址 |
 | `auto_redirect` | bool | 否 | 默认 `false` | 自动跳转 |
+| `logo` | string \| null | 否 | ≤500 | 门店 Logo 图片地址（B1） |
+| `address` | string \| null | 否 | ≤255 | 门店详细地址（B1） |
+| `commission_mode` | string | 否 | `fixed` / `ratio`，默认 `fixed` | 分成模式（B1） |
+| `commission_value` | decimal | 否 | ≥0；`ratio` 时 0–100 | 分成值（B1） |
+| `intro` | string \| null | 否 | — | 门店简介（B1） |
 
 **返回**：201 `StoreAdminItem`。
+
+**B1 校验规则**：
+- `commission_mode='ratio'` 时 `commission_value` 必须在 `0–100`（含），否则 **422**（`StoreAdminCreate` / `StoreAdminUpdate` 均在 schema 层用 `model_validator` 拦截）。
+- `commission_mode='fixed'` 时 `commission_value` 为金额，非负。
+
+**非法示例（分成比例越界 422）**：
+
+```json
+{ "code": "store-02", "name": "门店", "commission_mode": "ratio", "commission_value": 120 }
+```
 
 **业务规则**：
 - `code` 重复 → **409**「分站编码已存在」（捕获 `IntegrityError`）
@@ -315,3 +340,4 @@
 | 日期 | 版本 | 变更 | 影响 |
 |---|---|---|---|
 | 2026-09-12 | v1 | 新建：分站/门店 4 + 分店报表 2 + 分店分成明细 4 = 12 端点；`organization` 补 3 列；`tools_branch` 增 `mode` | M5 后端首版契约 |
+| 2026-10-20 | v2 | B1：`organization` 补 `logo` / `address` / `commission_mode` / `commission_value` / `intro` 5 列；`StoreAdminItem/Create/Update` 同步扩字段；比例模式校验 0–100 | 新增可选字段，旧客户端不受影响；迁移见 `migrations/m4_m7/20261020_01_backoffice_field_gaps_*` |

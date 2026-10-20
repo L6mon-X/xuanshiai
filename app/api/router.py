@@ -54,6 +54,17 @@ from app.api.routes import (
     member_auth_admin,
     member_behavior_admin,
     member_media_admin,
+    member_abandonment_admin,
+    admin_material_admin,
+    admin_qrcode_admin,
+    admin_sales_admin,
+    admin_sms_admin,
+    admin_outbound_admin,
+    admin_wechat_admin,
+    admin_econtract_admin,
+    admin_lovecard_admin,
+    admin_alliance_activity,
+    admin_interact_admin,
     media,
     meeting,
     member_follow_up_admin,
@@ -139,6 +150,9 @@ api_router.include_router(matchmaker_staff_admin.router, tags=["红娘后台"])
 api_router.include_router(matchmaker_member_admin.router, tags=["红娘后台"])
 api_router.include_router(organization_admin.router, tags=["红娘后台"])
 api_router.include_router(matchmaker_crm_admin.router, tags=["红娘后台"])
+# 弃海路由含 /admin/members/abandoned 等静态路径，必须排在 member_records_admin
+# （同为 /admin/members 前缀、含 /{member_id} 动态段）之前，否则会被动态段抢占。
+api_router.include_router(member_abandonment_admin.router, tags=["管理后台"])
 api_router.include_router(member_records_admin.router, tags=["红娘后台"])
 api_router.include_router(customer_leads_admin.router, tags=["管理后台"])
 api_router.include_router(matchmaker_dashboard_admin.router, tags=["红娘后台"])
@@ -175,6 +189,21 @@ api_router.include_router(promotion_order_admin.router, tags=["管理后台"])
 api_router.include_router(user_cancellation_router.router, tags=["管理后台"])
 api_router.include_router(admin_ticket_router.router, tags=["管理后台"])
 api_router.include_router(finance.admin_router, tags=["管理后台"])
+# A4/A5/A7/A8/A10：后台运营工具（素材库 / 二维码 / 话术库 / 相亲卡 / 互动内容 / 联盟活动）
+api_router.include_router(admin_material_admin.router, tags=["管理后台"])
+api_router.include_router(admin_qrcode_admin.router, tags=["管理后台"])
+api_router.include_router(admin_sales_admin.router, tags=["管理后台"])
+api_router.include_router(admin_lovecard_admin.router, tags=["管理后台"])
+api_router.include_router(admin_interact_admin.router, tags=["管理后台"])
+api_router.include_router(admin_alliance_activity.router, tags=["管理后台"])
+# A1：短信签名 / 模板 / 群发 / 记录
+api_router.include_router(admin_sms_admin.router, tags=["管理后台"])
+# A6：电话外呼（配置 / 余额 / 号码池 / 名单 / 记录）
+api_router.include_router(admin_outbound_admin.router, tags=["管理后台"])
+# A2：微信公众号运营（配置 / 粉丝 / 菜单 / 自动回复 / 模板 / 发送）
+api_router.include_router(admin_wechat_admin.router, tags=["管理后台"])
+# A3：电子合同（合同 / 模板 / 印章 / 配置）
+api_router.include_router(admin_econtract_admin.router, tags=["管理后台"])
 api_router.include_router(organization.router, tags=["组织与归属"])
 api_router.include_router(organization.promotion_router, tags=["组织与归属"])
 api_router.include_router(organization.partner_router, tags=["组织与归属"])

@@ -4,7 +4,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class StoreAdminItem(BaseModel):
@@ -16,6 +16,11 @@ class StoreAdminItem(BaseModel):
     link_url: str | None
     sort_order: int
     qr_code: str | None
+    logo: str | None = None
+    address: str | None = None
+    commission_mode: Literal["fixed", "ratio"] = "fixed"
+    commission_value: float = 0.0
+    intro: str | None = None
     status: Literal[1, 2, 3]
     auto_redirect: bool
     member_count: int = 0
@@ -40,7 +45,18 @@ class StoreAdminCreate(BaseModel):
     link_url: str | None = Field(default=None, max_length=255)
     sort_order: int = Field(default=0, ge=0, le=9999)
     qr_code: str | None = Field(default=None, max_length=500)
+    logo: str | None = Field(default=None, max_length=500, description="门店独立 LOGO")
+    address: str | None = Field(default=None, max_length=255, description="门店地址")
+    commission_mode: Literal["fixed", "ratio"] = Field(default="fixed", description="fixed 固定金额 / ratio 按比例")
+    commission_value: float = Field(default=0, ge=0, le=1000000, description="固定金额或比例值")
+    intro: str | None = Field(default=None, max_length=20000, description="门店简介")
     auto_redirect: bool = False
+
+    @model_validator(mode="after")
+    def validate_commission(self) -> "StoreAdminCreate":
+        if self.commission_mode == "ratio" and self.commission_value > 100:
+            raise ValueError("按比例计算时 commission_value 必须在 0–100 之间")
+        return self
 
 
 class StoreSubsiteMode(BaseModel):
@@ -77,7 +93,18 @@ class StoreAdminUpdate(BaseModel):
     link_url: str | None = Field(default=None, max_length=255)
     sort_order: int | None = Field(default=None, ge=0, le=9999)
     qr_code: str | None = Field(default=None, max_length=500)
+    logo: str | None = Field(default=None, max_length=500)
+    address: str | None = Field(default=None, max_length=255)
+    commission_mode: Literal["fixed", "ratio"] | None = None
+    commission_value: float | None = Field(default=None, ge=0, le=1000000)
+    intro: str | None = Field(default=None, max_length=20000)
     auto_redirect: bool | None = None
+
+    @model_validator(mode="after")
+    def validate_commission(self) -> "StoreAdminUpdate":
+        if self.commission_mode == "ratio" and self.commission_value is not None and self.commission_value > 100:
+            raise ValueError("按比例计算时 commission_value 必须在 0–100 之间")
+        return self
 
 
 class StoreStatusUpdate(BaseModel):

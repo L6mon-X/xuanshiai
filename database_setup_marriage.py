@@ -731,7 +731,27 @@ class DatabaseManager:
                 (1081, 108, '商品编辑', NULL, 'button', 'matchmaker.product.manage', NULL, 1, 1),
                 (1091, 109, '分派配置编辑', NULL, 'button', 'matchmaker.apportion.write', NULL, 1, 1),
                 (1101, 110, '红娘申请审核', NULL, 'button', 'matchmaker.application.review', NULL, 1, 1),
-                (1111, 111, '工单处置', NULL, 'button', 'matchmaker.system.manage', NULL, 1, 1)
+                (1111, 111, '工单处置', NULL, 'button', 'matchmaker.system.manage', NULL, 1, 1),
+                (112, NULL, '短信管理', '/sms', 'menu', 'platform.sms.read', 'message', 220, 1),
+                (113, NULL, '公众号管理', '/wechat-mp', 'menu', 'platform.wechat.read', 'wechat', 230, 1),
+                (114, NULL, '电子合同', '/e-contracts', 'menu', 'finance.contract.read', 'contract', 240, 1),
+                (115, NULL, '素材库', '/materials', 'menu', 'platform.material.read', 'media', 250, 1),
+                (116, NULL, '二维码管理', '/qrcodes', 'menu', 'platform.qrcode.read', 'qrcode', 260, 1),
+                (117, NULL, '电话外呼', '/outbound-call', 'menu', 'platform.outbound.read', 'phone', 270, 1),
+                (118, NULL, '销售话术库', '/sales-library', 'menu', 'platform.sales.read', 'sales', 280, 1),
+                (119, NULL, '相亲卡管理', '/lovecard', 'menu', 'platform.lovecard.read', 'lovecard', 290, 1),
+                (120, NULL, '互动内容', '/interact-content', 'menu', 'platform.interact.read', 'chat', 300, 1),
+                (121, NULL, '联盟活动', '/active-alliance', 'menu', 'platform.alliance.read', 'alliance', 310, 1),
+                (1121, 112, '短信编辑', NULL, 'button', 'platform.sms.write', NULL, 1, 1),
+                (1131, 113, '公众号编辑', NULL, 'button', 'platform.wechat.write', NULL, 1, 1),
+                (1141, 114, '合同编辑', NULL, 'button', 'finance.contract.write', NULL, 1, 1),
+                (1151, 115, '素材编辑', NULL, 'button', 'platform.material.write', NULL, 1, 1),
+                (1161, 116, '二维码编辑', NULL, 'button', 'platform.qrcode.write', NULL, 1, 1),
+                (1171, 117, '外呼编辑', NULL, 'button', 'platform.outbound.write', NULL, 1, 1),
+                (1181, 118, '话术编辑', NULL, 'button', 'platform.sales.write', NULL, 1, 1),
+                (1191, 119, '相亲卡编辑', NULL, 'button', 'platform.lovecard.write', NULL, 1, 1),
+                (1201, 120, '互动内容编辑', NULL, 'button', 'platform.interact.write', NULL, 1, 1),
+                (1211, 121, '联盟活动编辑', NULL, 'button', 'platform.alliance.write', NULL, 1, 1)
         """)
         cursor.execute("""
             INSERT IGNORE INTO matchmaker_tutorial (id, title, content, link_url, status)
@@ -3300,6 +3320,8 @@ class DatabaseManager:
         self._ensure_m7_columns(cursor)
         # 后台筛选参数补列（users / user_profile / customer_lead / admin_content_item）
         self._ensure_filter_columns(cursor)
+        # B2 互选活动：报名/互选时间窗、活动收费与微信展示开关
+        self._ensure_mutual_selection_columns(cursor)
 
         # M10 账号注销申请 + 平台工单反馈（旧库幂等补齐）
         # 两张表已由 BUSINESS_TABLES 中 CREATE TABLE IF NOT EXISTS 直接创建，
@@ -3448,6 +3470,24 @@ class DatabaseManager:
             "link_url": "varchar(255) DEFAULT NULL COMMENT '分站访问链接'",
             "sort_order": "int NOT NULL DEFAULT 0 COMMENT '显示排序，数字越大越靠前'",
             "qr_code": "varchar(500) DEFAULT NULL COMMENT '分站链接/二维码图片地址'",
+            # B1：门店页面「独立 LOGO / 地址 / 分成方式 / 门店简介」四项
+            "logo": "varchar(500) DEFAULT NULL COMMENT '门店独立 LOGO'",
+            "address": "varchar(255) DEFAULT NULL COMMENT '门店地址'",
+            "commission_mode": "varchar(16) NOT NULL DEFAULT 'fixed' COMMENT 'fixed 固定金额 / ratio 按比例'",
+            "commission_value": "decimal(12,2) NOT NULL DEFAULT 0.00 COMMENT '固定金额或比例值（ratio 时为百分比）'",
+            "intro": "text COMMENT '门店简介'",
+        }))
+
+    def _ensure_mutual_selection_columns(self, cursor) -> None:
+        """B2：互选活动补充报名/互选时间窗、活动收费与微信展示开关（旧库幂等补齐）。"""
+        self._ensure_table_columns(cursor, "`mutual_selection_activity`", self._named_columns({
+            "signup_start_time": "datetime DEFAULT NULL COMMENT '活动报名开始时间'",
+            "signup_end_time": "datetime DEFAULT NULL COMMENT '活动报名结束时间'",
+            "mutual_start_time": "datetime DEFAULT NULL COMMENT '互选开始时间'",
+            "mutual_end_time": "datetime DEFAULT NULL COMMENT '互选结束时间'",
+            "activity_fee": "decimal(10,2) DEFAULT NULL COMMENT '活动收费金额；NULL 表示不收费'",
+            "show_wechat_direct": "tinyint NOT NULL DEFAULT 1 COMMENT '显示双方微信自己加'",
+            "show_matchmaker_push": "tinyint NOT NULL DEFAULT 0 COMMENT '提示联系红娘推送微信号'",
         }))
 
     def _ensure_m6_columns(self, cursor) -> None:

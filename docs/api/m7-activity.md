@@ -203,23 +203,75 @@
 
 ### 4.2 创建 `POST /admin/mutual-activities`
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `title` | string | |
-| `cover` | string | |
-| `city` | string | |
-| `start_time`, `end_time` | datetime | |
-| `signup_deadline` | datetime | 可空 |
-| `max_male`, `max_female` | int | |
-| `description` | string | |
-| `status` | int | 1/2/3 |
+| 字段 | 类型 | 必填 | 校验 | 说明 |
+|---|---|---|---|---|
+| `title` | string | 是 | 1–128 | 活动标题 |
+| `cover` | string | 否 | ≤500 | 封面图 |
+| `city` | string | 否 | ≤64 | 城市 |
+| `start_time`, `end_time` | datetime | 是 | `end_time > start_time` | 活动起止 |
+| `signup_deadline` | datetime | 否 | — | 报名截止（兼容旧字段） |
+| `max_male`, `max_female` | int | 否 | ≥0 | 男女名额 |
+| `description` | string | 否 | — | 活动说明 |
+| `status` | int | 否 | 1/2/3 | 1 报名中 2 进行中 3 已结束 |
+| `signup_start_time` | datetime | 否 | 与 `signup_end_time` 成对时 `end > start` | **B2** 报名开始 |
+| `signup_end_time` | datetime | 否 | 同上 | **B2** 报名结束 |
+| `mutual_start_time` | datetime | 否 | 与 `mutual_end_time` 成对时 `end > start` | **B2** 互选开始 |
+| `mutual_end_time` | datetime | 否 | 同上 | **B2** 互选结束 |
+| `activity_fee` | decimal | 否 | ≥0；`null` = 不收费 | **B2** 活动费用 |
+| `show_wechat_direct` | bool | 否 | 默认 `true` | **B2** 是否展示微信直联入口 |
+| `show_matchmaker_push` | bool | 否 | 默认 `false` | **B2** 是否展示红娘推送入口 |
+
+**B2 请求示例**：
+
+```json
+{
+  "title": "双十一互选", "start_time": "2026-11-11T09:00:00", "end_time": "2026-11-13T18:00:00",
+  "signup_start_time": "2026-11-01T09:00:00", "signup_end_time": "2026-11-10T18:00:00",
+  "mutual_start_time": "2026-11-11T09:00:00", "mutual_end_time": "2026-11-13T18:00:00",
+  "activity_fee": 99, "show_wechat_direct": false, "show_matchmaker_push": true
+}
+```
+
+**非法示例（报名结束早于开始，422）**：
+
+```json
+{ "title": "x", "start_time": "2026-11-11T09:00:00", "end_time": "2026-11-13T18:00:00",
+  "signup_start_time": "2026-11-10T09:00:00", "signup_end_time": "2026-11-09T18:00:00" }
+```
+
+**时间窗校验**：
+- `MutualActivityCreate` 在 schema 层校验 `end_time > start_time`、报名与互选各自的起止顺序；
+- `MutualActivityUpdate` 只传半边时无法在 schema 交叉校验，由服务层按「合并后的行值」
+  校验并返回 **422**（`end_time 必须晚于 start_time` / `signup_end_time 必须晚于 signup_start_time` /
+  `mutual_end_time 必须晚于 mutual_start_time`）。
 
 ### 4.3 详情 `GET /admin/mutual-activities/{activity_id}`
 
+返回 `MutualActivityItem`，在 4.2 字段基础上含 `id`、`visible`、`participant_count`、
+`copy_count`、`created_at`、`updated_at`，以及 B2 的 7 个新字段。
+
 ### 4.4 修改 `PATCH /admin/mutual-activities/{activity_id}`
+
+可改 4.2 全部字段（部分更新）。时间窗按合并后值校验，见上。
+
+**复制**（4.6）会一并复制 B2 的 7 个字段（`copy_activity` 的硬编码列清单已同步扩展）。
 
 ### 4.5 上线/下线 `PATCH /admin/mutual-activities/{activity_id}/visible`
 `{ "online": bool }`。
+
+### 4.5b 下线（新增）`POST /admin/mutual-activities/{activity_id}/offline`
+
+| 参数 | 位置 | 类型 | 必填 | 校验 | 说明 |
+|---|---|---|---|---|---|
+| `activity_id` | path | int | 是 | ≥1 | 活动 ID |
+| `reason` | body | string | 否 | ≤255 | 下线原因（写入审计 `reason`） |
+
+```json
+{ "reason": "报名人数不足，本场取消" }
+```
+
+成功 `200` 返回 `MutualActivityItem`（`visible=false`），并写审计
+`mutual_activity.offline`。`PATCH /visible` 保持兼容，新前端建议用本接口（带原因可追溯）。
 
 ### 4.6 复制 `POST /admin/mutual-activities/{activity_id}/copy`
 
@@ -421,3 +473,8 @@ CREATE TABLE `mutual_selection_pick` (
 ## 十一、变更记录
 
 - **2026-09-12 v1.0** —— M7-A 首版（含活动报名 + 互选 + 配置域）
+- **2026-10-20 v1.1** —— B2：互选活动补 `signup_start_time` / `signup_end_time` /
+  `mutual_start_time` / `mutual_end_time` / `activity_fee` / `show_wechat_direct` /
+  `show_matchmaker_push` 七个字段，新增 `POST /admin/mutual-activities/{id}/offline`。
+  新增字段均为可选，旧客户端不受影响；迁移见
+  `migrations/m4_m7/20261020_01_backoffice_field_gaps_*.sql`。
