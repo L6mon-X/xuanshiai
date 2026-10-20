@@ -288,7 +288,7 @@ async def test_real_shadow_write_maps_assertion_mode_not_confidence(
             await verify_db.execute(
                 text(
                     "SELECT source_kind, status, confidence FROM ai_memory_observation "
-                    "WHERE owner_user_id = :owner ORDER BY id"
+                    "WHERE owner_user_id = :owner ORDER BY observation_id"
                 ),
                 {"owner": USER_ID},
             )
@@ -654,7 +654,7 @@ async def test_real_duplicate_confirm_replays_then_conflicts(
         "mem-confirm-grant",
         0,
     )
-    session = await create_master_session(
+    await create_master_session(
         real_db_session, USER_ID, ProfileSubject.PERSONAL, CONSENT_VERSION
     )
     await real_db_session.commit()
@@ -662,7 +662,7 @@ async def test_real_duplicate_confirm_replays_then_conflicts(
     factory = async_sessionmaker(real_db_engine, expire_on_commit=False)
     async with factory() as work_db:
         service = MemoryService(work_db)
-        records = await service.propose(
+        await service.propose(
             owner_user_id=USER_ID,
             subject="personal",
             canonical_key="personal:lifestyle:confirm-flow",

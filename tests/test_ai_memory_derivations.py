@@ -28,6 +28,9 @@ from app.services.ai.memory.derivations import (
     expire_memory_states,
     handle_memory_derivation,
 )
+from app.services.ai.memory.service import MemoryService
+
+from tests.test_ai_memory_ledger import FakeMemorySession, MemoryStore
 
 
 def _single_arg_handler(session: FakeMemorySession):
@@ -37,9 +40,6 @@ def _single_arg_handler(session: FakeMemorySession):
         return await handle_memory_derivation(session, event)
 
     return _run
-from app.services.ai.memory.service import MemoryService
-
-from tests.test_ai_memory_ledger import FakeMemorySession, MemoryStore
 
 pytestmark = pytest.mark.asyncio
 

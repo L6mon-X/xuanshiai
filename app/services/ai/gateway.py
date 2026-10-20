@@ -44,7 +44,7 @@ from app.services.ai.base import (
     SearchSuggestResult,
     StructuredExtractResult,
 )
-from app.services.ai.providers import get_provider
+from app.services.ai.providers import get_provider, last_token_usage
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +153,8 @@ class AIGateway:
             if timeout_seconds is None
             else timeout_seconds
         )
-        # Token usage / cost hooks; phase 1 mock reports none.
+        # Token usage / cost hooks. 供应商实际返回的用量经
+        # ``providers.last_token_usage`` 透传进入审计；未返回时保持 None（未知）。
         self._cost_hook: Any | None = None
         # Narrative 专用 provider（可选）。当 ai_narrative_provider 配置非空时，
         # 为重推理的 generate_narrative 单独构造一个更快的 provider 实例，
@@ -217,11 +218,13 @@ class AIGateway:
         started = time.monotonic()
         try:
             handler = getattr(active_provider, method)
+            last_token_usage.set(None)
             raw_result = await asyncio.wait_for(
                 handler(*args), timeout=self._timeout_seconds
             )
             record = self._record(
-                context, method, started, error_code=None, succeeded=True
+                context, method, started, error_code=None, succeeded=True,
+                token_usage=last_token_usage.get(),
             )
             if response_type is not None:
                 if not isinstance(raw_result, BaseModel):
@@ -321,7 +324,10 @@ class AIGateway:
         started: float,
         error_code: str | None,
         succeeded: bool,
+        token_usage: dict[str, Any] | None = None,
     ) -> GatewayCallRecord:
+        # token_usage 仅取供应商实际返回的用量（经 last_token_usage 透传）；
+        # 供应商未返回时保持 None，语义为"未知"，不得当作零成本。
         duration_ms = int((time.monotonic() - started) * 1000)
         return GatewayCallRecord(
             request_id=context.request_id or uuid.uuid4().hex,
@@ -332,7 +338,7 @@ class AIGateway:
             prompt_version=context.prompt_version,
             schema_version=context.schema_version,
             duration_ms=duration_ms,
-            token_usage=None,
+            token_usage=token_usage,
             error_code=error_code,
             succeeded=succeeded,
             input_revision=dict(context.input_revision),
@@ -402,6 +408,7 @@ class AIGateway:
         saw_finish = False
         deadline = asyncio.get_running_loop().time() + self._timeout_seconds
         iterator = None
+        last_token_usage.set(None)
         try:
             iterator = active_provider.stream_chat(
                 messages, json_mode=json_mode
@@ -472,6 +479,7 @@ class AIGateway:
                         status=status,
                         error_code=error_code,
                         duration_ms=int((time.monotonic() - started) * 1000),
+                        usage_cost=last_token_usage.get(),
                         display_eligible=False,
                     )
                 )
@@ -587,6 +595,7 @@ class AIGateway:
         method = "chat"
         started = time.monotonic()
         try:
+            last_token_usage.set(None)
             raw_result = await asyncio.wait_for(
                 getattr(active_provider, "chat")(messages, json_mode=json_mode),
                 timeout=self._timeout_seconds,
@@ -597,7 +606,8 @@ class AIGateway:
                     payload = json.loads(raw_result)
                 validated = response_type.model_validate(payload)
                 record = self._record(
-                    context, method, started, error_code=None, succeeded=True
+                    context, method, started, error_code=None, succeeded=True,
+                    token_usage=last_token_usage.get(),
                 )
                 await self._log_audit(record)
                 return InvokeOutcome(result=validated)
@@ -608,7 +618,8 @@ class AIGateway:
                     kind=ProviderErrorKind.NON_RETRYABLE,
                 )
             record = self._record(
-                context, method, started, error_code=None, succeeded=True
+                context, method, started, error_code=None, succeeded=True,
+                token_usage=last_token_usage.get(),
             )
             await self._log_audit(record)
             return InvokeOutcome(result=raw_result)

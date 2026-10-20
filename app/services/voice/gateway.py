@@ -117,8 +117,21 @@ class VoiceGateway:
                     message="voice provider 返回 None（内部错误或 schema 违例）",
                     kind=ProviderErrorKind.NON_RETRYABLE,
                 )
+            # 语音无 token 概念：记录供应商返回的音频时长类用量元数据
+            # （不含音频/转写原文）；供应商未给时长（0）时保持 None（未知）。
+            result_duration_ms = getattr(raw_result, "duration_ms", 0) or 0
+            usage = (
+                {
+                    "audio_duration_ms": result_duration_ms,
+                    "source": "provider",
+                    "model": context.model,
+                }
+                if result_duration_ms > 0
+                else None
+            )
             record = self._record(
-                context, method, started, error_code=None, succeeded=True
+                context, method, started, error_code=None, succeeded=True,
+                token_usage=usage,
             )
             if response_type is not None:
                 if not isinstance(raw_result, BaseModel):
@@ -200,6 +213,7 @@ class VoiceGateway:
         started: float,
         error_code: str | None,
         succeeded: bool,
+        token_usage: dict[str, Any] | None = None,
     ) -> GatewayCallRecord:
         duration_ms = int((time.monotonic() - started) * 1000)
         return GatewayCallRecord(
@@ -211,7 +225,7 @@ class VoiceGateway:
             prompt_version=context.prompt_version,
             schema_version=context.schema_version,
             duration_ms=duration_ms,
-            token_usage=None,
+            token_usage=token_usage,
             error_code=error_code,
             succeeded=succeeded,
             input_revision=dict(context.input_revision),

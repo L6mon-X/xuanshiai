@@ -18,7 +18,6 @@ from app.services.derivation_outbox import DerivationEvent
 from app.services.revisions import RevisionVector
 
 from tests.test_ai_memory_projections import (
-    GRANT_KWARGS,
     OWNER_ID,
     POLICY_REVISION,
     FakeProjectionSession,
