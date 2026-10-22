@@ -68,7 +68,8 @@ class MoxiangMasterOrchestrator:
     """
 
     ai_gateway: AIGateway
-    voice_gateway: VoiceGateway
+    # 语音未启用（AI_VOICE_* 关闭或未配阿里云 key）时为 None，文字对话不受影响。
+    voice_gateway: VoiceGateway | None
     state: MasterState = field(default=MasterState.IDLE)
     _history: list[dict[str, str]] = field(default_factory=list)
     _narrative_context: str = ""
@@ -270,6 +271,12 @@ class MoxiangMasterOrchestrator:
         """对 _last_reply_text 合成 TTS。无文本则返回空。"""
         result = MasterTurnResult(ai_reply=self._last_reply_text)
         if not self._last_reply_text:
+            return result
+        # 语音未启用时 voice_gateway 为 None：文字对话照常，只在用户点「听」时
+        # 如实返回能力未开放，而不是让整条 WS 连接因缺 key 崩掉。
+        if self.voice_gateway is None:
+            result.error_code = "AI_FEATURE_DISABLED"
+            result.error_message = "语音复述当前未启用"
             return result
         self.state = MasterState.SPEAKING
         tts_context = AITaskContext(
