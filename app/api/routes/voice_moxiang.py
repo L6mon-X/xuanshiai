@@ -792,11 +792,20 @@ async def moxiang_master_conversation(
 
     voice_enabled = _check_voice_feature() is None
 
+    # 语音网关只在语音模式真正启用时才构造。VoiceGateway 的构造函数会立刻
+    # 解析语音 provider，未配置 AI_ALIYUN_VOICE_API_KEY / APP_KEY 时抛
+    # ProviderError；若无条件构造，纯文字画像对话会连带一起被拖死
+    # （2026-10-22 线上复现：连接 accepted 后立刻关闭，前端永远等不到
+    # journey_ready，表现为「一直正在连接知遇」）。
+    voice_gateway: VoiceGateway | None = None
+    if voice_enabled:
+        voice_gateway = VoiceGateway(
+            timeout_seconds=settings.ai_gateway_timeout_seconds
+        )
+
     orchestrator = MoxiangMasterOrchestrator(
         ai_gateway=AIGateway(),
-        voice_gateway=VoiceGateway(
-            timeout_seconds=settings.ai_gateway_timeout_seconds
-        ),
+        voice_gateway=voice_gateway,
     )
     asr_client: Any = None
     partial_task: asyncio.Task[None] | None = None
