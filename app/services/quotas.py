@@ -5,8 +5,9 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.redis import get_daily_used
+from app.core.redis import daily_quota_key, get_daily_used
 from app.schemas.quotas import QuotaItem, QuotaSummary
+from app.services.admin_config import get_runtime_value
 from app.services.membership import get_active_membership_row
 
 
@@ -42,19 +43,44 @@ async def grant(db: AsyncSession, user_id: int, quota_code: str, amount: int, so
     await db.execute(text("INSERT INTO user_quota_grant (user_id,quota_code,remaining,source,order_no) VALUES (:user_id,:quota_code,:remaining,:source,:order_no)"), {"user_id": user_id, "quota_code": quota_code, "remaining": amount, "source": source, "order_no": order_no})
 
 
+async def resolve_browse_limit(
+    db: AsyncSession, user_id: int, is_vip: bool | None = None
+) -> int:
+    """每日可查看的**不同用户**上限。
+
+    会员读套餐权益 ``rights.browse_daily_limit``（缺键回退 20），非会员读平台
+    权限快照 ``free_browse_daily_limit``。``discovery._quota_limit`` 与
+    ``/users/me/quotas`` 共用此函数，避免"接口报 20、实际只给 8"的分叉。
+    """
+    vip, rights = await _membership_rights(db, user_id)
+    if is_vip is not None:
+        vip = is_vip
+    if vip:
+        value = rights.get("browse_daily_limit")
+        return max(0, int(value)) if value is not None else 20
+    return int(
+        await get_runtime_value(
+            db,
+            "platform_permissions",
+            "free_browse_daily_limit",
+            settings.browse_daily_limit,
+        )
+    )
+
+
 async def summary(db: AsyncSession, user_id: int) -> QuotaSummary:
     vip, rights = await _membership_rights(db, user_id)
     definitions = (
         ("apply", settings.apply_daily_free_limit + (int(rights.get("apply_bonus") or 0) if vip else 0), "apply"),
-        ("browse", 20 if vip else settings.browse_daily_limit, "browse"),
+        ("browse", await resolve_browse_limit(db, user_id, is_vip=vip), "browse"),
         ("superlike", settings.superlike_daily_vip_limit if vip else settings.superlike_daily_free_limit, "superlike"),
         ("paper_plane", settings.paper_plane_daily_limit, "paper_plane"),
     )
     items: list[QuotaItem] = []
     for quota_code, daily_limit, redis_code in definitions:
-        key = f"discovery:{redis_code}:{user_id}:{date.today().isoformat()}"
+        key = daily_quota_key(f"discovery:{redis_code}", user_id)
         if quota_code == "paper_plane":
-            key = f"paper-plane:{user_id}:{date.today().isoformat()}"
+            key = daily_quota_key("paper-plane", user_id)
         used = await get_daily_used(key)
         daily_remaining = max(0, daily_limit - used)
         extra = await _extra_remaining(db, user_id, quota_code)

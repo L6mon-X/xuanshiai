@@ -229,3 +229,49 @@ Python 3.12.7（项目自带 venv `.venv/`），未连接共享开发或生产 M
 
 1. **全量偶发卡死定位到具体用例**：`tests/test_voice_cleanup.py::test_worker_forever_loop_schedules_cleanup`。根因是该用例只把 `_run_round` 打桩，却在首轮真实触发了需要 DB 会话的**记忆状态 TTL 清理**（`last_memory_state_cleanup_at = -inf` ⇒ 首轮必然执行），与其 docstring 声称的"避免测试触碰数据库"矛盾。整套件跑到此处时连接池已绑定前序用例的已关闭事件循环，该 await 永不完成；而 `await task` 等的是不可取消的 Future ⇒ 进程 CPU 归零、日志停在该用例、15 分钟无进展。诊断手法：`-o faulthandler_timeout=180` 转储线程栈，可见事件循环空闲于 `select()`。修复：按 `test_ai_memory_ttl_cleanup` 同口径把 `_run_memory_state_ttl_cleanup_round` 打桩为空转，并显式钉住 retention 间隔。
 2. **符号链接两个用例的环境探测无效**：原逻辑只捕获 `os.symlink` 抛出的异常来判断"环境是否支持"，但本机实测该调用**既不抛异常也建不出真链接**（`link.is_symlink()` 为 False），导致两个用例比的是"链接不存在"这一假前提。已在创建后补 `if not link.is_symlink(): pytest.skip(...)`，与 docstring 的"symlink 不可用的环境自动 skip"一致。顺带核实：越界目标文件确实未被删除，删的只是链接本身（且前提不成立），**不存在路径穿越缺陷**。
+
+## 2026-10-22 浏览额度按「不同用户」计次 + 额度口径统一（改造后基线）
+
+> 触发：资料查看额度由"请求次数"改为"当天不同 `user_id` 个数"；同时修正 `/users/me/quotas` 的上限来源与时区日键。改动文件：`app/core/redis.py`、`app/services/discovery.py`、`app/services/quotas.py`、`app/api/routes/ai_moxiang.py`、`scripts/diagnose_login_blocker.py`、`tests/test_discovery_features.py`。**无 schema/迁移、无接口字段结构变化。**
+
+| 检查 | 命令 | 结果 | 结论 |
+| --- | --- | --- | --- |
+| 后端全量无集成测试 | `.venv/Scripts/python.exe -m pytest --ignore=tests/integration -q` | `7 failed, 2751 passed, 15 skipped in 429.02s` | 7 项**全部为环境缺失**，0 业务回归 |
+| 额度/会员共享定向 | `pytest tests/test_vip_authorization_consistency.py tests/test_discovery_features.py -k "membership_row_is_shared or browse or quota" -q` | `11 passed` | 额度解析与会员来源仍共享同一行 |
+| 浏览额度相关集成（真实 MySQL） | `AI_TEST_DATABASE_URL=...` + `pytest tests/integration/ai/test_ai_recommend_real_db.py -k "browse_side_effects or view_profile_still" -q` | `2 passed` | `include_card` 仍无副作用；`view_profile` 单次仍 +1（计数键类型未变） |
+| 全仓 Ruff | `ruff check app tests scripts` | `All checks passed!` | 0 告警 |
+
+### 失败清单（7 项，全部环境归因）
+
+| 测试 | 归因 |
+| --- | --- |
+| `test_ai_governance_contracts::test_ai_product_and_security_decisions_are_frozen` | 缺 `E:/Xuanshiai/PRODUCT.md` |
+| `test_memory_docs_contract::test_product_md_declares_memory_kernel_shadow_scope` | 同上 |
+| `test_memory_docs_contract::test_product_md_declares_deferred_scope` | 同上 |
+| `test_memory_docs_contract::test_architecture_doc_declares_frozen_contract` | 缺 `E:/Xuanshiai/docs/architecture/ai-memory-kernel-core-v1.md` |
+| `test_memory_docs_contract::test_architecture_doc_declares_no_downstream_switch_and_privacy_floor` | 同上 |
+| `test_memory_docs_contract::test_architecture_doc_declares_subject_write_guard` | 同上 |
+| `test_community_demo_seed::test_member_seed_assets_resolve_to_frontend_files` | 缺同级前端仓 `xuanshiai-vue`（实际在 `no upload/` 下，非同级） |
+
+### 与 2026-10-19 基线（`8 failed / 2678 passed / 15 skipped`）的差异
+
+- 失败数 8 → 7：`test_ai_profile_sessions::test_extraction_accumulates_fields_on_latest_draft` 本次**转绿**。此前三次复跑全败、曾判定为实现缺陷（`draft_id` 无写入点），本轮改为通过 ⇒ 该用例受执行顺序/库内状态影响，**结论需重开观察**，不应继续当作确定性失败。
+- `passed` 2678 → 2751（+73）：其中 11 条为本次新增的额度用例，其余来自工作区已合并的上游测试（`3577c89` 含 upstream merge）。
+- 本次改造首轮全量曾出现 `9 failed`，多出的是 `test_vip_authorization_consistency::test_effective_membership_row_is_shared_by_status_and_rights_consumers`——原因是 `resolve_browse_limit` 一度用 `isinstance(db, AsyncSession)` 跳过会员查询，导致额度解析不再与会员来源共享同一行。**已移除该保护**（生产路径 db 恒为 AsyncSession），并把该断言恢复为 3 次调用。
+
+### 新增/重写用例（`tests/test_discovery_features.py`）
+
+| 用例 | 作用 |
+| --- | --- |
+| `test_profile_browse_quota_uses_redis_fallback_reader`（重写） | 白盒改打桩 `consume_daily_unique`，验证 -1（已计费）分支返回剩余 |
+| `test_browse_quota_uses_redis_fallback_for_remaining_count`（重写） | 同口径，固定 limit 后断言 `limit-1` |
+| `test_repeat_view_of_same_target_consumes_once` | 同一 target 3 次 ⇒ 剩余 [7,7,7]、台账只 1 条 |
+| `test_ninth_distinct_target_is_rejected` | 8 个不同用户依次 7→0，第 9 个 429 |
+| `test_high_match_bonus_serves_extra_distinct_targets` | 常规满后高匹配走奖励池，返回 4 |
+| `test_bonus_pool_exhausted_then_rejected` | 8+5=13 个成功后第 14 个 429 |
+| `test_exhausted_quota_still_opens_already_viewed_target` | 额度耗尽后打开已看过用户仍放行（返回 0） |
+| `test_points_pool_marks_target_to_avoid_double_charge` | 积分池扣一次后重复看不重复扣（seen 生效） |
+| `test_browse_quota_keys_use_utc_daily_key` | 计数键与 seen 键均为 UTC 日键且不相等 |
+| `test_resolve_browse_limit_reads_snapshot_for_non_vip` | 普通用户上限来自快照 |
+| `test_resolve_browse_limit_reads_package_rights_for_vip` | VIP 上限来自套餐 rights |
+| `test_quota_summary_uses_same_browse_limit_as_discovery` | `/users/me/quotas` 与扣费上限同源 |

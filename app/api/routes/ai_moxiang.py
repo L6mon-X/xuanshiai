@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from uuid import uuid4
 
@@ -67,6 +68,8 @@ from app.services.ai.tasks import TaskError
 
 router = APIRouter()
 
+logger = logging.getLogger(__name__)
+
 _IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 
 
@@ -93,6 +96,10 @@ def _error_response(
 def _require_journey_feature() -> None:
     """Require the existing journey and profile feature gates."""
     if not bool(getattr(settings, "ai_moxiang_journey_enabled", False)):
+        logger.warning(
+            "ai_gate_blocked feature=moxiang_continuous flag=AI_MOXIANG_JOURNEY_ENABLED env=%s",
+            settings.environment,
+        )
         raise _error_response(
             "AI_FEATURE_DISABLED",
             "墨相师连续旅程当前未启用",
