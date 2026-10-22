@@ -792,11 +792,17 @@ async def moxiang_master_conversation(
 
     voice_enabled = _check_voice_feature() is None
 
+    # 语音网关只在语音模式真正启用时构造：未配置阿里云 key 时构造会抛
+    # ProviderError，把纯文字画像对话一起拖死（2026-10-22 线上复现）。
+    voice_gateway: VoiceGateway | None = None
+    if voice_enabled:
+        voice_gateway = VoiceGateway(
+            timeout_seconds=settings.ai_gateway_timeout_seconds
+        )
+
     orchestrator = MoxiangMasterOrchestrator(
         ai_gateway=AIGateway(),
-        voice_gateway=VoiceGateway(
-            timeout_seconds=settings.ai_gateway_timeout_seconds
-        ),
+        voice_gateway=voice_gateway,
     )
     asr_client: Any = None
     partial_task: asyncio.Task[None] | None = None
