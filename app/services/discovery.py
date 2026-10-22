@@ -22,7 +22,7 @@ from app.core.profile_tags import (
     normalize_custom_tag_categories,
     personal_tags,
 )
-from app.core.redis import consume_daily, get_daily_used, refund_daily
+from app.core.redis import consume_daily, consume_daily_unique, get_daily_used, mark_daily_member, refund_daily
 from app.services.membership import (
     active_membership_exists_for_column_sql,
     get_active_membership_row,
@@ -68,7 +68,7 @@ from app.services.candidate_visibility import (
 )
 from app.services.notifications import emit_notification
 from app.services.profile import _calculate_age, _json_dict, _json_list, _json_object, get_profile
-from app.services.quotas import consume_extra
+from app.services.quotas import consume_extra, resolve_browse_limit
 from app.services.admin_config import get_runtime_value
 from app.services.restrictions import ensure_user_allowed
 from app.services.runtime_config import (
@@ -661,20 +661,8 @@ async def _quota_key(prefix: str, user_id: int) -> str:
 
 
 async def _quota_limit(db: AsyncSession, user_id: int, is_vip: bool) -> int:
-    if not is_vip:
-        return int(await get_runtime_value(db, "platform_permissions", "free_browse_daily_limit", settings.browse_daily_limit))
-    row = await get_active_membership_row(db, user_id)
-    if not row:
-        return int(await get_runtime_value(db, "platform_permissions", "free_browse_daily_limit", settings.browse_daily_limit))
-    value = row["rights"]
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except json.JSONDecodeError:
-            value = {}
-    if isinstance(value, dict) and value.get("browse_daily_limit") is not None:
-        return max(0, int(value["browse_daily_limit"]))
-    return 20
+    """每日可查看的**不同用户**上限（委托 quotas 统一口径，与 /users/me/quotas 对齐）。"""
+    return await resolve_browse_limit(db, user_id, is_vip=is_vip)
 
 
 async def _record_quota_usage(db: AsyncSession, user_id: int, quota_code: str, source: str, reason: str, target_user_id: int | None = None) -> None:
@@ -682,18 +670,34 @@ async def _record_quota_usage(db: AsyncSession, user_id: int, quota_code: str, s
 
 
 async def _consume_browse(db: AsyncSession, user_id: int, match_score: float, is_vip: bool, target_user_id: int) -> int:
+    """扣除一次「查看不同用户」的额度，返回当天剩余可看的新用户数。
+
+    计费单元是**当天查看过的不同 target_user_id 个数**：同一用户当天第 2 次及
+    以后打开（``consume_daily_unique`` 返回 -1）直接放行，不扣常规/高匹配/积分
+    任何一个池，也不重复写台账。额度耗尽只对"新用户"生效。
+    """
     limit = await _quota_limit(db, user_id, is_vip)
     high_match_bonus = int(await get_runtime_value(db, "platform_permissions", "high_match_browse_bonus", settings.browse_high_match_bonus))
     regular_key = await _quota_key("browse", user_id)
-    if await consume_daily(regular_key, limit):
+    seen_key = await _quota_key("browse_seen", user_id)
+    member = str(target_user_id)
+    charged = await consume_daily_unique(seen_key, regular_key, member, limit)
+    if charged == -1:
+        return max(0, limit - await get_daily_used(regular_key))
+    if charged == 1:
         await _record_quota_usage(db, user_id, "browse", "package" if is_vip else "free", "Daily profile view", target_user_id)
-        return limit - await get_daily_used(regular_key)
+        return max(0, limit - await get_daily_used(regular_key))
     if match_score > 80:
         bonus_key = await _quota_key("browse_bonus", user_id)
-        if await consume_daily(bonus_key, high_match_bonus):
+        bonus = await consume_daily_unique(seen_key, bonus_key, member, high_match_bonus)
+        if bonus == 1:
             await _record_quota_usage(db, user_id, "browse", "bonus", "High-match profile bonus", target_user_id)
-            return high_match_bonus - await get_daily_used(bonus_key)
+            return max(0, high_match_bonus - await get_daily_used(bonus_key))
+        if bonus == -1:
+            return max(0, limit - await get_daily_used(regular_key))
     if await consume_extra(db, user_id, "browse", "积分兑换资料查看次数", target_user_id):
+        # 积分池在 MySQL，无法与 Redis 原子扣减；补记 seen，避免同一用户重复扣积分。
+        await mark_daily_member(seen_key, member)
         return 0
     raise HTTPException(429, detail="今日完整浏览额度已用完")
 
