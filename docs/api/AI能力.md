@@ -18,7 +18,21 @@ AI_RECOMMEND_ENABLED=false
 AI_MOXIANG_JOURNEY_ENABLED=false
 AI_VOICE_ENABLED=false
 AI_PROVIDER=mock
+AI_TEST_ONLY_USER_IDS=
 ```
+
+### 测试期用户隔离（`AI_TEST_ONLY_USER_IDS`）
+
+临时接入第三方（含免费）端点做联调时，用此变量把 AI 能力**限制在指定用户**，避免真实用户数据被发送到第三方。
+
+- 格式：逗号分隔的 `user_id`，容忍空格、全角逗号 `，`、中英文分号；非数字片段被忽略。例如 `AI_TEST_ONLY_USER_IDS=21,22,23,24`。
+- 为空（默认）：不做任何限制，行为与历史一致。
+- 非空：只有列表内的用户能通过 AI 门禁；**列表外的用户、以及没有请求上下文的调用（后台任务、脚本）一律 fail closed**，返回 `503 AI_FEATURE_DISABLED`。
+- 该检查在 `require_ai_feature` 内、在功能开关与生产审批门禁**之后**执行，因此不会掩盖原有的开关行为。
+- 生效方式：改环境变量后必须重启进程（`Settings` 为启动期加载）。
+- 只影响 AI 接口；额度、支付、实名等其它接口不受影响。
+
+> 变更记录 2026-10-23：新增 `AI_TEST_ONLY_USER_IDS` 测试期用户隔离。默认空值，**对既有部署无行为变化**；仅当显式配置后才收紧 AI 调用范围。协议与响应结构不变（复用既有 `503 AI_FEATURE_DISABLED`）。
 
 生产启用前还必须显式配置批准项和对应真实 provider 的凭据，例如
 `AI_POLICY_APPROVED=true`、`AI_PROVIDER_APPROVED=true`、

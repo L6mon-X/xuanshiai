@@ -10,6 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import decode_access_token
+from app.core.request_context import current_user_id_context
 from app.services.matchmaker_admin_auth import decode_matchmaker_admin_token, get_session_account
 from app.schemas.matchmaker_admin import MatchmakerAdminAccount
 from app.db.session import get_db
@@ -88,6 +89,8 @@ async def get_current_user(
     await db.commit()
     values = dict(row)
     values.setdefault("face_verified", None)
+    # 供跨层守卫（如 AI 测试期用户隔离）读取当前调用者，避免把 user 逐层透传。
+    current_user_id_context.set(int(row["id"]))
     return CurrentUser(**values, session_id=session_id)
 
 
