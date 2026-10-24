@@ -30,7 +30,6 @@ class CustomerLeadCreate(BaseModel):
     wechat: str | None = Field(default=None, max_length=128)
     source: str = Field(min_length=1, max_length=64)
     photo: str | None = Field(default=None, max_length=512)
-    gender: Literal[1, 2] | None = None
     birthday: date | None = None
     intention_level: Literal[1, 2, 3] = 1
     gender: LeadGender = Field(default=0, description="性别 0未知 1男 2女（A13）")
@@ -67,7 +66,6 @@ class CustomerLeadUpdate(BaseModel):
     phone: str | None = Field(default=None, pattern=r"^1[3-9]\d{9}$")
     wechat: str | None = Field(default=None, max_length=128)
     photo: str | None = Field(default=None, max_length=512)
-    gender: Literal[1, 2] | None = None
     birthday: date | None = None
     intention_level: Literal[1, 2, 3] | None = None
     gender: LeadGender | None = None
@@ -142,7 +140,6 @@ class CustomerLead(BaseModel):
     wechat: str | None
     source: str
     photo: str | None
-    gender: int | None
     birthday: date | None
     intention_level: Literal[1, 2, 3]
     gender: LeadGender = 0

@@ -50,11 +50,14 @@ def _lead(row: Any, redaction_level: str = REDACTION_LEVEL_STANDARD) -> Customer
 
     `wechat` 按敏感等级掩码后返回（审计第 1 项：完整微信号不得返回）；默认标准级，
     调用方忘记传等级时落到最严格一档，不会泄露完整值。
+    `gender` 历史行有 NULL（A13 加列前的数据），CustomerLead 是 Literal[0,1,2]
+    不接受 None，这里归一为 0（未知），否则整行序列化 500。
     """
     payload = dict(row)
     raw = payload.pop("tags_raw", None)
     payload["tags"] = [item for item in (raw or "").split(",") if item]
     payload["wechat"] = mask_contact(payload.get("wechat"), redaction_level)
+    payload["gender"] = payload.get("gender") or 0
     return CustomerLead(**payload)
 
 

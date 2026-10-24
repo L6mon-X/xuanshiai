@@ -23,7 +23,7 @@ from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 
 from app.schemas.customer_lead_admin import CustomerLead, CustomerLeadConvertRequest
-from app.services.customer_lead_admin import LEAD_SELECT, convert_lead
+from app.services.customer_lead_admin import LEAD_SELECT, convert_lead, list_leads
 
 PHONE = "13800000000"
 NOW = datetime(2026, 10, 1, 12, 0, 0)
@@ -50,6 +50,8 @@ class StubResult:
         return self._scalar
 
     def first(self):
+        if self._rows:
+            return self._rows[0]
         return self._first
 
     def mappings(self):
@@ -72,8 +74,10 @@ class StubDB:
         self.statements.append((sql, dict(params or {})))
         if "information_schema.COLUMNS" in sql:
             return StubResult(rows=_LEAD_COLUMNS)
+        if sql.strip().startswith("SELECT COUNT"):
+            return StubResult(scalar=1)
         if "tags_raw" in sql:
-            return StubResult(first=self._lead_row)
+            return StubResult(rows=[self._lead_row])
         if "SELECT phone FROM customer_lead" in sql:
             return StubResult(first=(self._lead_row.get("phone"),))
         if "FROM users WHERE phone" in sql:
@@ -237,6 +241,21 @@ def test_lead_select_provides_every_required_customer_lead_field() -> None:
     required = {name for name, field in CustomerLead.model_fields.items() if field.is_required()}
     assert required, "CustomerLead 应有必填字段"
     assert {name for name in required if name not in LEAD_SELECT} == set()
+
+
+@pytest.mark.asyncio
+async def test_list_leads_normalizes_null_gender_rows() -> None:
+    """A13 加性别列之前的客源行 gender 为 NULL；CustomerLead 是 Literal[0,1,2]
+    不接受 None，_lead 必须归一为 0（未知）。
+
+    线上曾复现：默认 page_size=20 拉到 NULL 行整页 500，而 page_size=5 只返回
+    有 gender 的新行所以验证时漏过——这类「页大小相关」的坑必须用全量页钉住。
+    """
+    db = StubDB(_lead_row(gender=None, id=99, name="历史NULL行"))
+    page = await list_leads(db, 1, 20, None, None, None, None)
+    assert page.total == 1
+    assert page.items[0].gender == 0
+    assert page.items[0].name == "历史NULL行"
 
 
 def test_gender_injection_never_touches_the_tags_subquery() -> None:
