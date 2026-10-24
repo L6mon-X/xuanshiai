@@ -10,8 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.dependencies import CurrentMatchmakerAdmin
 from app.schemas.admin_home import (
     AcademyCategory, AdminBootstrap, AdminDashboard, AnnouncementItem, AnnouncementPage,
-    DailyTrend, DashboardGender, DashboardMetrics, DashboardPending, HomeAuthorization,
-    HomeHeader, HomeOperator, IncomeRankItem, RechargeItem, SmsStatistics,
+    DailyTrend, DashboardGender, DashboardHonor, DashboardMetrics, DashboardMonthlyDelta,
+    DashboardPending, HomeAuthorization, HomeHeader, HomeOperator, IncomeRankItem, RechargeItem,
+    SmsStatistics,
 )
 
 
@@ -441,3 +442,59 @@ async def academy_categories(db: AsyncSession, enabled: bool | None = True) -> l
 async def recharge_items(db: AsyncSession) -> list[RechargeItem]:
     rows = await db.execute(text("SELECT id, name, resource_type, quantity, price FROM admin_recharge_item WHERE enabled = 1 AND tenant_id = 1 ORDER BY sort, id"))
     return [RechargeItem(**dict(row)) for row in rows.mappings().all()]
+
+
+async def honor(db: AsyncSession, admin: CurrentMatchmakerAdmin) -> DashboardHonor:
+    """光荣榜聚合（A11，近似口径只读，无补列/新表）。
+
+    牵线/约见按 D-16 数据范围收口，活动总数无归属列故不收口（与原站取
+    ``GET /admin/activities`` 的 total 口径一致）。
+    """
+    params: dict[str, object] = {}
+    match_scope, _ = _scope_condition(admin, "ma.from_user_id")
+    meeting_scope, _ = _scope_condition(admin, "mr.organizer_id")
+    row = (await db.execute(text(f"""SELECT
+        (SELECT COUNT(*) FROM match_apply ma WHERE {match_scope}) line_total,
+        (SELECT COUNT(*) FROM match_apply ma WHERE ma.status = 1 AND {match_scope}) line_success,
+        (SELECT COUNT(DISTINCT party.uid) FROM (
+            SELECT ma.from_user_id uid FROM match_apply ma WHERE ma.status = 1 AND {match_scope}
+            UNION ALL SELECT ma.to_user_id FROM match_apply ma WHERE ma.status = 1 AND {match_scope}
+        ) party) no_single,
+        (SELECT COUNT(*) FROM meeting_record mr WHERE {meeting_scope}) meeting_arranged,
+        (SELECT COUNT(*) FROM offline_activity) activity_held"""), params)).mappings().one()
+    return DashboardHonor(**{key: int(row[key] or 0) for key in DashboardHonor.model_fields})
+
+
+async def monthly_delta(db: AsyncSession, admin: CurrentMatchmakerAdmin) -> DashboardMonthlyDelta:
+    """统计卡本月增量（A11，只读）。按 created_at / start_at 落在自然月内计数。"""
+    today = date.today()
+    month_start = today.replace(day=1)
+    next_month = (month_start + timedelta(days=32)).replace(day=1)
+    params: dict[str, object] = {"month_start": month_start, "next_month": next_month}
+    user_scope, scope_params = _scope_condition(admin, "users.id")
+    params.update(scope_params)
+    lead_scope, lead_params = _lead_scope_condition(admin)
+    params.update(lead_params)
+    membership_scope, _ = _scope_condition(admin, "user_membership.user_id")
+    matchmaker_scope, _ = _scope_condition(admin, "user_matchmaker_apply.user_id")
+    row = (await db.execute(text(f"""SELECT
+        (SELECT COUNT(*) FROM users WHERE status = 1 AND created_at >= :month_start AND created_at < :next_month AND {user_scope}) member_delta,
+        (SELECT COUNT(*) FROM users WHERE status = 1 AND openid IS NOT NULL AND openid <> '' AND created_at >= :month_start AND created_at < :next_month AND {user_scope}) wechat_fan_delta,
+        (SELECT COUNT(*) FROM customer_lead WHERE created_at >= :month_start AND created_at < :next_month AND {lead_scope}) lead_delta,
+        (SELECT COUNT(DISTINCT user_membership.user_id) FROM user_membership WHERE status = 1 AND start_at >= :month_start AND start_at < :next_month AND {membership_scope}) vip_delta,
+        (SELECT COUNT(DISTINCT user_membership.user_id) FROM user_membership WHERE status = 1 AND start_at >= :month_start AND start_at < :next_month AND EXISTS (SELECT 1 FROM payment_order mo WHERE mo.order_no = user_membership.order_no AND mo.product_type = 'offline_vip') AND {membership_scope}) offline_vip_delta,
+        (SELECT COUNT(*) FROM user_matchmaker_apply WHERE application_type = 'service_matchmaker' AND status = 1 AND created_at >= :month_start AND created_at < :next_month AND {matchmaker_scope}) matchmaker_delta"""), params)).mappings().one()
+    vip = int(row["vip_delta"] or 0)
+    offline = int(row["offline_vip_delta"] or 0)
+    member = int(row["member_delta"] or 0)
+    return DashboardMonthlyDelta(
+        month=month_start.strftime("%Y-%m"),
+        member_delta=member,
+        platform_user_delta=member,
+        wechat_fan_delta=int(row["wechat_fan_delta"] or 0),
+        lead_delta=int(row["lead_delta"] or 0),
+        vip_delta=vip,
+        online_vip_delta=max(0, vip - offline),
+        offline_vip_delta=offline,
+        matchmaker_delta=int(row["matchmaker_delta"] or 0),
+    )

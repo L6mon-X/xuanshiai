@@ -112,6 +112,41 @@ class AdminDashboard(BaseModel):
     trends: list[DailyTrend]
 
 
+class DashboardHonor(BaseModel):
+    """光荣榜聚合（A11，近似口径只读）。
+
+    口径说明（本轮「近似口径优先」）：
+    - ``line_total`` / ``line_success`` 取线上牵线记录 ``match_apply`` 总数 / 成功数（status=1）；
+    - ``meeting_arranged`` 取线下约见 ``meeting_record`` 已安排总数；
+    - ``activity_held`` 原站口径为「已举办场次」，本库无场次统计，按用户确认用**活动总数**近似；
+    - ``no_single`` 原站为「脱单人数」，本库无独立字段，近似取「牵线成功涉及的去重会员数」。
+    """
+
+    line_total: int = Field(default=0, ge=0)
+    line_success: int = Field(default=0, ge=0)
+    meeting_arranged: int = Field(default=0, ge=0)
+    activity_held: int = Field(default=0, ge=0)
+    no_single: int = Field(default=0, ge=0)
+
+
+class DashboardMonthlyDelta(BaseModel):
+    """统计卡「本月 +X」增量（A11，只读，按 created_at/start_at 落在自然月内计数）。
+
+    原站「公众号粉丝 / 红娘团队」两项无月增量来源恒显示 +0；本接口用现有表
+    （users.openid / user_matchmaker_apply）近似给出真实月增量，不减损信息。
+    """
+
+    month: str
+    member_delta: int = Field(default=0, ge=0)
+    platform_user_delta: int = Field(default=0, ge=0)
+    wechat_fan_delta: int = Field(default=0, ge=0)
+    lead_delta: int = Field(default=0, ge=0)
+    vip_delta: int = Field(default=0, ge=0)
+    online_vip_delta: int = Field(default=0, ge=0)
+    offline_vip_delta: int = Field(default=0, ge=0)
+    matchmaker_delta: int = Field(default=0, ge=0)
+
+
 class AnnouncementItem(BaseModel):
     id: int
     version_id: int | None = None

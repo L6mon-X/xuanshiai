@@ -20,6 +20,8 @@ from app.schemas.customer_lead_admin import (
     CustomerLeadBatchImportResult, CustomerLeadConvertRequest, CustomerLeadFollowUpCreate, CustomerLeadImportRow, CustomerLeadImportSummary,
     CustomerLeadOption, CustomerLeadOptions,
     CustomerLeadPage, CustomerLeadStatistics, CustomerLeadUpdate,
+    CustomerLeadFollowUpRecord, CustomerLeadFollowUpRecordPage, CustomerLeadFollowBucket,
+    MatchmakerFollowStat, CustomerLeadPromoterStat,
 )
 from app.services.customer_lead_contact import (
     ensure_contact_available, normalize_contact, raise_duplicate_contact,
@@ -94,11 +96,14 @@ async def create_lead(db: AsyncSession, account_id: int, request: CustomerLeadCr
     await _ensure_user_in_scope(db, request.promoter_id, assignment_scope, assignment_scope_params)
     await ensure_contact_available(db, phone, wechat)
     try:
-        result = await db.execute(text("""INSERT INTO customer_lead
-            (name, phone, wechat, source, intention_level, remark, promoter_id, audit_status, created_by)
-            VALUES (:name, :phone, :wechat, :source, :intention_level, :remark, :promoter_id, :audit_status, :created_by)"""), {
-            **request.model_dump(exclude={"tags"}), "phone": phone, "wechat": wechat, "created_by": account_id,
-        })
+        insert_columns = ["name", "phone", "wechat", "source", "intention_level", "remark", "promoter_id", "audit_status", "created_by"]
+        insert_payload = {**request.model_dump(exclude={"tags"}), "phone": phone, "wechat": wechat, "created_by": account_id}
+        if "gender" in await _lead_columns(db):
+            insert_columns.append("gender")
+        insert_sql = f"""INSERT INTO customer_lead
+            ({', '.join(insert_columns)})
+            VALUES (:{', '.join(insert_columns)})"""
+        result = await db.execute(text(insert_sql), insert_payload)
         lead_id = int(result.lastrowid)
         await _sync_tags(db, lead_id, request.tags)
         await db.execute(text("""INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id)
@@ -135,7 +140,13 @@ async def get_lead(
     where = ["id = :id"]
     params: dict[str, Any] = {"id": lead_id}
     _merge_scope(where, params, scope, scope_params)
-    row = (await db.execute(text(f"{LEAD_SELECT} WHERE {' AND '.join(where)}"), params)).mappings().first()
+    columns = await _lead_columns(db)
+    if "deleted_at" in columns:
+        where.append("deleted_at IS NULL")
+    select_sql = LEAD_SELECT
+    if "gender" in columns:
+        select_sql = select_sql.replace("FROM customer_lead", ", CAST(gender AS SIGNED) AS gender FROM customer_lead")
+    row = (await db.execute(text(f"{select_sql} WHERE {' AND '.join(where)}"), params)).mappings().first()
     if not row:
         raise HTTPException(404, detail="客源线索不存在")
     return _lead(row, redaction_level)
@@ -156,6 +167,8 @@ async def convert_lead(
     guard_where = ["id = :id"]
     guard_params: dict[str, Any] = {"id": lead_id}
     _merge_scope(guard_where, guard_params, scope, scope_params)
+    if "deleted_at" in await _lead_columns(db):
+        guard_where.append("deleted_at IS NULL")
     if not await db.scalar(text(f"SELECT id FROM customer_lead WHERE {' AND '.join(guard_where)} FOR UPDATE"), guard_params):
         raise HTTPException(404, detail="客源线索不存在")
     lead = await get_lead(db, lead_id, "full", scope=scope, scope_params=scope_params)
@@ -266,6 +279,7 @@ async def list_leads(
     redaction_level: str = REDACTION_LEVEL_STANDARD,
     *,
     intention_level: int | None = None,
+    gender: int | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
     assign_start: str | None = None,
@@ -305,6 +319,8 @@ async def list_leads(
     where = ["1=1"]
     params: dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size}
     _merge_scope(where, params, scope, scope_params)
+    if "deleted_at" in columns:
+        where.append("deleted_at IS NULL")
     if status:
         where.append("status = :status")
         params["status"] = status
@@ -321,6 +337,9 @@ async def list_leads(
     if intention_level is not None:
         where.append("intention_level = :intention_level")
         params["intention_level"] = intention_level
+    if gender is not None and "gender" in columns:
+        where.append("gender = :gender")
+        params["gender"] = gender
     if promoter_id is not None:
         where.append("promoter_id = :promoter_id")
         params["promoter_id"] = promoter_id
@@ -394,7 +413,10 @@ async def list_leads(
 
     clause = " AND ".join(where)
     order_sql = _LEAD_ORDER_SQL.get(order or "latest", _LEAD_ORDER_SQL["latest"])
-    rows = await db.execute(text(f"{LEAD_SELECT} WHERE {clause} ORDER BY {order_sql} LIMIT :limit OFFSET :offset"), params)
+    select_sql = LEAD_SELECT
+    if "gender" in columns:
+        select_sql = select_sql.replace("FROM customer_lead", ", CAST(gender AS SIGNED) AS gender FROM customer_lead")
+    rows = await db.execute(text(f"{select_sql} WHERE {clause} ORDER BY {order_sql} LIMIT :limit OFFSET :offset"), params)
     count = await db.execute(text(f"SELECT COUNT(*) FROM customer_lead WHERE {clause}"), {k: v for k, v in params.items() if k not in ("limit", "offset")})
     total = int(count.scalar() or 0)
     return CustomerLeadPage(items=[_lead(row, redaction_level) for row in rows.mappings().all()], page=page, page_size=page_size, total=total, has_more=page * page_size < total)
@@ -412,6 +434,9 @@ async def update_lead(
 ) -> CustomerLead:
     current = await get_lead(db, lead_id, redaction_level, scope=scope, scope_params=scope_params)
     values = request.model_dump(exclude_unset=True)
+    # gender 列未迁移时从写入字段剔除，避免 Unknown column 500（先发版后迁移）。
+    if "gender" in values and "gender" not in await _lead_columns(db):
+        values.pop("gender")
     # tags 不是 customer_lead 的列，必须先从写入字段里剔除，再单独走标签同步。
     new_tags = [t.strip() for t in (values.pop("tags", None) or []) if t and t.strip()]
     # 掩码值不写回：表单预填的是脱敏后的展示值，原样落库会把真实微信号毁成 ***
@@ -513,10 +538,200 @@ async def lead_statistics(
     where = ["1=1"]
     params: dict[str, Any] = {}
     _merge_scope(where, params, scope, scope_params)
+    if "deleted_at" in await _lead_columns(db):
+        where.append("deleted_at IS NULL")
     row = (await db.execute(text(f"""SELECT COUNT(*) total, SUM(status = 'NEW') new_count, SUM(status = 'CONTACTED') contacted_count,
         SUM(status = 'INTENDED') intended_count, SUM(status = 'CONVERTED') converted_count, SUM(status = 'LOST') lost_count
         FROM customer_lead WHERE {' AND '.join(where)}"""), params)).mappings().one()
     return CustomerLeadStatistics(**{key: int(row[key] or 0) for key in ("total", "new_count", "contacted_count", "intended_count", "converted_count", "lost_count")})
+
+
+# ───────────── A13 客源跟进全览 / 数据报表 ─────────────
+
+async def list_follow_up_records(
+    db: AsyncSession,
+    page: int,
+    page_size: int,
+    *,
+    matchmaker_id: int | None = None,
+    promoter_id: int | None = None,
+    intention_level: int | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    search: str | None = None,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> CustomerLeadFollowUpRecordPage:
+    """全局客源跟进记录列表（A13）：代替前端“拉全部线索→逐条跟进”的 N+1。
+
+    归属 / 软删除均在 `customer_lead`，用 EXISTS 子查询收敛，既复用 D-16
+    作用域谓词（列名不带别名，作用于子查询内的 customer_lead），又与列表明细同口径。
+    """
+    where = ["1=1"]
+    params: dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size}
+    lead_where: list[str] = []
+    lead_params: dict[str, Any] = {}
+    if "deleted_at" in await _lead_columns(db):
+        lead_where.append("customer_lead.deleted_at IS NULL")
+    if scope:
+        lead_where.append(f"({scope})")
+        lead_params.update(scope_params or {})
+    if matchmaker_id is not None:
+        lead_where.append("customer_lead.matchmaker_id = :matchmaker_id")
+        params["matchmaker_id"] = matchmaker_id
+    if promoter_id is not None:
+        lead_where.append("customer_lead.promoter_id = :promoter_id")
+        params["promoter_id"] = promoter_id
+    if intention_level is not None:
+        where.append("fu.intention_level = :intention_level")
+        params["intention_level"] = intention_level
+    if start_date:
+        where.append("fu.created_at >= :start")
+        params["start"] = start_date
+    if end_date:
+        where.append("fu.created_at < DATE_ADD(:end, INTERVAL 1 DAY)")
+        params["end"] = end_date
+    if search:
+        where.append("(fu.content LIKE CONCAT('%', :search, '%') OR cl.name LIKE CONCAT('%', :search, '%'))")
+        params["search"] = search
+    if lead_where:
+        where.append("EXISTS (SELECT 1 FROM customer_lead WHERE customer_lead.id = fu.lead_id AND " + " AND ".join(lead_where) + ")")
+    params.update(lead_params)
+    clause = " AND ".join(where)
+    count = int((await db.execute(text(f"SELECT COUNT(*) FROM customer_lead_follow_up fu JOIN customer_lead cl ON cl.id = fu.lead_id WHERE {clause}"), params)).scalar() or 0)
+    rows = (await db.execute(text(f"""SELECT fu.id, fu.lead_id, cl.name AS lead_name, cl.source AS lead_source, cl.status AS lead_status,
+        fu.method, fu.content, fu.intention_level, fu.next_follow_at, cl.matchmaker_id, cl.promoter_id, fu.created_by, fu.created_at
+        FROM customer_lead_follow_up fu JOIN customer_lead cl ON cl.id = fu.lead_id
+        WHERE {clause} ORDER BY fu.id DESC LIMIT :limit OFFSET :offset"""), params)).mappings().all()
+    return CustomerLeadFollowUpRecordPage(
+        items=[CustomerLeadFollowUpRecord(**dict(row)) for row in rows],
+        page=page, page_size=page_size, total=count, has_more=page * page_size < count,
+    )
+
+
+async def lead_follow_statistics(
+    db: AsyncSession,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    matchmaker_id: int | None = None,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> CustomerLeadFollowBucket:
+    """跟进全览顶部时间卡片计数（A13）：今天/昨天/最近3天/本周/上周/本月/上月。"""
+    where = ["1=1"]
+    params: dict[str, Any] = {}
+    lead_where: list[str] = []
+    if "deleted_at" in await _lead_columns(db):
+        lead_where.append("customer_lead.deleted_at IS NULL")
+    if scope:
+        lead_where.append(f"({scope})")
+        params.update(scope_params or {})
+    if matchmaker_id is not None:
+        lead_where.append("customer_lead.matchmaker_id = :matchmaker_id")
+        params["matchmaker_id"] = matchmaker_id
+    if start_date:
+        where.append("fu.created_at >= :start")
+        params["start"] = start_date
+    if end_date:
+        where.append("fu.created_at < DATE_ADD(:end, INTERVAL 1 DAY)")
+        params["end"] = end_date
+    if lead_where:
+        where.append("EXISTS (SELECT 1 FROM customer_lead WHERE customer_lead.id = fu.lead_id AND " + " AND ".join(lead_where) + ")")
+    clause = " AND ".join(where)
+    row = (await db.execute(text(f"""SELECT
+        SUM(fu.created_at >= CURDATE() AND fu.created_at < DATE_ADD(CURDATE(), INTERVAL 1 DAY)) today,
+        SUM(fu.created_at >= DATE_SUB(CURDATE(), INTERVAL 1 DAY) AND fu.created_at < CURDATE()) yesterday,
+        SUM(fu.created_at >= DATE_SUB(CURDATE(), INTERVAL 3 DAY)) last_3_days,
+        SUM(fu.created_at >= DATE_SUB(CURDATE(), INTERVAL WEEKDAY(CURDATE()) DAY)) this_week,
+        SUM(fu.created_at >= DATE_SUB(CURDATE(), INTERVAL (WEEKDAY(CURDATE()) + 7) DAY) AND fu.created_at < DATE_SUB(CURDATE(), INTERVAL WEEKDAY(CURDATE()) DAY)) last_week,
+        SUM(fu.created_at >= DATE_FORMAT(CURDATE(), '%Y-%m-01')) this_month,
+        SUM(fu.created_at >= DATE_SUB(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH) AND fu.created_at < DATE_FORMAT(CURDATE(), '%Y-%m-01')) last_month
+        FROM customer_lead_follow_up fu WHERE {clause}"""), params)).mappings().one()
+    return CustomerLeadFollowBucket(**{key: int(row[key] or 0) for key in ("today", "yesterday", "last_3_days", "this_week", "last_week", "this_month", "last_month")})
+
+
+async def matchmaker_follow_stats(
+    db: AsyncSession,
+    *,
+    matchmaker_id: int | None = None,
+    scope: str | None = None,
+    scope_params: dict[str, Any] = None,
+) -> list[MatchmakerFollowStat]:
+    """按红娘的客源跟进统计（A13）：名下客源总数 / 跟进总条数 / 本月 / 从未跟进。"""
+    if scope_params is None:
+        scope_params = {}
+    where = ["cl.matchmaker_id IS NOT NULL"]
+    params: dict[str, Any] = {}
+    if "deleted_at" in await _lead_columns(db):
+        where.append("cl.deleted_at IS NULL")
+    if scope:
+        where.append(f"({scope})")
+        params.update(scope_params)
+    if matchmaker_id is not None:
+        where.append("cl.matchmaker_id = :matchmaker_id")
+        params["matchmaker_id"] = matchmaker_id
+    clause = " AND ".join(where)
+    rows = (await db.execute(text(f"""SELECT cl.matchmaker_id AS matchmaker_id,
+        COALESCE(NULLIF(u.nickname, ''), u.phone, CONCAT('红娘', cl.matchmaker_id)) AS matchmaker_name,
+        COUNT(DISTINCT cl.id) AS lead_count,
+        COUNT(fu.id) AS total_count,
+        SUM(fu.created_at >= DATE_FORMAT(CURDATE(), '%Y-%m-01')) AS month_count,
+        COUNT(DISTINCT CASE WHEN NOT EXISTS (SELECT 1 FROM customer_lead_follow_up fx WHERE fx.lead_id = cl.id) THEN cl.id END) AS unfollowed_count
+        FROM customer_lead cl
+        LEFT JOIN customer_lead_follow_up fu ON fu.lead_id = cl.id
+        LEFT JOIN users u ON u.id = cl.matchmaker_id
+        WHERE {clause}
+        GROUP BY cl.matchmaker_id, matchmaker_name
+        ORDER BY total_count DESC, lead_count DESC"""), params)).mappings().all()
+    return [MatchmakerFollowStat(
+        matchmaker_id=int(r["matchmaker_id"]), matchmaker_name=str(r["matchmaker_name"] or ""),
+        total_count=int(r["total_count"] or 0), month_count=int(r["month_count"] or 0),
+        unfollowed_count=int(r["unfollowed_count"] or 0),
+    ) for r in rows]
+
+
+async def promoter_acquisition_stats(
+    db: AsyncSession,
+    *,
+    promoter_id: int | None = None,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> list[CustomerLeadPromoterStat]:
+    """推广红娘获客统计（A13）：含男/女拆分。gender 列未迁移时男女相关列落 0。"""
+    has_gender = "gender" in await _lead_columns(db)
+    where = ["promoter_id IS NOT NULL"]
+    params: dict[str, Any] = {}
+    if "deleted_at" in await _lead_columns(db):
+        where.append("deleted_at IS NULL")
+    if scope:
+        where.append(f"({scope})")
+        params.update(scope_params or {})
+    if promoter_id is not None:
+        where.append("promoter_id = :promoter_id")
+        params["promoter_id"] = promoter_id
+    clause = " AND ".join(where)
+    if has_gender:
+        gender_cols = ("SUM(gender = 1) male, SUM(gender = 2) female, "
+                       "SUM(gender = 1 AND audit_status = 'active' AND status NOT IN ('LOST','CLOSED')) valid_male, "
+                       "SUM(gender = 2 AND audit_status = 'active' AND status NOT IN ('LOST','CLOSED')) valid_female")
+    else:
+        gender_cols = "0 male, 0 female, 0 valid_male, 0 valid_female"
+    rows = (await db.execute(text(f"""SELECT promoter_id,
+        COALESCE(NULLIF(u.nickname, ''), u.phone, CONCAT('红娘', promoter_id)) promoter_name,
+        COUNT(*) total, {gender_cols},
+        SUM(audit_status = 'pending') pending,
+        SUM(status IN ('LOST','CLOSED')) invalid
+        FROM customer_lead cl LEFT JOIN users u ON u.id = cl.promoter_id
+        WHERE {clause}
+        GROUP BY promoter_id, promoter_name
+        ORDER BY total DESC"""), params)).mappings().all()
+    return [CustomerLeadPromoterStat(
+        promoter_id=int(r["promoter_id"]), promoter_name=str(r["promoter_name"] or ""),
+        total=int(r["total"] or 0), male=int(r["male"] or 0), female=int(r["female"] or 0),
+        valid_male=int(r["valid_male"] or 0), valid_female=int(r["valid_female"] or 0),
+        pending=int(r["pending"] or 0), invalid=int(r["invalid"] or 0),
+    ) for r in rows]
 
 
 async def abandon_lead(
@@ -576,6 +791,84 @@ async def restore_lead(
     await db.execute(text("INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id) VALUES (:actor, 'customer_lead.restore', 'customer_lead', :id)"), {"actor": account_id, "id": lead_id})
     await db.commit()
     return await get_lead(db, lead_id, redaction_level, scope=scope, scope_params=scope_params)
+
+
+async def delete_lead(
+    db: AsyncSession,
+    account_id: int,
+    lead_id: int,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> None:
+    """软删除单条客源线索（A16）。
+
+    仅对当前数据范围内、未删除的线索生效（越权/不存在/已删除均 404）；
+    删除后生成列 active_phone/active_wechat 随 deleted_at 置 NULL，联系方式不再被占用。
+    """
+    if "deleted_at" not in await _lead_columns(db):
+        raise HTTPException(503, detail="客源删除功能未就绪：请先执行软删除迁移")
+    guard_where = ["id = :id", "deleted_at IS NULL"]
+    guard_params: dict[str, Any] = {"id": lead_id}
+    _merge_scope(guard_where, guard_params, scope, scope_params)
+    if not await db.scalar(text(f"SELECT id FROM customer_lead WHERE {' AND '.join(guard_where)} FOR UPDATE"), guard_params):
+        raise HTTPException(404, detail="客源线索不存在")
+    await db.execute(text("""UPDATE customer_lead
+        SET deleted_at = UTC_TIMESTAMP(), deleted_by = :account_id, updated_at = UTC_TIMESTAMP()
+        WHERE id = :id AND deleted_at IS NULL"""), {"account_id": account_id, "id": lead_id})
+    await db.execute(text("""INSERT INTO business_audit_log
+        (actor_user_id, action, resource_type, resource_id, reason)
+        VALUES (:actor, 'customer_lead.delete', 'customer_lead', :id, :reason)"""),
+        {"actor": account_id, "id": lead_id, "reason": "后台软删除客源线索"})
+    await db.commit()
+
+
+async def batch_delete_leads(
+    db: AsyncSession,
+    account_id: int,
+    lead_ids: list[int],
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> tuple[list[int], list[dict[str, str]]]:
+    """批量软删除客源线索（A16），部分成功语义。
+
+    单事务 + 一份汇总审计；越权/不存在/已删除的线索归入 failed，不整体报错。
+    返回 (deleted_ids, [{id, error}, ...])。
+    """
+    ids = list(dict.fromkeys(int(item) for item in lead_ids))
+    if "deleted_at" not in await _lead_columns(db):
+        raise HTTPException(503, detail="客源删除功能未就绪：请先执行软删除迁移")
+    if not ids:
+        return [], []
+    lock_params: dict[str, Any] = {}
+    id_placeholders = _placeholders("bdel", [str(item) for item in ids], lock_params)
+    lock_where = [f"id IN ({id_placeholders})", "deleted_at IS NULL"]
+    _merge_scope(lock_where, lock_params, scope, scope_params)
+    present = {
+        int(row[0])
+        for row in (await db.execute(text(
+            f"SELECT id FROM customer_lead WHERE {' AND '.join(lock_where)} FOR UPDATE"), lock_params)).all()
+    }
+    deleted: list[int] = []
+    failed: list[dict[str, str]] = []
+    for lead_id in ids:
+        if lead_id in present:
+            deleted.append(lead_id)
+        else:
+            failed.append({"id": str(lead_id), "error": "客源不存在、已删除或越权"})
+    if deleted:
+        del_params: dict[str, Any] = {"account_id": account_id}
+        del_placeholders = _placeholders("del", [str(item) for item in deleted], del_params)
+        await db.execute(text(f"""UPDATE customer_lead
+            SET deleted_at = UTC_TIMESTAMP(), deleted_by = :account_id, updated_at = UTC_TIMESTAMP()
+            WHERE id IN ({del_placeholders}) AND deleted_at IS NULL"""), del_params)
+        await db.execute(text("""INSERT INTO business_audit_log
+            (actor_user_id, action, resource_type, resource_id, reason)
+            VALUES (:actor, 'customer_lead.batch_delete', 'customer_lead', NULL, :reason)"""),
+            {"actor": account_id, "reason": f"批量软删除 {len(deleted)} 条客源线索"})
+    await db.commit()
+    return deleted, failed
 
 
 async def list_abandonments(
@@ -827,6 +1120,20 @@ async def lead_options(
         CustomerLeadOption(value=row["source"], label=row["source"])
         for row in (await db.execute(text(f"SELECT DISTINCT source FROM customer_lead WHERE {' AND '.join(source_where)} ORDER BY source"), source_params)).mappings().all()
     ]
+    # A14：合并运营维护的来源字典（customer_lead_source）；字典表不存在（迁移未执行）时
+    # 静默跳过，不阻断下拉。按 value 去重，字典优先展示，再补历史自由文本来源。
+    source_dict_exists = (await db.execute(text("""SELECT 1 FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'customer_lead_source'"""))).scalar()
+    dict_sources: list[CustomerLeadOption] = []
+    if source_dict_exists:
+        dict_sources = [
+            CustomerLeadOption(value=row["name"], label=row["name"])
+            for row in (await db.execute(text("SELECT name FROM customer_lead_source WHERE enabled = 1 ORDER BY sort, id"))).mappings().all()
+        ]
+    merged: dict[str, CustomerLeadOption] = {}
+    for option in [*dict_sources, *sources]:
+        merged.setdefault(option.value, option)
+    sources = list(merged.values())
     matchmakers = [
         CustomerLeadOption(value=str(row["id"]), label=row["label"])
         for row in (await db.execute(text("""SELECT u.id, COALESCE(NULLIF(u.nickname, ''), u.phone, CONCAT('用户', u.id)) AS label
