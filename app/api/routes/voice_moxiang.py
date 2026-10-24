@@ -100,6 +100,7 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy import text as sql_text
 
 from app.core.config import settings
+from app.core.request_context import current_user_id_context
 from app.services.voice.auth import VoiceTicketDenied, VoiceTicketUnavailable, authenticate_voice_ticket
 from app.db.session import session_factory as _db_session_factory
 from app.services.ai.flags import AiFeature, require_ai_feature
@@ -782,6 +783,14 @@ async def moxiang_master_conversation(
         await ws.close(code=1011, reason="凭证服务暂时不可用")
         return
     request_id = uuid.uuid4().hex
+
+    # WebSocket 连接不经过 ``get_current_user``，因此这里补写请求级用户上下文。
+    # 否则依赖该上下文的守卫（如 ``AI_TEST_ONLY_USER_IDS`` 白名单）在 WS 通道里
+    # 只能读到 None 而 fail closed，文字画像对话会被误杀成"连接失败"。
+    try:
+        current_user_id_context.set(int(user_id))
+    except (TypeError, ValueError):
+        current_user_id_context.set(None)
 
     await ws.accept()
     logger.info(
