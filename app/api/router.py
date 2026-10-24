@@ -21,6 +21,7 @@ from app.api.routes import (
     admin_config,
     admin_common_upload,
     admin_content,
+    admin_cms,
     ai_avatar,
     auth,
     ai,
@@ -143,6 +144,9 @@ api_router.include_router(admin_home.router, tags=["管理端首页"])
 api_router.include_router(admin_config.router, tags=["管理后台配置"])
 api_router.include_router(admin_common_upload.router, tags=["管理后台通用上传"])
 api_router.include_router(admin_content.router, tags=["管理后台通用内容"])
+# A11-CMS：系统更新公告 / 使用帮助文档（复用通用内容表，前端约定路径）
+api_router.include_router(admin_cms.update_report_router, tags=["管理后台"])
+api_router.include_router(admin_cms.help_doc_router, tags=["管理后台"])
 api_router.include_router(admin_home.legacy_router, tags=["管理端首页兼容"])
 api_router.include_router(matchmaker_admin.router, tags=["红娘后台"])
 api_router.include_router(matchmaker_admin_account.router, tags=["红娘后台"])

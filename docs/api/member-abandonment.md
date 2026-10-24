@@ -377,9 +377,74 @@ Content-Type: application/json
 
 ---
 
-## 6. 会员列表新增弃海筛选（B3）
+## 6. 批量弃海
 
-### 6.1 `GET /api/v1/admin/matchmaker/members` 新增参数
+### 6.1 `POST /api/v1/admin/members/batch-abandon`（A18，2026-10-24）
+
+#### 基本信息
+
+- 用途：批量把会员放入弃海池，与 `batch-status` 同构，包成一次事务 + 一份汇总审计。
+- 权限：`matchmaker.member.manage`；`Content-Type: application/json`；成功 `200 OK`。
+- **敏感操作**：必须携带 `Idempotency-Key`（8–128）与 `confirm=true`；缺幂等键 `422`，缺二次确认 `428`；`operation` 为 `matchmaker.member.batch_abandon`。
+
+#### 请求参数
+
+| 参数 | 位置 | 类型 | 必填 | 默认值 | 校验 | 含义 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `member_ids` | body | int[] | 是 | — | 1–200 个正整数（去重） | 待弃海会员 `users.id` |
+| `reason` | body | string | 是 | — | 1–500 字 | 弃海原因 |
+| `abandon_type` | body | string | 否 | `manual` | `manual`/`lead_sync`/`auto` | 弃海来源 |
+| `Idempotency-Key` | header | string | 是 | — | 8–128 | 幂等键 |
+| `confirm` | query | bool | 是 | — | 必须 `true` | 二次确认 |
+
+#### 请求示例
+
+```http
+POST /api/v1/admin/members/batch-abandon?confirm=true
+Authorization: Bearer <access_token>
+Idempotency-Key: 6f1c-abcdef-0123456789
+Content-Type: application/json
+
+{ "member_ids": [1, 2, 3], "reason": "批量清理失联会员", "abandon_type": "manual" }
+```
+
+非法示例（缺 `confirm=true` 返回 428；`member_ids=[]` 返回 422）。
+
+#### 返回参数
+
+| 字段 | 类型 | 必返 | 含义 |
+| --- | --- | --- | --- |
+| `succeeded` | int[] | 是 | 成功弃海的 member_id |
+| `failed` | array | 是 | 逐条失败项 `{id, error}` |
+| `failed[].id` | int | 是 | 失败会员 ID |
+| `failed[].error` | string | 是 | `会员不存在`（越权/不存在）/ `该会员已在弃海池` |
+
+#### 返回示例
+
+```json
+{ "succeeded": [1], "failed": [ { "id": 2, "error": "该会员已在弃海池" }, { "id": 3, "error": "会员不存在" } ] }
+```
+
+#### 使用方法与业务规则
+
+- 越权/不存在/已在池的 id 归入 `failed`，不整体 4xx；全部失败仍返 200（部分成功语义）。
+- 写操作前对作用域内目标行加 `FOR UPDATE` 锁，防并发重复写入有效记录。
+- 一份汇总审计：`action='member.batch_abandon'`，`resource_type='users'`，`resource_id=NULL`，成员清单记入 `after_json`。
+- 幂等：同 `Idempotency-Key` 重放直接返回上次结果，不重复弃海。
+
+#### 错误
+
+| 状态码 | 触发条件 | 前端处理 |
+| --- | --- | --- |
+| 401 / 403 | 未登录 / 缺 `matchmaker.member.manage` | 登录 / 提示无权限 |
+| 422 | 缺 `Idempotency-Key`、body 参数非法 | 补齐头与参数 |
+| 428 | 缺 `confirm=true` | 弹二次确认 |
+
+---
+
+## 7. 会员列表新增弃海筛选（B3）
+
+### 7.1 `GET /api/v1/admin/matchmaker/members` 新增参数
 
 | 参数 | 位置 | 类型 | 必填 | 默认值 | 校验 | 含义 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -388,7 +453,7 @@ Content-Type: application/json
 - 谓词：`EXISTS/NOT EXISTS (SELECT 1 FROM member_abandonment ma WHERE ma.user_id = u.id AND ma.restored_at IS NULL)`。
 - 返回结构：`MemberListItem` 新增 `abandoned: bool`（默认 `false`），表示当前是否在弃海池。
 
-### 6.2 `GET /api/v1/admin/matchmaker/members/statistics` 新增字段
+### 7.2 `GET /api/v1/admin/matchmaker/members/statistics` 新增字段
 
 | 字段 | 类型 | 必返 | 含义 |
 | --- | --- | --- | --- |
@@ -398,17 +463,18 @@ Content-Type: application/json
 
 ---
 
-## 7. 变更记录
+## 8. 变更记录
 
 | 日期 | 变更 | 兼容性 |
 | --- | --- | --- |
+| 2026-10-24 | 新增批量弃海 `POST /admin/members/batch-abandon`（A18，幂等 + 二次确认 + 部分成功语义） | 新增接口，向后兼容 |
 | 2026-10-20 | 新增 `/admin/members/abandoned`、`/abandonments`、`/{member_id}/abandon`、`/{member_id}/restore` | 新增接口，向后兼容 |
 | 2026-10-20 | `GET /admin/matchmaker/members` 新增 `abandoned` 筛选参数；`MemberListItem` 新增 `abandoned` 字段 | 新增可选参数与字段，旧客户端不受影响 |
 | 2026-10-20 | `GET /admin/matchmaker/members/statistics` 新增 `abandoned` 计数 | 新增字段，旧客户端忽略即可 |
 
 ---
 
-## 8. 文档完成自检清单
+## 9. 文档完成自检清单
 
 - [x] 请求参数表：每个参数均写明位置、类型、必填、默认值、校验与业务含义
 - [x] 请求体示例：给出完整 HTTP 示例；无请求体的接口已明确标注

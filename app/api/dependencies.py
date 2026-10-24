@@ -50,6 +50,8 @@ class CurrentUser:
     status: int
     realname_status: int
     face_verified: int | None = None
+    # A12-模拟登录：非空表示这是一个由该后台管理员发起的只读模拟会话（发起管理员 id）。
+    impersonated_by: int | None = None
 
 
 async def get_current_user(
@@ -88,7 +90,10 @@ async def get_current_user(
     await db.commit()
     values = dict(row)
     values.setdefault("face_verified", None)
-    return CurrentUser(**values, session_id=session_id)
+    # A12-模拟登录：从令牌 imp 声明中取发起管理员 id（无声明为 None，普通登录行为不变）。
+    impersonated_raw = payload.get("imp")
+    impersonated_by = int(impersonated_raw) if impersonated_raw is not None else None
+    return CurrentUser(**values, session_id=session_id, impersonated_by=impersonated_by)
 
 
 async def get_verified_user(current: CurrentUser = Depends(get_current_user)) -> CurrentUser:

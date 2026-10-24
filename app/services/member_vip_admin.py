@@ -6,7 +6,9 @@ from fastapi import HTTPException
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.schemas.member_vip_admin import AdminVipUpdate, AdminVipUpdateResponse
+from app.schemas.member_vip_admin import (
+    AdminLoginLogItem, AdminLoginLogPage, AdminVipUpdate, AdminVipUpdateResponse,
+)
 
 
 async def update_vip(
@@ -69,4 +71,91 @@ async def update_vip(
         VALUES (:actor, :action, 'user_membership', :id, :reason)"""), {"actor": admin_id, "action": f"member.vip.{request.action.lower()}", "id": membership_id, "reason": request.reason or "已支付订单后台处理"})
     await db.commit()
     return AdminVipUpdateResponse(membership_id=membership_id, user_id=user_id, action=request.action, package_type=request.package_type, status=1, start_at=start_at, end_at=end_at, order_no=request.order_no, reason=request.reason)
+
+
+# ───────────── A12 平台用户登录日志（全局列表 / 删除 / 清空，复用 user_login_log） ─────────────
+
+def _login_log_filters(
+    where: list[str], params: dict[str, object], *, search: str | None, login_status: int | None,
+    login_type: int | None, start_date: str | None, end_date: str | None,
+) -> None:
+    """登录日志列表与「一键清空」共用的筛选谓词，保证清空口径与列表一致。"""
+    if search:
+        where.append("(u.nickname LIKE CONCAT('%', :search, '%') OR u.phone LIKE CONCAT('%', :search, '%') OR l.ip LIKE CONCAT('%', :search, '%'))")
+        params["search"] = search
+    if login_status is not None:
+        where.append("l.login_status = :login_status")
+        params["login_status"] = login_status
+    if login_type is not None:
+        where.append("l.login_type = :login_type")
+        params["login_type"] = login_type
+    if start_date:
+        where.append("l.created_at >= :start_date")
+        params["start_date"] = start_date
+    if end_date:
+        where.append("l.created_at < DATE_ADD(:end_date, INTERVAL 1 DAY)")
+        params["end_date"] = end_date
+
+
+async def list_login_logs(
+    db: AsyncSession, page: int, page_size: int, *, search: str | None = None,
+    login_status: int | None = None, login_type: int | None = None,
+    start_date: str | None = None, end_date: str | None = None,
+    scope: str | None = None, scope_params: dict[str, object] | None = None,
+) -> AdminLoginLogPage:
+    """平台用户登录日志全局列表（A12）。按 D-16 作用域收口，倒序分页。"""
+    where = ["1 = 1"]
+    params: dict[str, object] = {"limit": page_size, "offset": (page - 1) * page_size}
+    base = "FROM user_login_log l JOIN users u ON u.id = l.user_id"
+    if scope:
+        params.update(scope_params or {})
+        where.append(f"({scope})")
+    _login_log_filters(where, params, search=search, login_status=login_status, login_type=login_type, start_date=start_date, end_date=end_date)
+    clause = " AND ".join(where)
+    rows = await db.execute(text(f"""SELECT l.id, l.user_id, u.nickname, u.phone, l.login_type, l.login_status, l.ip,
+        l.device_id, l.platform, l.failure_reason, l.created_at {base} WHERE {clause} ORDER BY l.id DESC LIMIT :limit OFFSET :offset"""), params)
+    count = await db.execute(text(f"SELECT COUNT(*) {base} WHERE {clause}"), {k: v for k, v in params.items() if k not in ("limit", "offset")})
+    total = int(count.scalar() or 0)
+    return AdminLoginLogPage(items=[AdminLoginLogItem(**dict(row)) for row in rows.mappings().all()], page=page, page_size=page_size, total=total, has_more=page * page_size < total)
+
+
+async def delete_login_log(
+    db: AsyncSession, admin_id: int, log_id: int, *, scope: str | None = None, scope_params: dict[str, object] | None = None,
+) -> int:
+    """删除单条平台用户登录日志（A12）。越权/不存在返回 404，不泄露存在性。"""
+    where = ["l.id = :id"]
+    params: dict[str, object] = {"id": log_id}
+    if scope:
+        params.update(scope_params or {})
+        where.append(f"({scope})")
+    res = await db.execute(text(f"""DELETE l FROM user_login_log l JOIN users u ON u.id = l.user_id
+        WHERE {' AND '.join(where)}"""), params)
+    deleted = int(res.rowcount or 0)
+    if not deleted:
+        raise HTTPException(404, detail="登录日志不存在或不在数据范围内")
+    await db.execute(text("""INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id, reason)
+        VALUES (:actor, 'member.login_log.delete', 'user_login_log', :id, :reason)"""), {"actor": admin_id, "id": log_id, "reason": "后台删除登录日志"})
+    await db.commit()
+    return deleted
+
+
+async def clear_login_logs(
+    db: AsyncSession, admin_id: int, *, search: str | None = None, login_status: int | None = None,
+    login_type: int | None = None, start_date: str | None = None, end_date: str | None = None,
+    scope: str | None = None, scope_params: dict[str, object] | None = None,
+) -> int:
+    """一键清空登录日志（A12）：按当前筛选 + 数据范围删除，返回删除行数。"""
+    where = ["1 = 1"]
+    params: dict[str, object] = {}
+    if scope:
+        params.update(scope_params or {})
+        where.append(f"({scope})")
+    _login_log_filters(where, params, search=search, login_status=login_status, login_type=login_type, start_date=start_date, end_date=end_date)
+    clause = " AND ".join(where)
+    res = await db.execute(text(f"""DELETE l FROM user_login_log l JOIN users u ON u.id = l.user_id WHERE {clause}"""), params)
+    deleted = int(res.rowcount or 0)
+    await db.execute(text("""INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id, reason)
+        VALUES (:actor, 'member.login_log.clear', 'user_login_log', NULL, :reason)"""), {"actor": admin_id, "reason": f"后台清空登录日志 {deleted} 条"})
+    await db.commit()
+    return deleted
 

@@ -15,11 +15,15 @@ from app.services.sensitive_operations import (
     begin_sensitive_operation,
     finish_sensitive_operation,
 )
-from app.schemas.matchmaker_crm_admin import MatchRecordCreate, MatchRecordItem, MatchRecordPage, MatchRecordResponse, MatchRecordStatistics, MatchRecordUpdate, MemberAssignmentResponse, MemberAssignmentUpdate, MemberDetail, MemberListItem, MemberPage, MemberStatistics, MemberStatusResponse, MemberStatusUpdate
+from app.schemas.matchmaker_crm_admin import MatchRecordCreate, MatchRecordItem, MatchRecordPage, MatchRecordResponse, MatchRecordStatistics, MatchRecordUpdate, MemberAssignmentResponse, MemberAssignmentUpdate, MemberDetail, MemberListItem, MemberPage, MemberStatistics, MemberStatusResponse, MemberStatusUpdate, SourceDistributionItem
 from app.schemas.admin import CertificationReviewRequest, RealnameReviewRequest
 from app.services.auth import list_realname_reviews, review_realname
 from app.services.certifications import list_certification_reviews, review_certification
-from app.services.member_crm_filter import build_member_filter, member_sort_sql
+from app.services.member_crm_filter import (
+    MEMBER_BALANCE_EXPR,
+    build_member_filter,
+    member_sort_sql,
+)
 
 router = APIRouter(prefix="/admin/matchmaker")
 
@@ -217,6 +221,22 @@ async def create_match_record(
     return MatchRecordResponse(id=int(result.lastrowid), from_user_id=body.from_love_user_id, to_user_id=body.to_love_user_id, status=body.line_status, created_at=body.create_time, responded_at=body.complete_time)
 
 
+def _normalize_tags(raw: object) -> object:
+    """把 tags 列归一化为 Python 结构。
+
+    MySQL JSON 列经 asyncmy 驱动取回时可能是已解析对象，也可能是 JSON 字符串；
+    历史脏数据（非列表值、非法 JSON）统一降级为 None，避免 500。
+    """
+    if raw is None or isinstance(raw, (dict, list)):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 async def _available_columns(db: AsyncSession) -> frozenset[tuple[str, str]]:
     """读取会员列表会引用的列是否存在，供缺列降级使用。
 
@@ -287,13 +307,26 @@ async def _member_query(
         COALESCE({user_expr('activity_signup')}, 0) AS activity_signup,
         {user_expr('level')} AS level, {user_expr('fetched_at')} AS fetched_at,
         a.assigned_at,
+        {auth_expr('real_name')} AS real_name,
+        {profile_expr('weight')} AS weight,
+        {profile_expr('tags')} AS tags,
+        {user_expr('last_login_at')} AS last_login_at,
+        {user_expr('register_ip')} AS ip_location,
+        {user_expr('ip_region')} AS ip_region,
+        {user_expr('phone_region')} AS phone_region,
+        {user_expr('login_num')} AS login_num,
+        COALESCE((SELECT up.balance FROM user_points up WHERE up.user_id = u.id ORDER BY up.id DESC LIMIT 1), 0) AS points,
+        {MEMBER_BALANCE_EXPR} AS balance,
         EXISTS (SELECT 1 FROM member_abandonment ma
             WHERE ma.user_id = u.id AND ma.restored_at IS NULL) AS abandoned,
         CASE WHEN v.user_id IS NULL OR (v.vip_end_at IS NOT NULL AND v.vip_end_at <= UTC_TIMESTAMP()) THEN 0 ELSE 1 END AS is_vip
         {base} WHERE {where} ORDER BY {order_by} LIMIT :limit OFFSET :offset"""), params)
     count = await db.execute(text(f"SELECT COUNT(*) {base} WHERE {where}"), {k: v for k, v in params.items() if k not in ("limit", "offset")})
     total = int(count.scalar() or 0)
-    items = [MemberListItem(**dict(row)) for row in rows.mappings().all()]
+    raw_rows = [dict(row) for row in rows.mappings().all()]
+    for item in raw_rows:
+        item["tags"] = _normalize_tags(item.get("tags"))
+    items = [MemberListItem(**item) for item in raw_rows]
     return MemberPage(items=items, page=page, page_size=page_size, total=total, has_more=page * page_size < total)
 
 
@@ -304,14 +337,24 @@ async def members(
     gender: int | None = Query(None, ge=1, le=2),
     status: int | None = Query(None, ge=1, le=3),
     vip: bool | None = Query(None),
-    auth_status: int | None = Query(None, ge=0, le=4, description="资料审核状态 0未提交 1审核中 2已通过 3未通过 4已到店核验"),
+    auth_status: str | None = Query(
+        None,
+        pattern=r"^[0-4](,[0-4]){0,4}$",
+        description="资料审核状态，支持英文逗号分隔多值：0未提交 1审核中 2已通过 3未通过 4已到店核验；如 1,2,3,4 为已提交资料（B6）",
+    ),
     assigned: bool | None = Query(None),
     follow_state: str | None = Query(None, pattern="^(never|due_today|overdue)$"),
     search: str | None = Query(None, max_length=64),
     search_type: str | None = Query(None, pattern="^(smart|phone|wechat|code|id|nickname|realname)$"),
-    sort_by: str = Query("created_at", pattern="^(created_at|entered_at|last_login_at|last_follow_at|next_follow_at|assigned_at|fetched_at|id)$"),
+    sort_by: str = Query("created_at", pattern="^(created_at|entered_at|last_login_at|last_follow_at|next_follow_at|assigned_at|fetched_at|login_num|balance|id)$"),
     order: str | None = Query(None, pattern="^(latest|earliest|smart)$", description="记录排序；与 sort_by 互斥，同时传时以 order 为准"),
     source: str | None = Query(None, max_length=32),
+    source__is_null: bool | None = Query(
+        None, description="来源空值筛选：true 仅未填写来源 / false 仅已填写来源（B5）"
+    ),
+    activity_id: int | None = Query(
+        None, ge=1, description="按具体活动报名筛选：存在该活动的报名记录（B0）"
+    ),
     region: str | None = Query(None, pattern="^(mainland|hmt|overseas)$"),
     xiangqin_status: int | None = Query(None, ge=1, le=5, description="相亲状态 1公开相亲 2委托红娘 3完全私密 4停止相亲 5已经脱单"),
     realname: bool | None = Query(None),
@@ -323,6 +366,10 @@ async def members(
     age_max: int | None = Query(None, ge=16, le=100),
     height_min: int | None = Query(None, ge=80, le=250),
     height_max: int | None = Query(None, ge=80, le=250),
+    weight_min: int | None = Query(None, ge=20, le=300, description="体重下限（kg，含），按 user_profile.weight 区间过滤（B9）"),
+    weight_max: int | None = Query(None, ge=20, le=300, description="体重上限（kg，含），按 user_profile.weight 区间过滤（B9）"),
+    next_follow_start: str | None = Query(None, max_length=10, description="预约下次跟进时间起（含，YYYY-MM-DD）；供预约跟进日历（A15）"),
+    next_follow_end: str | None = Query(None, max_length=10, description="预约下次跟进时间止（含当日，YYYY-MM-DD）；供预约跟进日历（A15）"),
     marriage: str | None = Query(None, max_length=64, description="婚况多选，英文逗号分隔；取值同 users.is_married 编码（0未知 1未婚 2离异 3丧偶）"),
     education: str | None = Query(None, max_length=255, description="学历多选，英文逗号分隔"),
     occupation: str | None = Query(None, max_length=255, description="职业多选，英文逗号分隔"),
@@ -358,11 +405,15 @@ async def members(
     values = {
         "gender": gender, "status": status, "vip": vip, "auth_status": auth_status,
         "assigned": assigned, "follow_state": follow_state, "search": search,
-        "search_type": search_type, "source": source, "region": region,
+        "search_type": search_type, "source": source, "source__is_null": source__is_null,
+        "activity_id": activity_id, "region": region,
         "xiangqin_status": xiangqin_status, "realname": realname, "cert_status": cert_status,
         "organization_id": organization_id, "matchmaker_id": matchmaker_id,
         "promoter_id": promoter_id, "age_min": age_min, "age_max": age_max,
-        "height_min": height_min, "height_max": height_max, "marriage": marriage,
+        "height_min": height_min, "height_max": height_max,
+        "weight_min": weight_min, "weight_max": weight_max,
+        "next_follow_start": next_follow_start, "next_follow_end": next_follow_end,
+        "marriage": marriage,
         "education": education, "occupation": occupation, "income": income,
         "income_min": income_min, "income_max": income_max,
         "intention_level": intention_level, "house": house, "ethnicity": ethnicity,
@@ -380,7 +431,7 @@ async def members(
     where, params = build_member_filter(values, available)
     scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = u.id")
     return await _member_query(
-        db, where, params, page, page_size, scope, member_sort_sql(sort_by, order), available=available
+        db, where, params, page, page_size, scope, member_sort_sql(sort_by, order, available), available=available
     )
 
 
@@ -415,7 +466,19 @@ async def member_statistics(current: CurrentMatchmakerAdmin = Depends(get_curren
         LEFT JOIN {_ASSIGNMENT_DISPLAY_DERIVED} a ON a.user_id = u.id
         LEFT JOIN (SELECT user_id, MAX(created_at) last_follow_at, MAX(next_follow_at) next_follow_at FROM member_follow_up GROUP BY user_id) f ON f.user_id = u.id
         WHERE ({scope})"""), params)).mappings().one()
-    return MemberStatistics(**{key: int(row[key] or 0) for key in ("total", "male", "female", "vip", "active", "unassigned", "never_followed", "follow_due_today", "abandoned")})
+    # B5/A11：来源分布（含未填写一档）。users.source 列缺失时降级为空列表，
+    # 不影响其余统计字段；前端可回退到“会员总数－已归类”兑底。
+    source_distribution: list[SourceDistributionItem] = []
+    if ("users", "source") in await _available_columns(db):
+        dist_rows = (await db.execute(text(f"""SELECT COALESCE(NULLIF(u.source, ''), '') AS value, COUNT(*) count
+            FROM users u
+            LEFT JOIN {_ASSIGNMENT_DISPLAY_DERIVED} scope_dummy ON scope_dummy.user_id = u.id
+            WHERE ({scope}) GROUP BY value ORDER BY count DESC, value"""), params)).mappings().all()
+        source_distribution = [
+            SourceDistributionItem(value=str(item["value"]), label=str(item["value"]) or "未填写来源", count=int(item["count"] or 0))
+            for item in dist_rows
+        ]
+    return MemberStatistics(**{key: int(row[key] or 0) for key in ("total", "male", "female", "vip", "active", "unassigned", "never_followed", "follow_due_today", "abandoned")}, source_distribution=source_distribution)
 
 
 @router.post("/members/batch-status")
@@ -545,18 +608,21 @@ async def review_member_certification(
 @router.get("/members/{member_id}", response_model=MemberDetail, summary="查询会员详情")
 async def member_detail(member_id: int = Path(..., ge=1), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> MemberDetail:
     column_rows = await db.execute(text("""SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS
-        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('user_profile', 'user_auth')"""))
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('user_profile', 'user_auth', 'users')"""))
     available = {(row[0], row[1]) for row in column_rows.all()}
     def profile_expr(name: str) -> str:
         return f"p.{name}" if ("user_profile", name) in available else "NULL"
 
     def auth_expr(name: str) -> str:
         return f"ua.{name}" if ("user_auth", name) in available else "NULL"
+
+    def user_expr(name: str) -> str:
+        return f"u.{name}" if ("users", name) in available else "NULL"
     params: dict[str, object] = {"id": member_id}
     # 越权访问按「不存在」处理（404），避免通过状态码差异枚举他组织会员 ID。
     scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = u.id")
     row = (await db.execute(text(f"""SELECT u.id, u.nickname, u.phone, u.gender, u.status, u.avatar, u.birthday, u.is_married, u.created_at,
-        u.last_login_at, u.register_ip AS ip_location, {profile_expr('residence_city_code')} AS residence_city_code,
+        u.last_login_at, u.register_ip AS ip_location, {user_expr('ip_region')} AS ip_region, {user_expr('phone_region')} AS phone_region, {user_expr('login_num')} AS login_num, COALESCE((SELECT up.balance FROM user_points up WHERE up.user_id = u.id ORDER BY up.id DESC LIMIT 1), 0) AS points, {MEMBER_BALANCE_EXPR} AS balance, {profile_expr('residence_city_code')} AS residence_city_code,
         {profile_expr('height')} AS height, {profile_expr('weight')} AS weight,
         {profile_expr('constellation')} AS constellation, {profile_expr('zodiac')} AS zodiac,
         {profile_expr('household')} AS household, {profile_expr('ethnicity')} AS ethnicity,
@@ -589,12 +655,7 @@ async def member_detail(member_id: int = Path(..., ge=1), current: CurrentMatchm
         from fastapi import HTTPException
         raise HTTPException(404, detail="会员不存在")
     data = dict(row)
-    raw_tags = data.get("tags")
-    if isinstance(raw_tags, str):
-        try:
-            data["tags"] = json.loads(raw_tags)
-        except (TypeError, ValueError):
-            data["tags"] = None
+    data["tags"] = _normalize_tags(data.get("tags"))
     # 微信号整列本身就是敏感值，必须按权限分级掩码后再返回；SQL 侧原样取出只是为了把
     # 脱敏口径集中在一处，elevated 档也仅保留首尾若干位。
     data["wechat"] = mask_contact(data.get("wechat"), redaction_level_from_permissions(current.permissions))

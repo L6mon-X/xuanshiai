@@ -150,7 +150,7 @@ def test_all_scoped_routes_apply_exists_predicate() -> None:
         (promotion_order_admin, ("order_list", "order_detail", "order_update", "order_delete", "order_stats")),
         (partner_admin, ("list_partners", "partner_detail", "partner_update", "partner_delete", "list_relations", "remove_relation")),
         (merchant_admin, ("merchant_list", "merchant_detail", "merchant_update", "merchant_delete", "order_list", "order_detail")),
-        (member_vip_admin, ("update_member_vip", "vip_members", "login_logs")),
+        (member_vip_admin, ("update_member_vip", "vip_members", "login_logs", "platform_login_logs", "platform_login_logs_clear", "platform_login_log_delete", "impersonate_member")),
         (offline_vip_admin, ("list_offline_vips", "get_offline_vip", "update_offline_vip", "offline_vip_meet_logs")),
         (member_follow_up_admin, ("all_follow_ups", "follow_up_summary", "list_follow_ups", "create_follow_up", "behavior", "all_behavior")),
     ]

@@ -35,6 +35,24 @@ class MemberRestoreRequest(BaseModel):
     matchmaker_id: int | None = Field(default=None, ge=1, description="捞回后分派的服务红娘（users.id）")
 
 
+class MemberBatchAbandonRequest(BaseModel):
+    """批量弃海（A18）：与 batch-status 同构，包成一次事务 + 一份审计。"""
+
+    member_ids: list[int] = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=1, max_length=500)
+    abandon_type: Literal["manual", "lead_sync", "auto"] = "manual"
+
+
+class MemberBatchAbandonFailure(BaseModel):
+    id: int
+    error: str
+
+
+class MemberBatchAbandonResult(BaseModel):
+    succeeded: list[int] = []
+    failed: list[MemberBatchAbandonFailure] = []
+
+
 class MemberAbandonmentItem(BaseModel):
     id: int
     user_id: int

@@ -46,6 +46,16 @@ BEHAVIOR_TYPE_SQL: dict[str, str] = {
 # 证件/户籍地区 -> users.region 取值。
 REGION_VALUES: frozenset[str] = frozenset({"mainland", "hmt", "overseas"})
 
+# 余额口径（A12-钱包）：account_ledger 中 account_type='user' 的可用余额（ AVAILABLE），
+# 与 finance.get_balance 的 available_amount 完全一致（CREDIT 减 DEBIT，REVERSED 不计）。
+# 只读展示/排序，不新建表；account_ledger 已存在，故无缺列降级问题。
+MEMBER_BALANCE_EXPR = (
+    "COALESCE((SELECT SUM(CASE WHEN al.direction = 'CREDIT' THEN al.amount"
+    " WHEN al.direction = 'DEBIT' THEN -al.amount ELSE 0 END)"
+    " FROM account_ledger al WHERE al.account_type = 'user'"
+    " AND al.account_id = u.id AND al.state = 'AVAILABLE'), 0)"
+)
+
 # 排序白名单：值全部由服务端写死，不拼接用户输入。
 SORT_SQL: dict[str, str] = {
     "created_at": "u.created_at DESC, u.id DESC",
@@ -55,6 +65,7 @@ SORT_SQL: dict[str, str] = {
     "next_follow_at": "COALESCE(f.next_follow_at, '9999-12-31') ASC, u.id DESC",
     "assigned_at": "COALESCE(a.assigned_at, '1970-01-01') DESC, u.id DESC",
     "fetched_at": "COALESCE(u.fetched_at, '1970-01-01') DESC, u.id DESC",
+    "balance": f"{MEMBER_BALANCE_EXPR} DESC, u.id DESC",
     "id": "u.id DESC",
 }
 
@@ -121,9 +132,18 @@ def build_member_filter(
         where.append("v.user_id IS NOT NULL AND (v.vip_end_at IS NULL OR v.vip_end_at > UTC_TIMESTAMP())")
     elif values.get("vip") is False:
         where.append("(v.user_id IS NULL OR (v.vip_end_at IS NOT NULL AND v.vip_end_at <= UTC_TIMESTAMP()))")
-    if values.get("auth_status") is not None:
-        where.append("COALESCE(ua.auth_status, 0) = :auth_status")
-        params["auth_status"] = values["auth_status"]
+    auth_status_raw = values.get("auth_status")
+    if auth_status_raw is not None and str(auth_status_raw) != "":
+        # B6：支持英文逗号分隔多值（如 1,2,3,4 表示已提交资料），与 marriage/education
+        # 等多选参数同口径；单个值时行为与旧的等值匹配一致，向后兼容。
+        statuses = [int(item) for item in split_values(str(auth_status_raw)) if item.isdigit()]
+        if statuses:
+            names = []
+            for index, status_value in enumerate(dict.fromkeys(statuses)):
+                key = f"auth_status_{index}"
+                params[key] = status_value
+                names.append(f":{key}")
+            where.append(f"COALESCE(ua.auth_status, 0) IN ({', '.join(names)})")
     if values.get("assigned") is True:
         where.append("a.matchmaker_id IS NOT NULL")
     elif values.get("assigned") is False:
@@ -141,6 +161,13 @@ def build_member_filter(
         if column("users", "source"):
             where.append("u.source = :source")
             params["source"] = values["source"]
+    # B5：source 空值筛选。true 仅未填写（NULL 或空串），false 仅已填写。
+    source_is_null = values.get("source__is_null")
+    if source_is_null is not None and column("users", "source"):
+        if source_is_null:
+            where.append("(u.source IS NULL OR u.source = '')")
+        else:
+            where.append("(u.source IS NOT NULL AND u.source <> '')")
     if values.get("region") in REGION_VALUES:
         if column("users", "region"):
             where.append("u.region = :region")
@@ -167,6 +194,13 @@ def build_member_filter(
             where.append(f"u.{flag} = 1")
         elif value is False and column("users", flag):
             where.append(f"u.{flag} = 0")
+    # B0：按具体活动筛报名。activity_signup 表无 deleted_at，以有效报名（未取消/未拒绝）为准。
+    if values.get("activity_id") is not None:
+        where.append(
+            "EXISTS (SELECT 1 FROM activity_signup asg WHERE asg.user_id = u.id"
+            " AND asg.activity_id = :activity_id AND asg.status IN (0, 1))"
+        )
+        params["activity_id"] = values["activity_id"]
     if values.get("offline_vip") is True:
         where.append(
             "EXISTS (SELECT 1 FROM offline_vip ov WHERE ov.user_id = u.id AND ov.deleted_at IS NULL)"
@@ -216,6 +250,13 @@ def build_member_filter(
     if values.get("height_max") is not None:
         where.append("p.height <= :height_max")
         params["height_max"] = values["height_max"]
+    # B9：体重区间，与 height_min/max 同口径；user_profile.weight 缺列时跳过而非报错。
+    if values.get("weight_min") is not None and column("user_profile", "weight"):
+        where.append("p.weight >= :weight_min")
+        params["weight_min"] = values["weight_min"]
+    if values.get("weight_max") is not None and column("user_profile", "weight"):
+        where.append("p.weight <= :weight_max")
+        params["weight_max"] = values["weight_max"]
 
     # ---- 多选维度 ----
     marriage = split_values(values.get("marriage"))
@@ -307,12 +348,33 @@ def build_member_filter(
     if values.get("assigned_end"):
         where.append("a.assigned_at < DATE_ADD(:assigned_end, INTERVAL 1 DAY)")
         params["assigned_end"] = values["assigned_end"]
+    # A15：预约跟进日历。按 member_follow_up 派生表的 next_follow_at 日期区间过滤，
+    # 结束日按「含当日」处理，供抽屉的 全部/最近N天/指定日期 Tab 复用会员列表。
+    if values.get("next_follow_start"):
+        where.append("f.next_follow_at >= :next_follow_start")
+        params["next_follow_start"] = values["next_follow_start"]
+    if values.get("next_follow_end"):
+        where.append("f.next_follow_at < DATE_ADD(:next_follow_end, INTERVAL 1 DAY)")
+        params["next_follow_end"] = values["next_follow_end"]
 
     return " AND ".join(where), params
 
 
-def member_sort_sql(sort_by: str | None, order: str | None) -> str:
-    """解析排序：order 与 sort_by 互斥，order 优先；未知值回落默认排序。"""
+def member_sort_sql(
+    sort_by: str | None,
+    order: str | None,
+    available: frozenset[tuple[str, str]] | None = None,
+) -> str:
+    """解析排序：order 与 sort_by 互斥，order 优先；未知值回落默认排序。
+
+    A12-补列：`login_num` 为新增列，若传入 `available` 且其中不含
+    `('users', 'login_num')`（迁移未执行），则降级为默认排序，避免拼
+    `u.login_num` 报 Unknown column 拖垮整页。`available` 为 None 时不降级（兼容旧调用）。
+    """
+    if sort_by == "login_num" and available is not None and ("users", "login_num") not in available:
+        return SORT_SQL["created_at"]
     if order in ORDER_SQL:
         return ORDER_SQL[order]
+    if sort_by == "login_num":
+        return "COALESCE(u.login_num, 0) DESC, u.id DESC"
     return SORT_SQL.get(str(sort_by), SORT_SQL["created_at"])

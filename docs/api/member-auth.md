@@ -163,7 +163,7 @@ GET /api/v1/admin/members/auth/realname-reviews?status=pending
 
 #### 使用方法与业务规则
 
-- 与 `realname-reviews` 一并调用，渲染 4 张统计卡；余量卡的「在线充值」按钮当前未接入充值能力。
+- 与 `realname-reviews` 一并调用，渲染 4 张统计卡；余量卡的「在线充值」按钮对应 §2.3 核验额度充值接（未接入时 `quota-packages.recharge_enabled=false`，前端保持「展示余量 + 联系服务商」弹窗）。
 - 错误同 2.1。
 
 #### 文档完成自检清单
@@ -173,6 +173,54 @@ GET /api/v1/admin/members/auth/realname-reviews?status=pending
 - [x] 有成功返回示例
 - [x] 有使用方法与业务规则
 - [x] 有错误码表
+
+---
+
+### 2.3 核验额度在线充值（A17，新增 2026-10-24）
+
+实名认证（人脸核验）与婚姻状况核验按第三方厂商用量计费，需先充值额度。本阶段后端只落「充值订单」骨架，真实额度扣减/结算由厂商回调驱动（尚未接线）；`provider` 由配置 `verification_recharge_provider` 控制，三档：`disabled`（默认，厂商未定）、`mock`（仅开发/联调，配置校验禁止出现在 staging/production）、`real`（预留，未接入时下单返回 501）。
+
+#### `GET /api/v1/admin/members/auth/quota-packages`
+
+- 权限：`matchmaker.member.read`。成功 `200`。无请求体。
+- 请求参数：`kind`（query，可选，`realname|marriage`；不传返回全部）。
+- 返回 `QuotaPackageList`：`packages[]`（每项 `id/kind/name/quantity/price/currency/enabled`）、`provider`、`recharge_enabled`（=`provider≠disabled`）。
+- **业务规则**：套餐目录为只读，**不受 `provider` 开关影响**（`disabled` 下仍可展示档位，仅 `recharge_enabled=false` 告知前端不可下单）。
+
+#### `POST /api/v1/admin/members/auth/recharge`
+
+- 权限：`matchmaker.member.manage`。成功 `201`，返回 `RechargeOrder`。属敏感写操作，必须同时携带 `Idempotency-Key`（8–128）与 `?confirm=true`；缺 `confirm` 返回 `428`。同键重放返回首次订单，不重复下单。
+- 请求体 `RechargeCreateRequest`：`kind`（`realname|marriage`）、`package_id`（1–64）、`quantity`（份数，默认 1，范围 1–999）。
+- 返回 `RechargeOrder`：`order_no/kind/package_id/package_name/quantity/unit_price/total_amount/currency/status/provider/pay_url/qr_code_url/created_at/paid_at`；`status` 为 `pending|paid|failed|cancelled`。
+- **业务规则**：`provider=disabled` 下单返回 `503`（不伪造支付）；`mock` 生成待付订单 + 模拟 `pay_url`；`real` 未接入返回 `501`；订单表未建（未执行迁移）返回 `503`。写审计 `action='member.auth.recharge'`。
+
+#### `GET /api/v1/admin/members/auth/recharge/{order_no}`
+
+- 权限：`matchmaker.member.read`。成功 `200`，返回 `RechargeOrder`。`order_no` 为 path 参数（1–64）。按订单号查本地状态（支付回调后刷新）；订单不存在 `404`；表未就绪 `503`。
+
+#### `POST /api/v1/admin/members/auth/recharge/{order_no}/callback`
+
+- 权限：`matchmaker.member.manage`。成功 `200`，返回更新后的 `RechargeOrder`。
+- 请求体 `{"status": "paid"|"failed"}`（默认 `paid`）。**仅供 `mock` provider 手动联调**：将 `pending` 订单置为 `paid/failed`；非 mock 环境调用返回 `503`；对非 mock 下单的订单手动回调返回 `409`。`real` 由厂商签名回调驱动，不走本接口。
+
+#### 错误（本小节通用）
+
+| HTTP | 触发条件 | 前端处理 |
+| --- | --- | --- |
+| 401/403 | 未登录/无权限 | 跳转或提示 |
+| 404 | 订单不存在 | 提示 |
+| 409 | 非 mock 订单手动回调 | 拒绝 |
+| 422 | 参数非法（kind/package_id/quantity） | 提示具体字段 |
+| 428 | 下单缺 `confirm=true` | 要求二次确认 |
+| 501 | `real` provider 尚未接入 | 提示厂商未接入 |
+| 503 | `disabled` 下单 / 非 mock 回调 / 订单表未就绪 | 保持展示余量弹窗，不伪造调用 |
+
+#### 文档完成自检清单
+
+- [x] 参数表
+- [x] 返回字段含义
+- [x] 使用方法（含 provider 三档行为）
+- [x] 错误码表（含 503/501）
 
 ---
 
@@ -680,6 +728,10 @@ GET /api/v1/admin/members/auth/commitment-reviews?status=pending&keyword=%E5%BE%
 | --- | --- | --- |
 | GET | `/api/v1/admin/members/auth/realname-reviews` | matchmaker.member.read |
 | GET | `/api/v1/admin/members/auth/realname-stats` | matchmaker.member.read |
+| GET | `/api/v1/admin/members/auth/quota-packages` | matchmaker.member.read |
+| POST | `/api/v1/admin/members/auth/recharge` | matchmaker.member.manage |
+| GET | `/api/v1/admin/members/auth/recharge/{order_no}` | matchmaker.member.read |
+| POST | `/api/v1/admin/members/auth/recharge/{order_no}/callback` | matchmaker.member.manage |
 | GET | `/api/v1/admin/members/auth/commitment-reviews` | matchmaker.member.read |
 | GET | `/api/v1/admin/members/auth/marriage-reviews` | matchmaker.member.read |
 | GET | `/api/v1/admin/members/auth/marriage-stats` | matchmaker.member.read |

@@ -15,6 +15,8 @@ from app.api.dependencies import CurrentMatchmakerAdmin, CurrentUser
 from app.core.config import settings
 from app.schemas.finance import (
     AccountBalanceResponse,
+    BalanceAdjustmentRequest,
+    BalanceAdjustmentResult,
     CommissionEntryResponse,
     CommissionEntryDetailItem,
     CommissionEntryDetailOptions,
@@ -48,6 +50,7 @@ from app.schemas.finance import (
     StoreCommissionOptions,
     StoreCommissionSummary,
     StoreOption,
+    UserWalletResponse,
 )
 from app.core.sensitive_fields import mask_contact, redaction_level_from_permissions
 from app.services.matchmaker import activate_paid_service_order
@@ -697,6 +700,276 @@ async def admin_grant_credits(db: AsyncSession, admin: CurrentUser, request: Cre
         total_amount=len(targets) * request.amount,
         sample_ledger_ids=ledger_ids[:10],
         target_user_ids=targets,
+    )
+
+
+# ============================================
+# A12-钱包：后台余额调整（发放/扣减）+ 按用户余额/流水视图
+# 不新建表，复用 account_ledger（account_type='user'）；不接真实支付。
+# ============================================
+
+
+async def admin_adjust_balance(
+    db: AsyncSession, admin: CurrentUser, request: BalanceAdjustmentRequest
+) -> BalanceAdjustmentResult:
+    """按 user_ids 批量调整余额（发放 CREDIT / 扣减 DEBIT），写 account_ledger + 审计。
+
+    原子性：DEBIT 前对本批账户加行锁并校验可用余额，任一不足则整批 409，
+    不产生部分扣减；CREDIT 只校验目标用户存在。不触发分账、不动 payment_order。
+    """
+    targets = list(request.user_ids)
+    amount = Decimal(str(request.amount))
+    direction = request.direction
+    in_params: dict[str, object] = {}
+    placeholders = []
+    for index, uid in enumerate(targets):
+        key = f"uid_{index}"
+        in_params[key] = uid
+        placeholders.append(f":{key}")
+    in_clause = ", ".join(placeholders)
+    existing = [
+        int(row[0])
+        for row in (
+            await db.execute(
+                text(f"SELECT id FROM users WHERE id IN ({in_clause}) AND status = 1 ORDER BY id"),
+                in_params,
+            )
+        ).all()
+    ]
+    missing = [uid for uid in targets if uid not in existing]
+    if not existing:
+        raise HTTPException(404, detail="目标用户不存在或已注销")
+    if missing:
+        raise HTTPException(404, detail=f"部分目标用户不存在或已注销：{missing[:20]}")
+    await db.execute(
+        text(
+            f"""SELECT account_id FROM account_ledger
+                WHERE account_type = 'user' AND account_id IN ({in_clause}) FOR UPDATE"""
+        ),
+        in_params,
+    )
+    if direction == "DEBIT":
+        avail_rows = (
+            await db.execute(
+                text(
+                    f"""SELECT account_id,
+                        COALESCE(SUM(CASE WHEN state = 'AVAILABLE' AND direction = 'CREDIT' THEN amount
+                                          WHEN state = 'AVAILABLE' AND direction = 'DEBIT' THEN -amount
+                                          ELSE 0 END), 0) AS available
+                        FROM account_ledger WHERE account_type = 'user' AND account_id IN ({in_clause})
+                        GROUP BY account_id"""
+                ),
+                in_params,
+            )
+        ).all()
+        available = {int(r[0]): Decimal(str(r[1])) for r in avail_rows}
+        insufficient = [uid for uid in existing if available.get(uid, Decimal(0)) < amount]
+        if insufficient:
+            raise HTTPException(409, detail=f"以下用户可用余额不足，扣减未执行：{insufficient[:20]}")
+    ledger_ids: list[int] = []
+    for uid in existing:
+        result = await db.execute(
+            text(
+                """INSERT INTO account_ledger
+                   (account_type, account_id, direction, amount, state, source_type, source_id, idempotency_key)
+                   VALUES ('user', :user_id, :direction, :amount, 'AVAILABLE', 'admin_balance_adjust', :source_id, :key)"""
+            ),
+            {
+                "user_id": uid,
+                "direction": direction,
+                "amount": amount,
+                "source_id": admin.id,
+                "key": f"balance-adjust:{admin.id}:{uid}:{direction}:{amount}:{request.reason}",
+            },
+        )
+        ledger_ids.append(int(result.lastrowid or 0))
+    await db.execute(
+        text(
+            """INSERT INTO business_audit_log
+               (actor_user_id, action, resource_type, resource_id, reason, after_json)
+               VALUES (:admin_id, 'finance.balance_adjust', 'finance', NULL, :reason, :after_json)"""
+        ),
+        {
+            "admin_id": admin.id,
+            "reason": request.reason,
+            "after_json": json.dumps(
+                {
+                    "direction": direction,
+                    "adjusted_count": len(existing),
+                    "amount_per_user": str(amount),
+                    "total_amount": str(len(existing) * amount),
+                    "ledger_ids": ledger_ids[:10],
+                },
+                ensure_ascii=False,
+            ),
+        },
+    )
+    await db.commit()
+    return BalanceAdjustmentResult(
+        direction=direction,
+        adjusted_count=len(existing),
+        total_amount=len(existing) * amount,
+        sample_ledger_ids=ledger_ids[:10],
+        target_user_ids=existing,
+    )
+
+
+async def admin_get_user_wallet(
+    db: AsyncSession, user_id: int, page: int, page_size: int, *, admin: CurrentMatchmakerAdmin
+) -> UserWalletResponse:
+    """按用户聚合钱包视图：可用/待用余额 + 最新流水；越权/不存在按 404。"""
+    scope_params: dict[str, object] = {"uid": user_id}
+    member_scope = _member_anchor_scope(admin, scope_params, member_column="u.id")
+    visible = await db.execute(
+        text(f"SELECT 1 FROM users u WHERE u.id = :uid AND ({member_scope})"), scope_params
+    )
+    if not visible.first():
+        raise HTTPException(404, detail="用户不存在或无访问权限")
+    balance = await get_balance(db, "user", user_id)
+    ledger = await admin_list_ledger(
+        db, page, page_size, "user", user_id, None, None, admin=admin
+    )
+    return UserWalletResponse(
+        account_type=balance.account_type,
+        account_id=balance.account_id,
+        pending_amount=balance.pending_amount,
+        available_amount=balance.available_amount,
+        ledger=ledger,
+    )
+
+
+# ============================================
+# A12-钱包：后台余额调整（发放/扣减）+ 按用户余额/流水视图
+# 不新建表，复用 account_ledger（account_type='user'）；不接真实支付。
+# ============================================
+
+
+async def admin_adjust_balance(
+    db: AsyncSession, admin: CurrentUser, request: BalanceAdjustmentRequest
+) -> BalanceAdjustmentResult:
+    """按 user_ids 批量调整余额（发放 CREDIT / 扣减 DEBIT），写 account_ledger + 审计。
+
+    原子性：DEBIT 前对本批账户加行锁并校验可用余额，任一不足则整批 409，
+    不产生部分扣减；CREDIT 只校验目标用户存在。不触发分账、不动 payment_order。
+    """
+    targets = list(request.user_ids)
+    amount = Decimal(str(request.amount))
+    direction = request.direction
+    in_params: dict[str, object] = {}
+    placeholders = []
+    for index, uid in enumerate(targets):
+        key = f"uid_{index}"
+        in_params[key] = uid
+        placeholders.append(f":{key}")
+    in_clause = ", ".join(placeholders)
+    existing = [
+        int(row[0])
+        for row in (
+            await db.execute(
+                text(f"SELECT id FROM users WHERE id IN ({in_clause}) AND status = 1 ORDER BY id"),
+                in_params,
+            )
+        ).all()
+    ]
+    missing = [uid for uid in targets if uid not in existing]
+    if not existing:
+        raise HTTPException(404, detail="目标用户不存在或已注销")
+    if missing:
+        raise HTTPException(404, detail=f"部分目标用户不存在或已注销：{missing[:20]}")
+    await db.execute(
+        text(
+            f"""SELECT account_id FROM account_ledger
+                WHERE account_type = 'user' AND account_id IN ({in_clause}) FOR UPDATE"""
+        ),
+        in_params,
+    )
+    if direction == "DEBIT":
+        avail_rows = (
+            await db.execute(
+                text(
+                    f"""SELECT account_id,
+                        COALESCE(SUM(CASE WHEN state = 'AVAILABLE' AND direction = 'CREDIT' THEN amount
+                                          WHEN state = 'AVAILABLE' AND direction = 'DEBIT' THEN -amount
+                                          ELSE 0 END), 0) AS available
+                        FROM account_ledger WHERE account_type = 'user' AND account_id IN ({in_clause})
+                        GROUP BY account_id"""
+                ),
+                in_params,
+            )
+        ).all()
+        available = {int(r[0]): Decimal(str(r[1])) for r in avail_rows}
+        insufficient = [uid for uid in existing if available.get(uid, Decimal(0)) < amount]
+        if insufficient:
+            raise HTTPException(409, detail=f"以下用户可用余额不足，扣减未执行：{insufficient[:20]}")
+    ledger_ids: list[int] = []
+    for uid in existing:
+        result = await db.execute(
+            text(
+                """INSERT INTO account_ledger
+                   (account_type, account_id, direction, amount, state, source_type, source_id, idempotency_key)
+                   VALUES ('user', :user_id, :direction, :amount, 'AVAILABLE', 'admin_balance_adjust', :source_id, :key)"""
+            ),
+            {
+                "user_id": uid,
+                "direction": direction,
+                "amount": amount,
+                "source_id": admin.id,
+                "key": f"balance-adjust:{admin.id}:{uid}:{direction}:{amount}:{request.reason}",
+            },
+        )
+        ledger_ids.append(int(result.lastrowid or 0))
+    await db.execute(
+        text(
+            """INSERT INTO business_audit_log
+               (actor_user_id, action, resource_type, resource_id, reason, after_json)
+               VALUES (:admin_id, 'finance.balance_adjust', 'finance', NULL, :reason, :after_json)"""
+        ),
+        {
+            "admin_id": admin.id,
+            "reason": request.reason,
+            "after_json": json.dumps(
+                {
+                    "direction": direction,
+                    "adjusted_count": len(existing),
+                    "amount_per_user": str(amount),
+                    "total_amount": str(len(existing) * amount),
+                    "ledger_ids": ledger_ids[:10],
+                },
+                ensure_ascii=False,
+            ),
+        },
+    )
+    await db.commit()
+    return BalanceAdjustmentResult(
+        direction=direction,
+        adjusted_count=len(existing),
+        total_amount=len(existing) * amount,
+        sample_ledger_ids=ledger_ids[:10],
+        target_user_ids=existing,
+    )
+
+
+async def admin_get_user_wallet(
+    db: AsyncSession, user_id: int, page: int, page_size: int, *, admin: CurrentMatchmakerAdmin
+) -> UserWalletResponse:
+    """按用户聚合钱包视图：可用/待用余额 + 最新流水；越权/不存在按 404。"""
+    scope_params: dict[str, object] = {"uid": user_id}
+    member_scope = _member_anchor_scope(admin, scope_params, member_column="u.id")
+    visible = await db.execute(
+        text(f"SELECT 1 FROM users u WHERE u.id = :uid AND ({member_scope})"), scope_params
+    )
+    if not visible.first():
+        raise HTTPException(404, detail="用户不存在或无访问权限")
+    balance = await get_balance(db, "user", user_id)
+    ledger = await admin_list_ledger(
+        db, page, page_size, "user", user_id, None, None, admin=admin
+    )
+    return UserWalletResponse(
+        account_type=balance.account_type,
+        account_id=balance.account_id,
+        pending_amount=balance.pending_amount,
+        available_amount=balance.available_amount,
+        ledger=ledger,
     )
 
 

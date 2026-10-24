@@ -52,8 +52,16 @@ async def find_conflicting_lead_id(
         exclude_clause = " AND id != :conflict_exclude_id"
         params["conflict_exclude_id"] = exclude_lead_id
     exclusion = ", ".join(f"'{status}'" for status in LEAD_INACTIVE_STATUSES)
+    # 软删除迁移已执行时，被删除的客源不再占用联系方式（与生成列 deleted_at 判定一致）；
+    # 未执行迁移时缺列，静默跳过该谓词，保证「先发版后迁移」不报错。
+    active_clause = ""
+    cols = (await db.execute(text("""SELECT COLUMN_NAME FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'customer_lead' AND COLUMN_NAME = 'deleted_at'"""))).all()
+    if cols:
+        active_clause = "AND deleted_at IS NULL "
     query = (
         f"SELECT id FROM customer_lead WHERE status NOT IN ({exclusion}) "
+        f"{active_clause}"
         f"AND ({' OR '.join(contact_conditions)}){exclude_clause} ORDER BY id LIMIT 1"
     )
     return await db.scalar(text(query), params)

@@ -10,13 +10,24 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Path, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies import CurrentMatchmakerAdmin, get_current_matchmaker_admin
+from app.api.dependencies import (
+    CurrentMatchmakerAdmin,
+    get_current_matchmaker_admin,
+    require_sensitive_operation,
+)
 from app.db.session import get_db
+from app.services.sensitive_operations import (
+    abort_sensitive_operation,
+    begin_sensitive_operation,
+    finish_sensitive_operation,
+)
 from app.schemas.member_abandonment_admin import (
     AbandonedMemberPage,
     MemberAbandonmentItem,
     MemberAbandonmentPage,
     MemberAbandonRequest,
+    MemberBatchAbandonRequest,
+    MemberBatchAbandonResult,
     MemberRestoreRequest,
 )
 from app.services import member_abandonment_admin as service
@@ -76,6 +87,41 @@ async def abandonment_records(
     return await service.list_abandonments(
         db, page, page_size, active_only, abandon_type, search, scope=scope, scope_params=scope_params
     )
+
+
+@router.post(
+    "/batch-abandon", response_model=MemberBatchAbandonResult,
+    summary="批量弃海（幂等 + 二次确认，一次事务 + 一份审计）",
+)
+async def member_batch_abandon(
+    body: MemberBatchAbandonRequest,
+    idempotency_key: str = Depends(require_sensitive_operation),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MemberBatchAbandonResult:
+    """A18：与 batch-status 同构，需 confirm=true + Idempotency-Key；同键重放不重复弃海。"""
+    current.require("matchmaker.member.manage")
+    # 批量写操作同口径收敛数据范围（D-16）；谓词以 users 为表名，与服务层锁定语句一致。
+    scope_params: dict[str, object] = {}
+    scope = current.scope_exists_clause(scope_params, correlation="scope_assignment.user_id = users.id")
+    reservation, replayed = await begin_sensitive_operation(
+        db,
+        actor_id=current.account.id,
+        operation="matchmaker.member.batch_abandon",
+        idempotency_key=idempotency_key,
+        payload={"body": body.model_dump(mode="json")},
+    )
+    if replayed is not None:
+        return MemberBatchAbandonResult(**replayed)
+    try:
+        result = await service.batch_abandon_members(
+            db, current.account.id, body, scope=scope, scope_params=scope_params
+        )
+    except Exception:
+        await abort_sensitive_operation(db, reservation)
+        raise
+    await finish_sensitive_operation(db, reservation, result.model_dump(mode="json"))
+    return result
 
 
 @router.post(

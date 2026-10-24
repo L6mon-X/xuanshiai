@@ -14,6 +14,8 @@ from app.api.dependencies import (
 from app.db.session import get_db
 from app.schemas.finance import (
     AccountBalanceResponse,
+    BalanceAdjustmentRequest,
+    BalanceAdjustmentResult,
     CommissionEntryResponse,
     CommissionEntryDetailOptions,
     CommissionEntryDetailPage,
@@ -38,9 +40,12 @@ from app.schemas.finance import (
     StoreCommissionEntryPage,
     StoreCommissionOptions,
     StoreCommissionSummary,
+    UserWalletResponse,
 )
 from app.services.finance import (
     admin_grant_credits,
+    admin_adjust_balance,
+    admin_get_user_wallet,
     admin_list_credit_records,
     create_order,
     create_rule,
@@ -353,3 +358,47 @@ async def grant_credits(body: CreditGrantRequest = Body(...), admin: CurrentMatc
     """按 target_type 解析账户集 → 写 account_ledger(CREDIT, AVAILABLE, source_type='admin_grant') → 写 business_audit_log。"""
     admin.require("finance.write")
     return await admin_grant_credits(db, _finance_actor(admin), body)
+
+
+@admin_router.post("/balance-adjustments", response_model=BalanceAdjustmentResult, status_code=201, summary="后台用户余额调整（发放/扣减，幂等 + 二次确认）")
+async def balance_adjustments(
+    body: BalanceAdjustmentRequest = Body(...),
+    idempotency_key: str = Depends(require_sensitive_operation),
+    admin: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> BalanceAdjustmentResult:
+    """A12-钱包：按 user_ids 批量发放(CREDIT)/扣减(DEBIT)，复用 account_ledger，不接真实支付。
+
+    敏感写：Header Idempotency-Key + Query confirm=true（缺 confirm → 428，缺/非法幂等键 → 422）。
+    扣减前对本批账户加行锁并校验可用余额，任一不足整批 409，不产生部分扣减。
+    """
+    admin.require("finance.write")
+    reservation, replayed = await begin_sensitive_operation(
+        db,
+        actor_id=admin.account.id,
+        operation="finance.balance_adjust",
+        idempotency_key=idempotency_key,
+        payload={"body": body.model_dump(mode="json")},
+    )
+    if replayed is not None:
+        return BalanceAdjustmentResult(**replayed)
+    try:
+        result = await admin_adjust_balance(db, _finance_actor(admin), body)
+    except Exception:
+        await abort_sensitive_operation(db, reservation)
+        raise
+    await finish_sensitive_operation(db, reservation, result.model_dump(mode="json"))
+    return result
+
+
+@admin_router.get("/user-wallet/{user_id}", response_model=UserWalletResponse, summary="按用户查询钱包余额与流水")
+async def user_wallet(
+    user_id: int = Path(..., ge=1),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    admin: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> UserWalletResponse:
+    """A12-钱包：可用/待用余额 + 最新流水（只读，受 D-16 数据范围约束）。"""
+    admin.require("finance.read")
+    return await admin_get_user_wallet(db, user_id, page, page_size, admin=admin)

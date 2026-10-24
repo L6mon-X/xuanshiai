@@ -339,6 +339,22 @@ async def ensure_default_user_role(db: AsyncSession, user_id: int) -> None:
         ON DUPLICATE KEY UPDATE status = 1"""), {"user_id": user_id})
 
 
+async def touch_login(db: AsyncSession, user_id: int, extra_set: str = "") -> None:
+    """登录时刷新 last_login_at，并在 users.login_num 列已迁移时自增登录次数（A12）。
+
+    login_num 为补列项：迁移未执行的环境（information_schema 查不到该列）静默跳过自增，
+    不抛 Unknown column。登录为写路径，这里一次轻量探测保证跨环境兼容。
+    """
+    has_login_num = (await db.execute(text("""SELECT 1 FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' AND COLUMN_NAME = 'login_num'"""))).first()
+    set_clause = "last_login_at = UTC_TIMESTAMP()"
+    if extra_set:
+        set_clause = f"{extra_set}, {set_clause}"
+    if has_login_num:
+        set_clause = f"login_num = login_num + 1, {set_clause}"
+    await db.execute(text(f"UPDATE users SET {set_clause} WHERE id = :id"), {"id": user_id})
+
+
 async def login_phone(db: AsyncSession, request: PhoneLoginRequest, ip: str | None, user_agent: str | None) -> dict[str, Any]:
     if request.purpose != "login":
         raise HTTPException(422, detail="手机号登录验证码用途必须为login")
@@ -346,7 +362,7 @@ async def login_phone(db: AsyncSession, request: PhoneLoginRequest, ip: str | No
     user_agent = normalize_user_agent(user_agent)
     async with db.begin():
         user_id = await get_or_create_user_by_phone(db, request.phone, ip)
-        await db.execute(text("UPDATE users SET phone_verified_at = UTC_TIMESTAMP(), last_login_at = UTC_TIMESTAMP() WHERE id = :id"), {"id": user_id})
+        await touch_login(db, user_id)
         tokens = await create_session(db, user_id, request.device_id, request.platform, request.app_version, ip, user_agent)
         await db.execute(text("INSERT INTO user_login_log (user_id, login_type, ip, device) VALUES (:id, 2, :ip, :device)"), {"id": user_id, "ip": ip, "device": user_agent})
     tokens["need_bind_phone"] = False
@@ -363,7 +379,7 @@ async def login_wechat(db: AsyncSession, request: WechatLoginRequest, ip: str | 
             raise HTTPException(403, detail="账号当前不可用")
         if row:
             user_id = row["id"]
-            await db.execute(text("UPDATE users SET nickname = COALESCE(:nickname, nickname), avatar = COALESCE(:avatar, avatar), last_login_at = UTC_TIMESTAMP() WHERE id = :id"), {"id": user_id, "nickname": request.nickname, "avatar": request.avatar})
+            await touch_login(db, user_id, extra_set="nickname = COALESCE(:nickname, nickname), avatar = COALESCE(:avatar, avatar)")
             phone = row["phone"]
         else:
             if not await platform_registration_open(db):
@@ -392,7 +408,7 @@ async def login_existing_account(db: AsyncSession, request: ExistingAccountLogin
         if not row["password"] or not verify_password(request.password, row["password"]):
             raise HTTPException(401, detail="手机号或密码错误")
         await ensure_default_user_role(db, int(row["id"]))
-        await db.execute(text("UPDATE users SET last_login_at = UTC_TIMESTAMP() WHERE id = :id"), {"id": row["id"]})
+        await touch_login(db, int(row["id"]))
         tokens = await create_session(db, int(row["id"]), request.device_id, request.platform, request.app_version, ip, user_agent)
         await db.execute(text("INSERT INTO user_login_log (user_id, login_type, ip, device) VALUES (:id, 3, :ip, :device)"), {"id": row["id"], "ip": ip, "device": user_agent})
     tokens["need_bind_phone"] = not bool(row["phone"])
@@ -443,6 +459,106 @@ async def refresh_session(db: AsyncSession, request: RefreshRequest, ip: str | N
 
 async def revoke_session(db: AsyncSession, session_id: int) -> None:
     await db.execute(text("UPDATE user_session SET status = 2, revoked_at = UTC_TIMESTAMP(), revoke_reason = 'logout' WHERE id = :id AND status = 1"), {"id": session_id})
+
+
+# A12-模拟登录：受限短时只读会话。默认 15 分钟过期，token 带 imp 声明，
+# 由 app/main.py 只读中间件拒绝写操作。不触发登录奖励/在线标记等普通登录副作用。
+IMPERSONATION_TOKEN_EXPIRE_MINUTES = 15
+
+
+async def create_impersonation_session(
+    db: AsyncSession,
+    admin_id: int,
+    user_id: int,
+    ip: str | None,
+    user_agent: str | None,
+) -> dict[str, Any]:
+    """为后台管理员签发一个面向目标用户的短时只读模拟会话，返回仅含 access_token。
+
+    安全收口：目标账号必须存在且 status=1；会话带 impersonated_by（缺列时降级不写，
+    仍由 token 声明保证只读）；审计写入 business_audit_log（admin.impersonate.create）。
+    """
+    user = (await db.execute(
+        text("SELECT id, status FROM users WHERE id = :id"), {"id": user_id}
+    )).mappings().first()
+    if not user:
+        raise HTTPException(404, detail="目标用户不存在")
+    if int(user["status"]) != 1:
+        raise HTTPException(409, detail="目标账号当前不可用，无法模拟登录")
+    has_col = (await db.execute(text(
+        """SELECT 1 FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_session' AND COLUMN_NAME = 'impersonated_by'"""
+    ))).first()
+    minutes = getattr(settings, "impersonation_token_expire_minutes", None) or IMPERSONATION_TOKEN_EXPIRE_MINUTES
+    refresh = random_token()
+    now = datetime.now(UTC).replace(tzinfo=None)
+    access_expire = now + timedelta(minutes=minutes)
+    params: dict[str, Any] = {
+        "user_id": user_id,
+        "refresh_hash": hash_token(refresh),
+        "device_id": f"impersonate:{admin_id}",
+        "ip": ip,
+        "ua": normalize_user_agent(user_agent),
+        "access_expire": access_expire,
+        "refresh_expire": access_expire,
+    }
+    if has_col:
+        params["imp_by"] = admin_id
+        insert_result = await db.execute(
+            text(
+                """INSERT INTO user_session
+                   (user_id, refresh_token_hash, device_id, platform, ip, user_agent,
+                    created_at, last_used_at, access_expire_at, refresh_expire_at, status, impersonated_by)
+                   VALUES (:user_id, :refresh_hash, :device_id, 'impersonation', :ip, :ua,
+                           UTC_TIMESTAMP(), UTC_TIMESTAMP(), :access_expire, :refresh_expire, 1, :imp_by)"""
+            ),
+            params,
+        )
+    else:
+        insert_result = await db.execute(
+            text(
+                """INSERT INTO user_session
+                   (user_id, refresh_token_hash, device_id, platform, ip, user_agent,
+                    created_at, last_used_at, access_expire_at, refresh_expire_at, status)
+                   VALUES (:user_id, :refresh_hash, :device_id, 'impersonation', :ip, :ua,
+                           UTC_TIMESTAMP(), UTC_TIMESTAMP(), :access_expire, :refresh_expire, 1)"""
+            ),
+            params,
+        )
+    session_id = int(insert_result.lastrowid)
+    access = create_token(
+        user_id, session_id, "access", timedelta(minutes=minutes), extra={"imp": admin_id}
+    )
+    await db.execute(
+        text("UPDATE user_session SET access_token_hash = :hash WHERE id = :id"),
+        {"hash": hash_token(access), "id": session_id},
+    )
+    await db.execute(
+        text(
+            """INSERT INTO business_audit_log
+               (actor_user_id, action, resource_type, resource_id, reason, after_json)
+               VALUES (:admin_id, 'admin.impersonate.create', 'user', :user_id, :reason, :after_json)"""
+        ),
+        {
+            "admin_id": admin_id,
+            "user_id": user_id,
+            "reason": "后台模拟登录",
+            "after_json": json.dumps(
+                {"session_id": session_id, "expires_in_minutes": minutes, "read_only": True},
+                ensure_ascii=False,
+            ),
+        },
+    )
+    await db.commit()
+    return {
+        "access_token": access,
+        "token_type": "bearer",
+        "expires_in": minutes * 60,
+        "impersonated_user_id": user_id,
+        "session_id": session_id,
+        "read_only": True,
+        "impersonated_by": admin_id,
+    }
 
 
 async def accept_agreement(db: AsyncSession, user_id: int, agreement_type: str, version: str, content_hash: str | None, scene: str | None, ip: str | None, device_id: str | None) -> None:

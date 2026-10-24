@@ -9,7 +9,11 @@
 from fastapi import APIRouter, Depends, Path, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies import CurrentMatchmakerAdmin, get_current_matchmaker_admin
+from app.api.dependencies import (
+    CurrentMatchmakerAdmin,
+    get_current_matchmaker_admin,
+    require_sensitive_operation,
+)
 from app.db.session import get_db
 from app.schemas.member_auth_admin import (
     AuthTypeCreate,
@@ -25,7 +29,18 @@ from app.schemas.member_auth_admin import (
     RealnameStats,
     ReviewActionRequest,
 )
+from app.schemas.member_auth_recharge_admin import (
+    QuotaPackageList,
+    RechargeCreateRequest,
+    RechargeOrder,
+)
 from app.services import member_auth_admin as service
+from app.services import member_auth_recharge_admin as recharge_service
+from app.services.sensitive_operations import (
+    abort_sensitive_operation,
+    begin_sensitive_operation,
+    finish_sensitive_operation,
+)
 
 router = APIRouter(prefix="/admin/members")
 
@@ -53,6 +68,79 @@ async def realname_statistics(
 ) -> RealnameStats:
     current.require("matchmaker.member.read")
     return await service.realname_stats(db)
+
+
+# ─── 核验额度在线充值（A17） ──────────────────────────────────
+# 静态路径 /auth/quota-packages、/auth/recharge 必须声明在 /auth/{kind}/{review_id}
+# 动态路由之前，否则会被动态路由抢占。provider 由配置 verification_recharge_provider 控制。
+
+
+@router.get("/auth/quota-packages", response_model=QuotaPackageList, summary="核验额度充值套餐列表")
+async def quota_packages(
+    kind: str | None = Query(None, pattern="^(realname|marriage)$"),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+) -> QuotaPackageList:
+    """A17：只读套餐目录 + 当前是否可充值。目录不受 provider 开关影响。"""
+    current.require("matchmaker.member.read")
+    provider = recharge_service.current_provider()
+    return QuotaPackageList(
+        packages=recharge_service.list_packages(kind),
+        provider=provider,
+        recharge_enabled=provider != "disabled",
+    )
+
+
+@router.post("/auth/recharge", response_model=RechargeOrder, status_code=201, summary="发起核验额度充值")
+async def auth_recharge(
+    body: RechargeCreateRequest,
+    idempotency_key: str = Depends(require_sensitive_operation),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> RechargeOrder:
+    """A17：下单（幂等 + 二次确认）。provider=disabled→503、mock→待付订单、real→501。"""
+    current.require("matchmaker.member.manage")
+    reservation, replayed = await begin_sensitive_operation(
+        db,
+        actor_id=current.account.id,
+        operation="member.auth.recharge",
+        idempotency_key=idempotency_key,
+        payload={"body": body.model_dump(mode="json")},
+    )
+    if replayed is not None:
+        return RechargeOrder(**replayed)
+    try:
+        order = await recharge_service.create_order(db, current.account.id, body.kind, body.package_id, body.quantity)
+    except Exception:
+        await abort_sensitive_operation(db, reservation)
+        raise
+    await finish_sensitive_operation(db, reservation, order.model_dump(mode="json"))
+    return order
+
+
+@router.get("/auth/recharge/{order_no}", response_model=RechargeOrder, summary="查询核验额度充值订单")
+async def auth_recharge_status(
+    order_no: str = Path(..., min_length=1, max_length=64),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> RechargeOrder:
+    """A17：按订单号查状态（支付回调后刷新）。"""
+    current.require("matchmaker.member.read")
+    return await recharge_service.get_order_status(db, order_no)
+
+
+@router.post("/auth/recharge/{order_no}/callback", response_model=RechargeOrder, summary="充值支付回调（仅 mock/联调）")
+async def auth_recharge_callback(
+    order_no: str = Path(..., min_length=1, max_length=64),
+    body: dict | None = None,
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> RechargeOrder:
+    """A17：mock provider 下的手动支付回调，将 pending 订单置为 paid/failed。"""
+    current.require("matchmaker.member.manage")
+    status = (body or {}).get("status", "paid")
+    if status not in ("paid", "failed"):
+        status = "paid"
+    return await recharge_service.apply_mock_callback(db, order_no, status)
 
 
 # ─── 会员承诺 ─────────────────────────────────────────────────────

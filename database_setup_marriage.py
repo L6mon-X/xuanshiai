@@ -226,6 +226,9 @@ class DatabaseManager:
                 "deletion_scheduled_at": "`deletion_scheduled_at` datetime DEFAULT NULL",
                 "deletion_cancelled_at": "`deletion_cancelled_at` datetime DEFAULT NULL",
                 "deleted_at": "`deleted_at` datetime DEFAULT NULL",
+                "login_num": "`login_num` int NOT NULL DEFAULT 0 COMMENT '累计登录次数（A12）'",
+                "ip_region": "`ip_region` varchar(64) DEFAULT NULL COMMENT 'IP 属地（A12，展示用，待解析回填）'",
+                "phone_region": "`phone_region` varchar(64) DEFAULT NULL COMMENT '手机号归属地（A12，展示用，待解析回填）'",
             },
             "user_auth": {
                 "realname_status": "`realname_status` tinyint NOT NULL DEFAULT '0' COMMENT '0未认证 1认证中 2通过 3失败 4人工复核 5撤销'",
@@ -465,6 +468,9 @@ class DatabaseManager:
                 "pay_status": "`pay_status` tinyint NOT NULL DEFAULT '0' COMMENT '0未支付 1已支付'",
                 "pay_method": "`pay_method` varchar(32) DEFAULT NULL COMMENT '支付方式'",
             },
+            "user_session": {
+                "impersonated_by": "`impersonated_by` bigint unsigned DEFAULT NULL COMMENT '模拟登录发起管理员 id（A12）'",
+            },
         }
 
         for table_name, columns in required_columns.items():
@@ -477,6 +483,75 @@ class DatabaseManager:
         self._ensure_idempotency_contract(cursor)
         self._ensure_ai_advisor_indexes(cursor)
         self._ensure_customer_lead_contact_uniqueness(cursor)
+        self._ensure_customer_lead_soft_delete_and_source(cursor)
+
+    def _ensure_customer_lead_soft_delete_and_source(self, cursor):
+        """客源软删除列 + 来源字典表（旧库幂等补齐）。
+
+        镜像 migrations/customer_lead_gaps/20261024_01_..._up.sql：
+        - customer_lead 补 deleted_at / deleted_by 与索引 idx_customer_lead_deleted；
+        - 旧库已有的 active_phone / active_wechat 生成列定义不含 deleted_at，
+          需检测并重建为「软删除也置 NULL」，才能让删除后的客源不再占用联系方式；
+        - 新建 customer_lead_source 字典表并幂等播种常见来源（INSERT IGNORE）。
+        """
+        try:
+            cursor.execute("SHOW TABLES LIKE 'customer_lead'")
+            if not cursor.fetchone():
+                return
+            self._ensure_table_columns(cursor, "`customer_lead`", self._named_columns({
+                "gender": "tinyint NOT NULL DEFAULT 0 COMMENT '性别 0未知 1男 2女（A13）'",
+                "deleted_at": "datetime DEFAULT NULL COMMENT '软删除时间；空为有效'",
+                "deleted_by": "bigint unsigned DEFAULT NULL COMMENT '删除操作人 matchmaker_admin_account.id'",
+            }))
+            self._ensure_optional_index(cursor, "customer_lead", "idx_customer_lead_deleted", "(`deleted_at`)")
+            # 生成列旧定义不引用 deleted_at，软删除后仍会占用联系方式唯一键；
+            # 检测到缺引用时重建（先删唯一索引与列，再按新定义重建）。
+            for column, ddl, base in (
+                ("active_phone", "varchar(32)", "phone"),
+                ("active_wechat", "varchar(128)", "wechat"),
+            ):
+                cursor.execute(
+                    "SELECT GENERATION_EXPRESSION FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'customer_lead' "
+                    "AND COLUMN_NAME = %s",
+                    (column,),
+                )
+                row = cursor.fetchone()
+                if not row or "deleted_at" in (row[0] or ""):
+                    continue
+                cursor.execute(f"ALTER TABLE `customer_lead` DROP INDEX `uk_customer_lead_{column}`")
+                cursor.execute(f"ALTER TABLE `customer_lead` DROP COLUMN `{column}`")
+                cursor.execute(
+                    f"ALTER TABLE `customer_lead` ADD COLUMN `{column}` {ddl} GENERATED ALWAYS AS "
+                    f"(CASE WHEN `status` IN ('LOST','CLOSED') OR `deleted_at` IS NOT NULL "
+                    f"THEN NULL ELSE NULLIF(TRIM(`{base}`), '') END) STORED"
+                )
+                cursor.execute(
+                    f"ALTER TABLE `customer_lead` ADD UNIQUE KEY `uk_customer_lead_{column}` (`{column}`)"
+                )
+                logger.info(f"✅ 已重建 customer_lead.{column} 生成列（纳入 deleted_at 判定）")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS `customer_lead_source` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `name` varchar(64) NOT NULL COMMENT '来源名称',
+                    `color` varchar(16) DEFAULT NULL COMMENT '展示颜色',
+                    `enabled` tinyint NOT NULL DEFAULT 1 COMMENT '是否启用 1是 0否',
+                    `sort` int NOT NULL DEFAULT 0 COMMENT '排序，越小越靠前',
+                    `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_customer_lead_source` (`name`),
+                    KEY `idx_customer_lead_source_sort` (`enabled`, `sort`, `id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='客源来源字典配置'
+            """)
+            cursor.execute("""
+                INSERT IGNORE INTO customer_lead_source (name, sort, enabled) VALUES
+                ('抖音', 10, 1), ('微信群', 20, 1), ('本地群', 30, 1), ('身边朋友', 40, 1),
+                ('同行群', 50, 1), ('朋友圈', 60, 1), ('朋友介绍', 70, 1), ('QQ', 80, 1),
+                ('其他渠道', 90, 1), ('落地页', 100, 1), ('批量导入', 110, 1)
+            """)
+        except Exception as exc:
+            logger.warning(f"⚠️ customer_lead 软删除列/来源字典表迁移失败: {exc}")
 
     def _ensure_ai_advisor_indexes(self, cursor):
         """补齐 AI 军师旧表的幂等索引，避免重复请求重复扣额度。"""
@@ -800,13 +875,13 @@ class DatabaseManager:
         column_specs = {
             "active_phone": (
                 "ADD COLUMN `active_phone` varchar(32) GENERATED ALWAYS AS "
-                "(CASE WHEN `status` IN ('LOST','CLOSED') THEN NULL ELSE NULLIF(TRIM(`phone`), '') END) STORED "
-                "COMMENT '有效手机号（弃海/关闭为NULL，唯一）'"
+                "(CASE WHEN `status` IN ('LOST','CLOSED') OR `deleted_at` IS NOT NULL THEN NULL ELSE NULLIF(TRIM(`phone`), '') END) STORED "
+                "COMMENT '有效手机号（弃海/关闭/删除为NULL，唯一）'"
             ),
             "active_wechat": (
                 "ADD COLUMN `active_wechat` varchar(128) GENERATED ALWAYS AS "
-                "(CASE WHEN `status` IN ('LOST','CLOSED') THEN NULL ELSE NULLIF(TRIM(`wechat`), '') END) STORED "
-                "COMMENT '有效微信（弃海/关闭为NULL，唯一）'"
+                "(CASE WHEN `status` IN ('LOST','CLOSED') OR `deleted_at` IS NOT NULL THEN NULL ELSE NULLIF(TRIM(`wechat`), '') END) STORED "
+                "COMMENT '有效微信（弃海/关闭/删除为NULL，唯一）'"
             ),
         }
         unique_specs = {
@@ -1149,7 +1224,10 @@ class DatabaseManager:
                     `is_single_pledge` tinyint DEFAULT '0' COMMENT '是否签署单身承诺 0否 1是',
                     `data_complete_rate` tinyint DEFAULT '0' COMMENT '资料完整度 0-100',
                     `register_ip` varchar(64) DEFAULT NULL,
+                    `ip_region` varchar(64) DEFAULT NULL COMMENT 'IP 属地（A12，展示用，待解析回填）',
+                    `phone_region` varchar(64) DEFAULT NULL COMMENT '手机号归属地（A12，展示用，待解析回填）',
                     `last_login_at` datetime DEFAULT NULL,
+                    `login_num` int NOT NULL DEFAULT 0 COMMENT '累计登录次数（A12）',
                     `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
                     `updated_at` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     PRIMARY KEY (`id`),
@@ -1225,11 +1303,13 @@ class DatabaseManager:
                     `refresh_expire_at` datetime NOT NULL,
                     `revoked_at` datetime DEFAULT NULL,
                     `revoke_reason` varchar(64) DEFAULT NULL,
+                    `impersonated_by` bigint unsigned DEFAULT NULL COMMENT '模拟登录发起管理员 id（A12，NULL=正常登录会话）',
                     `status` tinyint NOT NULL DEFAULT '1' COMMENT '1有效 2撤销 3过期',
                     PRIMARY KEY (`id`),
                     UNIQUE KEY `uk_refresh_token_hash` (`refresh_token_hash`),
                     KEY `idx_session_user_status` (`user_id`,`status`),
                     KEY `idx_session_device` (`device_id`),
+                    KEY `idx_session_impersonated_by` (`impersonated_by`),
                     KEY `idx_session_refresh_expire` (`refresh_expire_at`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='用户登录会话'
             """,
