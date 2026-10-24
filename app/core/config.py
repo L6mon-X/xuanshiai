@@ -113,6 +113,10 @@ class Settings(BaseSettings):
     outbound_call_account: str | None = None
     outbound_call_secret: SecretStr | None = None
     outbound_call_timeout_seconds: float = Field(default=10, gt=0, le=60)
+    # 核验额度在线充值（A17）：厂商未定前保持 disabled，下单接口 503；
+    # mock 仅用于开发/联调（生成待付订单 + 模拟支付链接），生产禁止。
+    # 套餐目录只读展示不受该开关影响。
+    verification_recharge_provider: Literal["disabled", "mock", "real"] = "disabled"
 
     # AI avatar calls an OpenAI-compatible chat-completions service from the
     # backend only. API keys must never be exposed to the mini-program.
@@ -216,7 +220,10 @@ class Settings(BaseSettings):
     ai_deepseek_api_key: SecretStr | None = None
     ai_deepseek_base_url: str = "https://api.deepseek.com"
     ai_deepseek_model: str = "deepseek-v4-flash"
-    ai_deepseek_max_tokens: int = Field(default=2048, gt=0, le=8192)
+    # 2048 装不下用心度评审这类长 JSON 输出（summary 500 字 + 最多 4 条
+    # advice 各 300 字 ≈ 1700 汉字，中文按 1.5~2 token/字折算超 2500 token），
+    # 输出被截断会让 parse_json 收到不完整 JSON 而 503。默认给到 4096。
+    ai_deepseek_max_tokens: int = Field(default=4096, gt=0, le=8192)
 
     # Dots provider 配置（小红书 hi lab dots.llm，OpenAI 兼容 API）。真实
     # api_key 仅存于被忽略的 .env；.env.example 只放占位符。dots3-note-prev
@@ -460,6 +467,8 @@ class Settings(BaseSettings):
             raise ValueError("staging/production 环境必须关闭 AUTO_INIT_DB")
         if self.environment in {"staging", "production"} and self.live_provider == "mock":
             raise ValueError("staging/production 环境禁止使用直播 Mock Provider")
+        if self.environment in {"staging", "production"} and self.verification_recharge_provider == "mock":
+            raise ValueError("staging/production 环境禁止使用核验充值 Mock Provider")
         if self.live_enabled and self.live_provider == "tencent":
             sdk_secret = (
                 self.tencent_live_sdk_secret_key.get_secret_value().strip()

@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 LeadStatus = Literal["NEW", "CONTACTED", "INTENDED", "CONVERTED", "LOST", "CLOSED"]
 # 客源审核状态：active 有效 / pending 待核
 LeadAuditStatus = Literal["active", "pending"]
+# 客源性别（A13）：0未知 1男 2女，与 users.gender 同语义
+LeadGender = Literal[0, 1, 2]
 
 
 def _strip_contact(value: object) -> object:
@@ -25,6 +27,7 @@ class CustomerLeadCreate(BaseModel):
     wechat: str | None = Field(default=None, max_length=128)
     source: str = Field(min_length=1, max_length=64)
     intention_level: Literal[1, 2, 3] = 1
+    gender: LeadGender = Field(default=0, description="性别 0未知 1男 2女（A13）")
     remark: str | None = Field(default=None, max_length=2000)
     promoter_id: int | None = Field(default=None, ge=1, description="推广红娘用户ID")
     audit_status: LeadAuditStatus = "active"
@@ -56,6 +59,7 @@ class CustomerLeadUpdate(BaseModel):
     phone: str | None = Field(default=None, max_length=32)
     wechat: str | None = Field(default=None, max_length=128)
     intention_level: Literal[1, 2, 3] | None = None
+    gender: LeadGender | None = None
     status: LeadStatus | None = None
     remark: str | None = Field(default=None, max_length=2000)
     next_follow_at: datetime | None = None
@@ -71,7 +75,7 @@ class CustomerLeadUpdate(BaseModel):
 
     @model_validator(mode="after")
     def require_update(self) -> "CustomerLeadUpdate":
-        if not self.tags and all(value is None for value in (self.name, self.phone, self.wechat, self.intention_level, self.status, self.remark, self.next_follow_at, self.promoter_id, self.audit_status)):
+        if not self.tags and all(value is None for value in (self.name, self.phone, self.wechat, self.intention_level, self.gender, self.status, self.remark, self.next_follow_at, self.promoter_id, self.audit_status)):
             raise ValueError("至少提供一个需要修改的字段")
         return self
 
@@ -112,6 +116,7 @@ class CustomerLead(BaseModel):
     wechat: str | None
     source: str
     intention_level: Literal[1, 2, 3]
+    gender: LeadGender = 0
     status: LeadStatus
     audit_status: LeadAuditStatus = "active"
     matchmaker_id: int | None
@@ -151,6 +156,24 @@ class CustomerLeadRestoreRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=500)
 
 
+class CustomerLeadBatchDeleteRequest(BaseModel):
+    """批量软删除客源线索（A16）。lead_ids 1-200 个正整数，重复自动去重。"""
+
+    lead_ids: list[int] = Field(min_length=1, max_length=200)
+
+
+class CustomerLeadBatchDeleteFailure(BaseModel):
+    id: int
+    error: str
+
+
+class CustomerLeadBatchDeleteResult(BaseModel):
+    """部分成功语义：越权/不存在/已删除的归入 failed，不整体报错。"""
+
+    deleted: list[int] = Field(default_factory=list)
+    failed: list[CustomerLeadBatchDeleteFailure] = Field(default_factory=list)
+
+
 class CustomerLeadConvertRequest(BaseModel):
     gender: Literal[1, 2] | None = None
     remark: str | None = Field(default=None, max_length=500)
@@ -180,6 +203,7 @@ class CustomerLeadImportRow(BaseModel):
     wechat: str | None = Field(default=None, max_length=128)
     source: str = Field(min_length=1, max_length=64)
     intention_level: Literal[1, 2, 3] = 1
+    gender: LeadGender = Field(default=0, description="性别 0未知 1男 2女（A13）")
     remark: str | None = Field(default=None, max_length=2000)
 
 
@@ -215,3 +239,65 @@ class CustomerLeadOptions(BaseModel):
     matchmakers: list[CustomerLeadOption] = Field(default_factory=list)
     promoters: list[CustomerLeadOption] = Field(default_factory=list)
     tags: list[CustomerLeadOption] = Field(default_factory=list)
+
+
+class CustomerLeadFollowUpRecord(BaseModel):
+    """全局客源跟进记录行（A13），代替前端 N+1 聚合。"""
+
+    id: int
+    lead_id: int
+    lead_name: str
+    lead_source: str
+    lead_status: str
+    method: str
+    content: str
+    intention_level: int | None
+    next_follow_at: datetime | None
+    matchmaker_id: int | None
+    promoter_id: int | None
+    created_by: int
+    created_at: datetime
+
+
+class CustomerLeadFollowUpRecordPage(BaseModel):
+    items: list[CustomerLeadFollowUpRecord]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
+
+
+class CustomerLeadFollowBucket(BaseModel):
+    """跟进全览顶部时间卡片计数（A13）。"""
+
+    today: int = 0
+    yesterday: int = 0
+    last_3_days: int = 0
+    this_week: int = 0
+    last_week: int = 0
+    this_month: int = 0
+    last_month: int = 0
+
+
+class MatchmakerFollowStat(BaseModel):
+    """按红娘的客源跟进统计（A13，数据报表「跟进总条数/本月跟进条数」）。"""
+
+    matchmaker_id: int
+    matchmaker_name: str
+    total_count: int = 0
+    month_count: int = 0
+    unfollowed_count: int = 0
+
+
+class CustomerLeadPromoterStat(BaseModel):
+    """推广红娘获客统计（A13，含男/女拆分，需 gender 列已迁移）。"""
+
+    promoter_id: int
+    promoter_name: str
+    total: int = 0
+    male: int = 0
+    female: int = 0
+    valid_male: int = 0
+    valid_female: int = 0
+    pending: int = 0
+    invalid: int = 0

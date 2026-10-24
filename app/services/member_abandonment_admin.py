@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from fastapi import HTTPException
@@ -22,6 +23,9 @@ from app.schemas.member_abandonment_admin import (
     MemberAbandonmentItem,
     MemberAbandonmentPage,
     MemberAbandonRequest,
+    MemberBatchAbandonFailure,
+    MemberBatchAbandonRequest,
+    MemberBatchAbandonResult,
     MemberRestoreRequest,
 )
 
@@ -313,3 +317,80 @@ async def list_abandonments(
         total=total,
         has_more=page * page_size < total,
     )
+
+
+async def batch_abandon_members(
+    db: AsyncSession,
+    actor_id: int,
+    body: MemberBatchAbandonRequest,
+    *,
+    scope: str,
+    scope_params: dict[str, object],
+) -> MemberBatchAbandonResult:
+    """批量弃海（A18）：一次事务 + 一份汇总审计。
+
+    越权/不存在/已在弃海池的会员逐条归入 ``failed``，不整体报错；成功项写入
+    ``member_abandonment``（与单条 abandon 同口径）。
+    """
+    ids = list(dict.fromkeys(body.member_ids))
+    if not ids:
+        return MemberBatchAbandonResult()
+    placeholders = ",".join(f":id_{index}" for index in range(len(ids)))
+    params: dict[str, Any] = {f"id_{index}": value for index, value in enumerate(ids)}
+    params.update(scope_params)
+    # 先锁住作用域内的目标行，防止并发重复写入有效弃海记录（与 batch-status 同收口口径）。
+    locked = (
+        await db.execute(
+            text(f"SELECT users.id FROM users WHERE users.id IN ({placeholders}) AND ({scope}) FOR UPDATE"),
+            params,
+        )
+    ).scalars().all()
+    in_scope = {int(user_id) for user_id in locked}
+    active_rows = (
+        await db.execute(
+            text(
+                f"SELECT user_id FROM member_abandonment WHERE user_id IN ({placeholders})"
+                " AND restored_at IS NULL"
+            ),
+            {f"id_{index}": value for index, value in enumerate(ids)},
+        )
+    ).scalars().all()
+    already = {int(user_id) for user_id in active_rows}
+    succeeded: list[int] = []
+    failed: list[MemberBatchAbandonFailure] = []
+    for member_id in ids:
+        if member_id not in in_scope:
+            failed.append(MemberBatchAbandonFailure(id=member_id, error="会员不存在"))
+            continue
+        if member_id in already:
+            failed.append(MemberBatchAbandonFailure(id=member_id, error="该会员已在弃海池"))
+            continue
+        await db.execute(
+            text(
+                "INSERT INTO member_abandonment (user_id, reason, abandon_type, abandoned_by)"
+                " VALUES (:user_id, :reason, :abandon_type, :abandoned_by)"
+            ),
+            {
+                "user_id": member_id,
+                "reason": body.reason,
+                "abandon_type": body.abandon_type,
+                "abandoned_by": actor_id,
+            },
+        )
+        succeeded.append(member_id)
+    # 一份汇总审计：resource_id 置空，成员清单写入 after_json，便于事后追溯整批操作。
+    if succeeded:
+        await db.execute(
+            text(
+                "INSERT INTO business_audit_log"
+                " (actor_user_id, action, resource_type, resource_id, after_json, reason)"
+                " VALUES (:actor, 'member.batch_abandon', 'users', NULL, CAST(:after AS JSON), :reason)"
+            ),
+            {
+                "actor": actor_id,
+                "after": json.dumps({"member_ids": succeeded, "abandon_type": body.abandon_type}),
+                "reason": f"批量弃海{len(succeeded)}人: {body.reason}"[:255],
+            },
+        )
+    await db.commit()
+    return MemberBatchAbandonResult(succeeded=succeeded, failed=failed)

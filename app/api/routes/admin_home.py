@@ -158,7 +158,9 @@ async def legacy_top_statistics(admin: CurrentMatchmakerAdmin = Depends(get_curr
 async def legacy_member_statistics(admin: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)):
     admin.require("dashboard.read")
     m = (await admin_home.dashboard(db, admin, date.today(), date.today())).metrics
-    return _legacy({"appointmentAuditingNum": 0, "commitmentAuditingNum": 0, "educationAuditingNum": 0, "femaleNums": 0, "houseAuditingNum": 0, "lineAuditingNum": 0, "loveCustomerNums": m.lead_count, "loveUserAuditingNum": 0, "maleNums": 0, "matchmakerNums": m.matchmaker_count, "noSingleNums": 0, "offlineIncome": float(m.offline_income), "offlineVipNums": 0, "otherAuditingNum": 0, "popMatchmakerNums": 0, "popularizeAuditingNum": 0, "reportAuditingNum": 0, "total": m.member_count, "vipNums": m.vip_count})
+    # B7：maleNums/femaleNums 此前恒为 0，与 /admin/dashboard 的 member_gender 不一致；
+    # 现取 dashboard 的男女会员计数（同口径 scope 收口），另补线下VIP/推广红娘两项已有计数。
+    return _legacy({"appointmentAuditingNum": 0, "commitmentAuditingNum": 0, "educationAuditingNum": 0, "femaleNums": m.female_member_count, "houseAuditingNum": 0, "lineAuditingNum": 0, "loveCustomerNums": m.lead_count, "loveUserAuditingNum": 0, "maleNums": m.male_member_count, "matchmakerNums": m.matchmaker_count, "noSingleNums": 0, "offlineIncome": float(m.offline_income), "offlineVipNums": m.offline_vip_count, "otherAuditingNum": 0, "popMatchmakerNums": m.promotion_matchmaker_count, "popularizeAuditingNum": 0, "reportAuditingNum": 0, "total": m.member_count, "vipNums": m.vip_count})
 
 
 @declare_permission("finance.read")

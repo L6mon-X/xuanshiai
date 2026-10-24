@@ -150,7 +150,7 @@ def test_all_scoped_routes_apply_exists_predicate() -> None:
         (promotion_order_admin, ("order_list", "order_detail", "order_update", "order_delete", "order_stats")),
         (partner_admin, ("list_partners", "partner_detail", "partner_update", "partner_delete", "list_relations", "remove_relation")),
         (merchant_admin, ("merchant_list", "merchant_detail", "merchant_update", "merchant_delete", "order_list", "order_detail")),
-        (member_vip_admin, ("update_member_vip", "vip_members", "login_logs")),
+        (member_vip_admin, ("update_member_vip", "vip_members", "login_logs", "platform_login_logs", "platform_login_logs_clear", "platform_login_log_delete", "impersonate_member")),
         (offline_vip_admin, ("list_offline_vips", "get_offline_vip", "update_offline_vip", "offline_vip_meet_logs")),
         (member_follow_up_admin, ("all_follow_ups", "follow_up_summary", "list_follow_ups", "create_follow_up", "behavior", "all_behavior")),
     ]
@@ -182,9 +182,12 @@ async def test_lead_detail_out_of_scope_is_not_found() -> None:
             lead_id=99, current=_admin("SELF", permissions={"customer_lead.manage"}), db=db
         )
     assert exc.value.status_code == 404
-    sql, params = db.statements[0]
+    # lead_detail 会先查 information_schema 探测可选列（_lead_columns），
+    # 因此作用域谓词不在 statements[0]。按内容定位，不依赖执行顺序。
+    sql, params = next(
+        (s, p) for s, p in db.statements if "matchmaker_id = :scope_matchmaker_user_id" in s
+    )
     assert "scope_assignment" not in sql  # 客源线索用直列谓词，不是 EXISTS
-    assert "matchmaker_id = :scope_matchmaker_user_id" in sql
     assert params["scope_matchmaker_user_id"] == SELF_MATCHMAKER_USER_ID
 
 
@@ -211,7 +214,8 @@ async def test_lead_detail_is_fail_closed_for_unbound_account() -> None:
             db=db,
         )
     assert exc.value.status_code == 404
-    assert "1 = 0" in db.statements[0][0]
+    # 同上：探列查询会先执行，fail-closed 的 1 = 0 出现在其后的主查询里。
+    assert any("1 = 0" in sql for sql, _ in db.statements), [sql for sql, _ in db.statements]
 
 
 @pytest.mark.asyncio

@@ -104,9 +104,10 @@ BUSINESS_TABLES = {
             `wechat` varchar(128) DEFAULT NULL,
             `source` varchar(64) NOT NULL,
             `intention_level` tinyint NOT NULL DEFAULT '1' COMMENT '1低 2中 3高',
+            `gender` tinyint NOT NULL DEFAULT 0 COMMENT '性别 0未知 1男 2女（A13）',
             `status` varchar(32) NOT NULL DEFAULT 'NEW' COMMENT 'NEW/CONTACTED/INTENDED/CONVERTED/LOST/CLOSED',
-            `active_phone` varchar(32) GENERATED ALWAYS AS (CASE WHEN `status` IN ('LOST','CLOSED') THEN NULL ELSE NULLIF(TRIM(`phone`), '') END) STORED COMMENT '有效手机号（弃海/关闭为NULL，唯一）',
-            `active_wechat` varchar(128) GENERATED ALWAYS AS (CASE WHEN `status` IN ('LOST','CLOSED') THEN NULL ELSE NULLIF(TRIM(`wechat`), '') END) STORED COMMENT '有效微信（弃海/关闭为NULL，唯一）',
+            `active_phone` varchar(32) GENERATED ALWAYS AS (CASE WHEN `status` IN ('LOST','CLOSED') OR `deleted_at` IS NOT NULL THEN NULL ELSE NULLIF(TRIM(`phone`), '') END) STORED COMMENT '有效手机号（弃海/关闭/删除为NULL，唯一）',
+            `active_wechat` varchar(128) GENERATED ALWAYS AS (CASE WHEN `status` IN ('LOST','CLOSED') OR `deleted_at` IS NOT NULL THEN NULL ELSE NULLIF(TRIM(`wechat`), '') END) STORED COMMENT '有效微信（弃海/关闭/删除为NULL，唯一）',
             `matchmaker_id` bigint unsigned DEFAULT NULL,
             `organization_id` bigint unsigned DEFAULT NULL,
             `promoter_id` bigint unsigned DEFAULT NULL COMMENT '推广红娘用户ID',
@@ -115,6 +116,8 @@ BUSINESS_TABLES = {
             `converted_user_id` bigint unsigned DEFAULT NULL,
             `remark` varchar(2000) DEFAULT NULL,
             `created_by` bigint unsigned NOT NULL,
+            `deleted_at` datetime DEFAULT NULL COMMENT '软删除时间；空为有效',
+            `deleted_by` bigint unsigned DEFAULT NULL COMMENT '删除操作人 matchmaker_admin_account.id',
             `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
             `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
@@ -123,7 +126,8 @@ BUSINESS_TABLES = {
             KEY `idx_customer_lead_promoter` (`promoter_id`),
             KEY `idx_customer_lead_status` (`status`, `created_at`),
             KEY `idx_customer_lead_matchmaker` (`matchmaker_id`, `status`),
-            KEY `idx_customer_lead_phone` (`phone`)
+            KEY `idx_customer_lead_phone` (`phone`),
+            KEY `idx_customer_lead_deleted` (`deleted_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='后台客源线索'
     """,
     "customer_lead_follow_up": """
@@ -182,6 +186,43 @@ BUSINESS_TABLES = {
             `lead_id` bigint unsigned NOT NULL, `tag_id` bigint unsigned NOT NULL,
             PRIMARY KEY (`lead_id`, `tag_id`), KEY `idx_customer_lead_tag` (`tag_id`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='客源标签关联'
+    """,
+    "customer_lead_source": """
+        CREATE TABLE IF NOT EXISTS `customer_lead_source` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `name` varchar(64) NOT NULL COMMENT '来源名称（与 customer_lead.source 自由文本按名称对齐）',
+            `color` varchar(16) DEFAULT NULL COMMENT '展示颜色',
+            `enabled` tinyint NOT NULL DEFAULT 1 COMMENT '是否启用 1是 0否',
+            `sort` int NOT NULL DEFAULT 0 COMMENT '排序，越小越靠前',
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_customer_lead_source` (`name`),
+            KEY `idx_customer_lead_source_sort` (`enabled`, `sort`, `id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='客源来源字典配置'
+    """,
+    "member_auth_recharge_order": """
+        CREATE TABLE IF NOT EXISTS `member_auth_recharge_order` (
+            `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+            `order_no` varchar(64) NOT NULL COMMENT '对外充值订单号',
+            `kind` varchar(16) NOT NULL COMMENT 'realname 实名/marriage 婚姻',
+            `package_id` varchar(64) NOT NULL COMMENT '套餐档 ID',
+            `package_name` varchar(128) NOT NULL DEFAULT '' COMMENT '套餐名称快照',
+            `quantity` int unsigned NOT NULL DEFAULT 1 COMMENT '核验次数增量（份数×每份次数）',
+            `unit_price` decimal(12,2) NOT NULL DEFAULT 0.00 COMMENT '单价（元）',
+            `total_amount` decimal(12,2) NOT NULL DEFAULT 0.00 COMMENT '总金额（元）',
+            `currency` varchar(8) NOT NULL DEFAULT 'CNY',
+            `status` varchar(16) NOT NULL DEFAULT 'pending' COMMENT 'pending/paid/failed/cancelled',
+            `provider` varchar(32) NOT NULL DEFAULT 'mock' COMMENT '下单时的 provider',
+            `pay_url` varchar(500) DEFAULT NULL COMMENT '支付跳转链接/二维码（mock 为占位）',
+            `created_by` bigint unsigned DEFAULT NULL COMMENT '发起管理员 matchmaker_admin_account.id',
+            `paid_at` datetime DEFAULT NULL COMMENT '支付完成时间',
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_member_auth_recharge_order_no` (`order_no`),
+            KEY `idx_member_auth_recharge_status` (`status`, `created_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='会员核验额度充值订单（A17 骨架）'
     """,
     "member_follow_up": """
         CREATE TABLE IF NOT EXISTS `member_follow_up` (

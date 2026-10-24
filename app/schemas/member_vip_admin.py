@@ -41,6 +41,9 @@ class AdminLoginLogItem(BaseModel):
     platform: str | None
     failure_reason: str | None
     created_at: datetime
+    # A12 平台用户登录日志全局列表补充：登录方式与手机号（旧逐会员接口不投影时为默认值）。
+    login_type: int | None = None
+    phone: str | None = None
 
 
 class AdminLoginLogPage(BaseModel):
@@ -49,6 +52,12 @@ class AdminLoginLogPage(BaseModel):
     page_size: int
     total: int
     has_more: bool
+
+
+class LoginLogDeleteResult(BaseModel):
+    """登录日志删除/清空结果（A12）。``deleted`` 为本次实际删除行数。"""
+
+    deleted: int = Field(ge=0)
 
 
 class AdminVipUpdate(BaseModel):
@@ -76,3 +85,19 @@ class AdminVipUpdateResponse(BaseModel):
     end_at: datetime | None
     order_no: str | None
     reason: str | None
+
+
+class ImpersonateSessionResponse(BaseModel):
+    """A12-模拟登录：后台为目标用户签发的受限短时只读会话。
+
+    read_only 恒为 True；access_token 只能执行安全方法（GET/HEAD/OPTIONS），
+    写方法会被 app/main.py 只读中间件拒绝；expires_in 为秒，到期自动失效。
+    """
+
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    impersonated_user_id: int
+    session_id: int
+    read_only: bool = True
+    impersonated_by: int

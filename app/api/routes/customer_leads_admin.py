@@ -3,11 +3,18 @@
 from fastapi import APIRouter, Depends, File, Form, Path, Query, Response, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies import CurrentMatchmakerAdmin, declare_permission, get_current_matchmaker_admin
+from app.api.dependencies import CurrentMatchmakerAdmin, declare_permission, get_current_matchmaker_admin, require_sensitive_operation
 from app.core.sensitive_fields import redaction_level_from_permissions
 from app.db.session import get_db
-from app.schemas.customer_lead_admin import CustomerLead, CustomerLeadAbandonment, CustomerLeadAbandonRequest, CustomerLeadBatchImportRequest, CustomerLeadAssignment, CustomerLeadConvertRequest, CustomerLeadConvertResult, CustomerLeadCreate, CustomerLeadBatchImportResult, CustomerLeadFollowUp, CustomerLeadFollowUpCreate, CustomerLeadImportSummary, CustomerLeadOptions, CustomerLeadPage, CustomerLeadRestoreRequest, CustomerLeadStatistics, CustomerLeadUpdate
-from app.services.customer_lead_admin import abandon_lead, add_follow_up, assign_lead, batch_import_leads, build_import_template, convert_lead, create_lead, get_lead, import_leads_file, lead_options, lead_statistics, list_abandonments, list_follow_ups, list_leads, restore_lead, update_lead
+from app.schemas.customer_lead_admin import CustomerLead, CustomerLeadAbandonment, CustomerLeadAbandonRequest, CustomerLeadBatchDeleteFailure, CustomerLeadBatchDeleteRequest, CustomerLeadBatchDeleteResult, CustomerLeadBatchImportRequest, CustomerLeadAssignment, CustomerLeadConvertRequest, CustomerLeadConvertResult, CustomerLeadCreate, CustomerLeadBatchImportResult, CustomerLeadFollowUp, CustomerLeadFollowUpCreate, CustomerLeadFollowUpRecordPage, CustomerLeadFollowBucket, MatchmakerFollowStat, CustomerLeadPromoterStat, CustomerLeadImportSummary, CustomerLeadOptions, CustomerLeadPage, CustomerLeadRestoreRequest, CustomerLeadStatistics, CustomerLeadUpdate
+from app.schemas.customer_lead_dict_admin import LeadDictCreate, LeadDictItem, LeadDictOrder, LeadDictUpdate
+from app.services.customer_lead_admin import abandon_lead, add_follow_up, assign_lead, batch_delete_leads, batch_import_leads, build_import_template, convert_lead, create_lead, delete_lead, get_lead, import_leads_file, lead_options, lead_statistics, lead_follow_statistics, list_abandonments, list_follow_ups, list_follow_up_records, list_leads, matchmaker_follow_stats, promoter_acquisition_stats, restore_lead, update_lead
+from app.services import customer_lead_dict_admin as dict_service
+from app.services.sensitive_operations import (
+    abort_sensitive_operation,
+    begin_sensitive_operation,
+    finish_sensitive_operation,
+)
 
 router = APIRouter(prefix="/admin/customer-leads")
 
@@ -41,6 +48,7 @@ async def lead_list(
     matchmaker_id: int | None = Query(None, ge=1),
     search: str | None = Query(None, max_length=64),
     intention_level: int | None = Query(None, ge=1, le=3, description="意向程度 1低 2中 3高"),
+    gender: int | None = Query(None, ge=0, le=2, description="性别 0未知 1男 2女（A13）"),
     start_date: str | None = Query(None, max_length=10, description="录入时间起（含，兼容前端空字符串）"),
     end_date: str | None = Query(None, max_length=10, description="录入时间止（含，兼容前端空字符串）"),
     assign_start: str | None = Query(None, max_length=10, description="分派时间起（含，兼容前端空字符串）"),
@@ -75,6 +83,7 @@ async def lead_list(
         scope=scope,
         scope_params=scope_params,
         intention_level=intention_level,
+        gender=gender,
         start_date=start_date,
         end_date=end_date,
         assign_start=assign_start,
@@ -126,6 +135,154 @@ async def lead_dict(current: CurrentMatchmakerAdmin = Depends(get_current_matchm
     current.require("customer_lead.manage")
     scope, scope_params = _lead_scope(current)
     return await lead_options(db, scope=scope, scope_params=scope_params)
+
+
+# ─────────────────── A13 跟进全览 / 数据报表 ───────────────────
+# 静态路径 /follow-records 、/follow-statistics 、/matchmaker-follow-stats 、
+# /promoter-stats 均先于 /{lead_id} 注册。
+
+
+@declare_permission("customer_lead.manage")
+@router.get("/follow-records", response_model=CustomerLeadFollowUpRecordPage, summary="全局客源跟进记录列表")
+async def follow_records(
+    page: int = Query(1, ge=1, le=1000),
+    page_size: int = Query(20, ge=1, le=100),
+    matchmaker_id: int | None = Query(None, ge=1, description="按服务红娘过滤"),
+    promoter_id: int | None = Query(None, ge=1, description="按推广红娘过滤"),
+    intention_level: int | None = Query(None, ge=1, le=3),
+    start_date: str | None = Query(None, max_length=10, description="跟进时间起（含）"),
+    end_date: str | None = Query(None, max_length=10, description="跟进时间止（含）"),
+    search: str | None = Query(None, max_length=64, description="跟进内容/客源称呼模糊匹配"),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> CustomerLeadFollowUpRecordPage:
+    current.require("customer_lead.manage")
+    scope, scope_params = _lead_scope(current)
+    return await list_follow_up_records(
+        db, page, page_size,
+        matchmaker_id=matchmaker_id, promoter_id=promoter_id, intention_level=intention_level,
+        start_date=start_date, end_date=end_date, search=search,
+        scope=scope, scope_params=scope_params,
+    )
+
+
+@declare_permission("customer_lead.manage")
+@router.get("/follow-statistics", response_model=CustomerLeadFollowBucket, summary="客源跟进时间卡片计数")
+async def follow_statistics(
+    start_date: str | None = Query(None, max_length=10),
+    end_date: str | None = Query(None, max_length=10),
+    matchmaker_id: int | None = Query(None, ge=1),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> CustomerLeadFollowBucket:
+    current.require("customer_lead.manage")
+    scope, scope_params = _lead_scope(current)
+    return await lead_follow_statistics(
+        db, start_date=start_date, end_date=end_date, matchmaker_id=matchmaker_id,
+        scope=scope, scope_params=scope_params,
+    )
+
+
+@declare_permission("customer_lead.manage")
+@router.get("/matchmaker-follow-stats", response_model=list[MatchmakerFollowStat], summary="按红娘客源跟进统计")
+async def matchmaker_follow_statistics(
+    matchmaker_id: int | None = Query(None, ge=1),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> list[MatchmakerFollowStat]:
+    current.require("customer_lead.manage")
+    scope, scope_params = _lead_scope(current)
+    return await matchmaker_follow_stats(db, matchmaker_id=matchmaker_id, scope=scope, scope_params=scope_params)
+
+
+@declare_permission("customer_lead.manage")
+@router.get("/promoter-stats", response_model=list[CustomerLeadPromoterStat], summary="推广红娘获客统计")
+async def promoter_statistics(
+    promoter_id: int | None = Query(None, ge=1),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> list[CustomerLeadPromoterStat]:
+    current.require("customer_lead.manage")
+    scope, scope_params = _lead_scope(current)
+    return await promoter_acquisition_stats(db, promoter_id=promoter_id, scope=scope, scope_params=scope_params)
+
+
+# ─────────────────── A14 来源 / 标签字典 CRUD ───────────────────
+# 前端契约路径：/admin/customer-leads/sources 、/admin/customer-leads/tags（复数）。
+# 与同域 /{lead_id} 动态路由共用 router，故必须排在前面（静态段先于 {lead_id} 注册）。
+# 字典为全局配置，不需数据范围收敛；写入需 customer_lead.manage。
+
+
+@declare_permission("customer_lead.manage")
+@router.get("/sources", response_model=list[LeadDictItem], summary="来源字典列表")
+async def source_dict_list(current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> list[LeadDictItem]:
+    current.require("customer_lead.manage")
+    return await dict_service.list_dict(db, "sources")
+
+
+@declare_permission("customer_lead.manage")
+@router.post("/sources/reorder", status_code=204, summary="来源重排")
+async def source_dict_reorder(body: LeadDictOrder, current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> None:
+    current.require("customer_lead.manage")
+    await dict_service.reorder_dict(db, "sources", body.ids)
+
+
+@declare_permission("customer_lead.manage")
+@router.post("/sources", response_model=LeadDictItem, status_code=201, summary="新增来源")
+async def source_dict_create(body: LeadDictCreate, current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> LeadDictItem:
+    current.require("customer_lead.manage")
+    return await dict_service.create_dict(db, "sources", body)
+
+
+@declare_permission("customer_lead.manage")
+@router.patch("/sources/{item_id}", response_model=LeadDictItem, summary="修改来源")
+async def source_dict_update(item_id: int = Path(..., ge=1), body: LeadDictUpdate = ..., current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> LeadDictItem:
+    current.require("customer_lead.manage")
+    return await dict_service.update_dict(db, "sources", item_id, body)
+
+
+@declare_permission("customer_lead.manage")
+@router.delete("/sources/{item_id}", status_code=204, summary="删除来源")
+async def source_dict_delete(item_id: int = Path(..., ge=1), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> Response:
+    current.require("customer_lead.manage")
+    await dict_service.delete_dict(db, "sources", item_id)
+    return Response(status_code=204)
+
+
+@declare_permission("customer_lead.manage")
+@router.get("/tags", response_model=list[LeadDictItem], summary="标签字典列表")
+async def tag_dict_list(current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> list[LeadDictItem]:
+    current.require("customer_lead.manage")
+    return await dict_service.list_dict(db, "tags")
+
+
+@declare_permission("customer_lead.manage")
+@router.post("/tags/reorder", status_code=204, summary="标签重排")
+async def tag_dict_reorder(body: LeadDictOrder, current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> None:
+    current.require("customer_lead.manage")
+    await dict_service.reorder_dict(db, "tags", body.ids)
+
+
+@declare_permission("customer_lead.manage")
+@router.post("/tags", response_model=LeadDictItem, status_code=201, summary="新增标签")
+async def tag_dict_create(body: LeadDictCreate, current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> LeadDictItem:
+    current.require("customer_lead.manage")
+    return await dict_service.create_dict(db, "tags", body)
+
+
+@declare_permission("customer_lead.manage")
+@router.patch("/tags/{item_id}", response_model=LeadDictItem, summary="修改标签")
+async def tag_dict_update(item_id: int = Path(..., ge=1), body: LeadDictUpdate = ..., current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> LeadDictItem:
+    current.require("customer_lead.manage")
+    return await dict_service.update_dict(db, "tags", item_id, body)
+
+
+@declare_permission("customer_lead.manage")
+@router.delete("/tags/{item_id}", status_code=204, summary="删除标签")
+async def tag_dict_delete(item_id: int = Path(..., ge=1), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> Response:
+    current.require("customer_lead.manage")
+    await dict_service.delete_dict(db, "tags", item_id)
+    return Response(status_code=204)
 
 
 @declare_permission("customer_lead.manage")
@@ -280,3 +437,66 @@ async def lead_restore(lead_id: int = Path(..., ge=1), body: CustomerLeadRestore
     current.require("customer_lead.manage")
     scope, scope_params = _lead_scope(current)
     return await restore_lead(db, current.account.id, lead_id, body.reason, redaction_level_from_permissions(current.permissions), scope=scope, scope_params=scope_params)
+
+
+@declare_permission("customer_lead.manage")
+@router.post("/batch-delete", response_model=CustomerLeadBatchDeleteResult, summary="批量删除客源（幂等 + 二次确认）")
+async def lead_batch_delete(
+    body: CustomerLeadBatchDeleteRequest,
+    idempotency_key: str = Depends(require_sensitive_operation),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> CustomerLeadBatchDeleteResult:
+    """A16：软删除多条客源，需 confirm=true + Idempotency-Key；单事务 + 一份汇总审计。
+
+    越权/不存在/已删除的线索归入 failed，不整体报错；同键重放不重复删除。
+    静态路径 /batch-delete 必须先于 /{lead_id} 系列注册。
+    """
+    current.require("customer_lead.manage")
+    scope, scope_params = _lead_scope(current)
+    reservation, replayed = await begin_sensitive_operation(
+        db,
+        actor_id=current.account.id,
+        operation="customer_lead.batch_delete",
+        idempotency_key=idempotency_key,
+        payload={"body": body.model_dump(mode="json")},
+    )
+    if replayed is not None:
+        return CustomerLeadBatchDeleteResult(**replayed)
+    try:
+        deleted, failed = await batch_delete_leads(db, current.account.id, body.lead_ids, scope=scope, scope_params=scope_params)
+    except Exception:
+        await abort_sensitive_operation(db, reservation)
+        raise
+    result = CustomerLeadBatchDeleteResult(deleted=deleted, failed=[CustomerLeadBatchDeleteFailure(**item) for item in failed])
+    await finish_sensitive_operation(db, reservation, result.model_dump(mode="json"))
+    return result
+
+
+@declare_permission("customer_lead.manage")
+@router.delete("/{lead_id}", status_code=204, summary="删除客源线索（软删除）")
+async def lead_delete(
+    lead_id: int = Path(..., ge=1),
+    idempotency_key: str = Depends(require_sensitive_operation),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """A16：软删除单条客源，需 confirm=true + Idempotency-Key。越权/不存在/已删除返回 404。"""
+    current.require("customer_lead.manage")
+    scope, scope_params = _lead_scope(current)
+    reservation, replayed = await begin_sensitive_operation(
+        db,
+        actor_id=current.account.id,
+        operation="customer_lead.delete",
+        idempotency_key=idempotency_key,
+        payload={"lead_id": lead_id},
+    )
+    if replayed is not None:
+        return Response(status_code=204)
+    try:
+        await delete_lead(db, current.account.id, lead_id, scope=scope, scope_params=scope_params)
+    except Exception:
+        await abort_sensitive_operation(db, reservation)
+        raise
+    await finish_sensitive_operation(db, reservation, {"deleted": True, "id": lead_id})
+    return Response(status_code=204)

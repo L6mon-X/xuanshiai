@@ -71,6 +71,10 @@ ALLOWED_DOMAINS: frozenset[str] = frozenset(
         "sms_broadcast",
         "sms_send_record",
         "ad_slot",
+        # A11-CMS：系统更新公告 / 使用帮助文档，复用通用内容表（无新表）。
+        # 标题=title，正文/分类等放 extra_json（body / category）。
+        "update_report",
+        "help_doc",
     }
 )
 
@@ -139,6 +143,8 @@ EXTRA_FILTER_KEYS: frozenset[str] = frozenset(
         "group_id",
         "pay",
         "nick",
+        # A11-CMS：更新公告按分类筛选（category 存于 extra_json）。
+        "category",
     }
 )
 
@@ -297,6 +303,20 @@ async def update_item(db: AsyncSession, domain: str, item_id: int, body: Content
         await db.execute(text("SELECT * FROM admin_content_item WHERE id = :id"), {"id": item_id})
     ).mappings().first()
     return _row_to_item(fresh)
+
+
+async def get_item(db: AsyncSession, domain: str, item_id: int) -> ContentItem:
+    """A11-CMS：按域 + ID 取单条内容详情（正文在 extra.body）。不存在返回 404。"""
+    _ensure_domain(domain)
+    row = (
+        await db.execute(
+            text("SELECT * FROM admin_content_item WHERE id = :id AND domain = :domain"),
+            {"id": item_id, "domain": domain},
+        )
+    ).mappings().first()
+    if row is None:
+        raise HTTPException(404, detail="内容项不存在")
+    return _row_to_item(row)
 
 
 async def delete_item(db: AsyncSession, domain: str, item_id: int) -> None:

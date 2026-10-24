@@ -332,6 +332,49 @@ class CreditGrantResult(BaseModel):
     target_user_ids: list[int] = Field(default_factory=list, description="实际命中的 user_id 列表")
 
 
+# ============================================
+# A12-钱包：后台余额调整（发放/扣减）+ 按用户余额/流水视图
+# 不新建表，复用 account_ledger（account_type='user'）；不接真实支付。
+# ============================================
+
+
+class BalanceAdjustmentRequest(BaseModel):
+    """后台「用户余额-修改」入参：按 user_ids 批量发放(CREDIT)或扣减(DEBIT)。"""
+
+    user_ids: list[int] = Field(min_length=1, max_length=5000, description="目标用户 ID 列表，单次最多 5000")
+    direction: Literal["CREDIT", "DEBIT"] = Field(description="CREDIT 发放/充值，DEBIT 扣减/调整")
+    amount: Decimal = Field(gt=0, le=1_000_000, decimal_places=2, description="每人调整金额（元），正数，两位小数")
+    reason: str = Field(min_length=1, max_length=20, description="调整理由，不超过 20 字")
+
+    @model_validator(mode="after")
+    def validate_user_ids(self) -> "BalanceAdjustmentRequest":
+        cleaned = [int(uid) for uid in self.user_ids if int(uid) > 0]
+        if not cleaned:
+            raise ValueError("user_ids 必须为正整数")
+        self.user_ids = list(dict.fromkeys(cleaned))
+        return self
+
+
+class BalanceAdjustmentResult(BaseModel):
+    """余额调整结果汇总。"""
+
+    direction: str
+    adjusted_count: int = Field(description="实际写入账本的账户数")
+    total_amount: Decimal = Field(description="本次调整总金额 = adjusted_count * amount")
+    sample_ledger_ids: list[int] = Field(default_factory=list, description="前 10 条 ledger.id 样本")
+    target_user_ids: list[int] = Field(default_factory=list, description="实际命中的 user_id 列表")
+
+
+class UserWalletResponse(BaseModel):
+    """按用户聚合的钱包视图：可用/待用余额 + 最新流水。"""
+
+    account_type: str
+    account_id: int
+    pending_amount: Decimal
+    available_amount: Decimal
+    ledger: LedgerEntryPage
+
+
 # ------------------------- 积分明细列表 -------------------------
 # 积分明细页（/system-credit-history）此前只有「发放积分」写接口，没有查询接口。
 # 数据取自 account_ledger 中 account_type='user' 的积分流水（direction=CREDIT 为入账、
