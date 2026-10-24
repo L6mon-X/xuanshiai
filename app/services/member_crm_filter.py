@@ -56,6 +56,13 @@ MEMBER_BALANCE_EXPR = (
     " AND al.account_id = u.id AND al.state = 'AVAILABLE'), 0)"
 )
 
+# 积分口径（A12）：取 user_points 中该用户最新一条 balance（与会员列表 `points` 展示列同源）。
+# user_points 表已存在、无需新列，排序与展示复用同一表达式。
+MEMBER_POINTS_EXPR = (
+    "COALESCE((SELECT up.balance FROM user_points up"
+    " WHERE up.user_id = u.id ORDER BY up.id DESC LIMIT 1), 0)"
+)
+
 # 排序白名单：值全部由服务端写死，不拼接用户输入。
 SORT_SQL: dict[str, str] = {
     "created_at": "u.created_at DESC, u.id DESC",
@@ -66,6 +73,9 @@ SORT_SQL: dict[str, str] = {
     "assigned_at": "COALESCE(a.assigned_at, '1970-01-01') DESC, u.id DESC",
     "fetched_at": "COALESCE(u.fetched_at, '1970-01-01') DESC, u.id DESC",
     "balance": f"{MEMBER_BALANCE_EXPR} DESC, u.id DESC",
+    # 积分排序：前端列表用 `integral`、展示字段名是 `points`，两个 token 同一口径都受理。
+    "points": f"{MEMBER_POINTS_EXPR} DESC, u.id DESC",
+    "integral": f"{MEMBER_POINTS_EXPR} DESC, u.id DESC",
     "id": "u.id DESC",
 }
 

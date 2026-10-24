@@ -23,6 +23,8 @@ from app.schemas.finance import (
     CommissionRuleResponse,
     CreditGrantRequest,
     CreditGrantResult,
+    CreditDeductRequest,
+    CreditDeductResult,
     CreditRecordPage,
     FinanceOrderCreate,
     FinanceReportRow,
@@ -44,6 +46,7 @@ from app.schemas.finance import (
 )
 from app.services.finance import (
     admin_grant_credits,
+    admin_deduct_credits,
     admin_adjust_balance,
     admin_get_user_wallet,
     admin_list_credit_records,
@@ -358,6 +361,37 @@ async def grant_credits(body: CreditGrantRequest = Body(...), admin: CurrentMatc
     """按 target_type 解析账户集 → 写 account_ledger(CREDIT, AVAILABLE, source_type='admin_grant') → 写 business_audit_log。"""
     admin.require("finance.write")
     return await admin_grant_credits(db, _finance_actor(admin), body)
+
+
+@admin_router.post("/credit-deductions", response_model=CreditDeductResult, status_code=201, summary="后台手动扣减积分（积分明细-扣减积分，幂等 + 二次确认）")
+async def deduct_credits(
+    body: CreditDeductRequest = Body(...),
+    idempotency_key: str = Depends(require_sensitive_operation),
+    admin: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> CreditDeductResult:
+    """A12-积分：与发放积分对称的扣减（写 account_ledger DEBIT）。
+
+    敏感写：Header Idempotency-Key + Query confirm=true（缺 confirm → 428，缺/非法幂等键 → 422）。
+    扣减前加行锁并校验可用积分，任一不足整批 409，不产生部分扣减。
+    """
+    admin.require("finance.write")
+    reservation, replayed = await begin_sensitive_operation(
+        db,
+        actor_id=admin.account.id,
+        operation="finance.credit_deduct",
+        idempotency_key=idempotency_key,
+        payload={"body": body.model_dump(mode="json")},
+    )
+    if replayed is not None:
+        return CreditDeductResult(**replayed)
+    try:
+        result = await admin_deduct_credits(db, _finance_actor(admin), body)
+    except Exception:
+        await abort_sensitive_operation(db, reservation)
+        raise
+    await finish_sensitive_operation(db, reservation, result.model_dump(mode="json"))
+    return result
 
 
 @admin_router.post("/balance-adjustments", response_model=BalanceAdjustmentResult, status_code=201, summary="后台用户余额调整（发放/扣减，幂等 + 二次确认）")

@@ -8,6 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import CurrentMatchmakerAdmin, get_current_matchmaker_admin, require_sensitive_operation
+from app.core.config import settings
 from app.core.sensitive_fields import mask_contact, redaction_level_from_permissions
 from app.db.session import get_db
 from app.services.sensitive_operations import (
@@ -15,12 +16,13 @@ from app.services.sensitive_operations import (
     begin_sensitive_operation,
     finish_sensitive_operation,
 )
-from app.schemas.matchmaker_crm_admin import MatchRecordCreate, MatchRecordItem, MatchRecordPage, MatchRecordResponse, MatchRecordStatistics, MatchRecordUpdate, MemberAssignmentResponse, MemberAssignmentUpdate, MemberDetail, MemberListItem, MemberPage, MemberStatistics, MemberStatusResponse, MemberStatusUpdate, SourceDistributionItem
+from app.schemas.matchmaker_crm_admin import MatchRecordCreate, MatchRecordItem, MatchRecordPage, MatchRecordResponse, MatchRecordStatistics, MatchRecordUpdate, MemberAssignmentResponse, MemberAssignmentUpdate, MemberDetail, MemberListItem, MemberPage, MemberStatistics, MemberStatusResponse, MemberStatusUpdate, MemberWechatBindRequest, SourceDistributionItem
 from app.schemas.admin import CertificationReviewRequest, RealnameReviewRequest
 from app.services.auth import list_realname_reviews, review_realname
 from app.services.certifications import list_certification_reviews, review_certification
 from app.services.member_crm_filter import (
     MEMBER_BALANCE_EXPR,
+    MEMBER_POINTS_EXPR,
     build_member_filter,
     member_sort_sql,
 )
@@ -42,6 +44,41 @@ class MemberBatchStatus(BaseModel):
     member_ids: list[int] = Field(min_length=1, max_length=200)
     status: int = Field(ge=1, le=3)
     reason: str = Field(min_length=1, max_length=255)
+
+
+class MemberBatchDeleteRequest(BaseModel):
+    member_ids: list[int] = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=1, max_length=255)
+
+
+class MemberDeleteFailure(BaseModel):
+    id: int
+    error: str
+
+
+class MemberDeleteResult(BaseModel):
+    deleted: list[int] = Field(default_factory=list)
+    failed: list[MemberDeleteFailure] = Field(default_factory=list)
+
+
+class RegionResolverStatus(BaseModel):
+    provider: str
+    refresh_enabled: bool
+    adapter_implemented: bool
+
+
+class RegionRefreshResult(BaseModel):
+    kind: str
+    provider: str
+    dry_run: bool
+    scanned_count: int
+    updated_count: int
+    adapter_implemented: bool
+
+
+class MemberWechatBindingResult(BaseModel):
+    member_id: int
+    wechat_bound: bool
 
 
 # 牵线记录列表与统计共用的 FROM 子句：ra 既要供 SELECT 展示归属红娘，
@@ -283,6 +320,10 @@ async def _member_query(
         LEFT JOIN (SELECT user_id, MAX(end_at) AS vip_end_at FROM user_membership WHERE status = 1 GROUP BY user_id) v ON v.user_id = u.id
         LEFT JOIN {_ASSIGNMENT_DISPLAY_DERIVED} a ON a.user_id = u.id
         LEFT JOIN (SELECT user_id, MAX(created_at) last_follow_at, MAX(next_follow_at) next_follow_at FROM member_follow_up GROUP BY user_id) f ON f.user_id = u.id"""
+    # 软删除口径（A12-会员删除）：users.deleted_at 列已存在（属账号生命周期，与
+    # user_candidates 同口径），列表默认排除已软删行；列缺失（未跑 setup）时不拼，避免 Unknown column。
+    if ("users", "deleted_at") in available:
+        where = f"({where}) AND u.deleted_at IS NULL"
     where = f"({where}) AND ({scope})"
     params = {**params, "limit": page_size, "offset": (page - 1) * page_size}
     # Keep sort fields server-side whitelisted; never interpolate user input.
@@ -315,7 +356,7 @@ async def _member_query(
         {user_expr('ip_region')} AS ip_region,
         {user_expr('phone_region')} AS phone_region,
         {user_expr('login_num')} AS login_num,
-        COALESCE((SELECT up.balance FROM user_points up WHERE up.user_id = u.id ORDER BY up.id DESC LIMIT 1), 0) AS points,
+        {MEMBER_POINTS_EXPR} AS points,
         {MEMBER_BALANCE_EXPR} AS balance,
         EXISTS (SELECT 1 FROM member_abandonment ma
             WHERE ma.user_id = u.id AND ma.restored_at IS NULL) AS abandoned,
@@ -346,7 +387,7 @@ async def members(
     follow_state: str | None = Query(None, pattern="^(never|due_today|overdue)$"),
     search: str | None = Query(None, max_length=64),
     search_type: str | None = Query(None, pattern="^(smart|phone|wechat|code|id|nickname|realname)$"),
-    sort_by: str = Query("created_at", pattern="^(created_at|entered_at|last_login_at|last_follow_at|next_follow_at|assigned_at|fetched_at|login_num|balance|id)$"),
+    sort_by: str = Query("created_at", pattern="^(created_at|entered_at|last_login_at|last_follow_at|next_follow_at|assigned_at|fetched_at|login_num|balance|points|integral|id)$"),
     order: str | None = Query(None, pattern="^(latest|earliest|smart)$", description="记录排序；与 sort_by 互斥，同时传时以 order 为准"),
     source: str | None = Query(None, max_length=32),
     source__is_null: bool | None = Query(
@@ -523,6 +564,324 @@ async def batch_member_status(
     return response
 
 
+@router.post("/members/batch-delete", response_model=MemberDeleteResult, summary="批量删除会员（软删除，幂等 + 二次确认）")
+async def batch_member_delete(
+    body: MemberBatchDeleteRequest,
+    idempotency_key: str = Depends(require_sensitive_operation),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MemberDeleteResult:
+    """A12-会员删除：软删 `users.deleted_at`（复用账号生命周期列，不物理删、不新建列）。
+
+    敏感写：confirm=true + Idempotency-Key；作用域收口（D-16），越权/不存在/已删除逐条归入 failed。
+    """
+    current.require("matchmaker.member.manage")
+    if ("users", "deleted_at") not in await _available_columns(db):
+        raise HTTPException(503, detail="会员软删除列未就绪：请执行账号生命周期迁移")
+    ids = list(dict.fromkeys(body.member_ids))
+    reservation, replayed = await begin_sensitive_operation(
+        db,
+        actor_id=current.account.id,
+        operation="matchmaker.member.batch_delete",
+        idempotency_key=idempotency_key,
+        payload={"body": body.model_dump(mode="json")},
+    )
+    if replayed is not None:
+        return MemberDeleteResult(**replayed)
+    placeholders = ",".join(f":id_{index}" for index in range(len(ids)))
+    params: dict[str, object] = {f"id_{index}": value for index, value in enumerate(ids)}
+    scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = users.id")
+    try:
+        locked = (await db.execute(text(
+            f"SELECT users.id AS id, users.deleted_at AS deleted_at FROM users"
+            f" WHERE users.id IN ({placeholders}) AND ({scope}) FOR UPDATE"), params)).mappings().all()
+        state = {int(r["id"]): r["deleted_at"] for r in locked}
+        succeeded: list[int] = []
+        failed: list[MemberDeleteFailure] = []
+        for member_id in ids:
+            if member_id not in state:
+                failed.append(MemberDeleteFailure(id=member_id, error="会员不存在或无权限"))
+                continue
+            if state[member_id] is not None:
+                failed.append(MemberDeleteFailure(id=member_id, error="该会员已删除"))
+                continue
+            await db.execute(text(
+                "UPDATE users SET deleted_at=UTC_TIMESTAMP(), updated_at=UTC_TIMESTAMP()"
+                " WHERE id=:mid AND deleted_at IS NULL"), {"mid": member_id})
+            succeeded.append(member_id)
+        if succeeded:
+            await db.execute(text(
+                "INSERT INTO business_audit_log"
+                " (actor_user_id, action, resource_type, resource_id, after_json, reason)"
+                " VALUES (:actor, 'member.batch_delete', 'users', NULL, CAST(:after AS JSON), :reason)"),
+                {"actor": current.account.id,
+                 "after": json.dumps({"member_ids": succeeded}),
+                 "reason": f"批量删除{len(succeeded)}人: {body.reason}"[:255]},
+            )
+        await db.commit()
+    except Exception:
+        await abort_sensitive_operation(db, reservation)
+        raise
+    result = MemberDeleteResult(deleted=succeeded, failed=failed)
+    await finish_sensitive_operation(db, reservation, result.model_dump(mode="json"))
+    return result
+
+
+@router.delete("/members/{member_id}", response_model=MemberDeleteResult, summary="删除单个会员（软删除，幂等 + 二次确认）")
+async def member_delete(
+    member_id: int = Path(..., ge=1),
+    reason: str = Query("后台删除", min_length=1, max_length=255, description="删除理由（记入审计）"),
+    idempotency_key: str = Depends(require_sensitive_operation),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MemberDeleteResult:
+    """A12-会员删除：按 user_id 软删单个平台注册账号（非后台账号，与 `DELETE /accounts/{id}` 不同域）。"""
+    current.require("matchmaker.member.manage")
+    if ("users", "deleted_at") not in await _available_columns(db):
+        raise HTTPException(503, detail="会员软删除列未就绪：请执行账号生命周期迁移")
+    reservation, replayed = await begin_sensitive_operation(
+        db,
+        actor_id=current.account.id,
+        operation="matchmaker.member.delete",
+        idempotency_key=idempotency_key,
+        payload={"member_id": member_id, "reason": reason},
+    )
+    if replayed is not None:
+        return MemberDeleteResult(**replayed)
+    params: dict[str, object] = {"member_id": member_id}
+    scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = users.id")
+    try:
+        row = (await db.execute(text(
+            "SELECT users.deleted_at AS deleted_at FROM users WHERE users.id=:member_id"
+            f" AND ({scope}) FOR UPDATE"), params)).mappings().first()
+        if row is None:
+            await abort_sensitive_operation(db, reservation)
+            raise HTTPException(404, detail="会员不存在或无权限")
+        if row["deleted_at"] is not None:
+            await abort_sensitive_operation(db, reservation)
+            raise HTTPException(409, detail="该会员已删除")
+        await db.execute(text(
+            "UPDATE users SET deleted_at=UTC_TIMESTAMP(), updated_at=UTC_TIMESTAMP()"
+            " WHERE id=:member_id AND deleted_at IS NULL"), {"member_id": member_id})
+        await db.execute(text(
+            "INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id, reason)"
+            " VALUES (:actor, 'member.delete', 'users', :id, :reason)"),
+            {"actor": current.account.id, "id": member_id, "reason": reason[:255]},
+        )
+        await db.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        await abort_sensitive_operation(db, reservation)
+        raise
+    result = MemberDeleteResult(deleted=[member_id])
+    await finish_sensitive_operation(db, reservation, result.model_dump(mode="json"))
+    return result
+
+
+@router.get("/members/region-resolver", response_model=RegionResolverStatus, summary="属地解析服务状态")
+async def region_resolver_status(
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+) -> RegionResolverStatus:
+    """A12-属地：回显 provider 与是否可刷新（不受开关影响的只读目录）。"""
+    current.require("matchmaker.member.read")
+    provider = settings.region_resolver_provider
+    return RegionResolverStatus(
+        provider=provider, refresh_enabled=provider != "disabled", adapter_implemented=False
+    )
+
+
+async def _refresh_region(
+    db: AsyncSession, current: CurrentMatchmakerAdmin, kind: str, idempotency_key: str
+) -> RegionRefreshResult:
+    """一键刷新属地：provider 门控。disabled→503、real→501（适配器待接入）、mock→干跑统计（不写库）。
+
+    全项目无 IP→属地 / 号码归属地解析器（外部依赖），mock 不伪造真实地理值，仅统计候选行。
+    """
+    provider = settings.region_resolver_provider
+    if provider == "disabled":
+        raise HTTPException(503, detail="属地解析服务未接入（厂商未配置）")
+    if provider == "real":
+        raise HTTPException(501, detail="属地解析适配器待接入")
+    reservation, replayed = await begin_sensitive_operation(
+        db,
+        actor_id=current.account.id,
+        operation=f"matchmaker.member.refresh_{kind}_region",
+        idempotency_key=idempotency_key,
+        payload={"kind": kind},
+    )
+    if replayed is not None:
+        return RegionRefreshResult(**replayed)
+    try:
+        available = await _available_columns(db)
+        source_col = "register_ip" if kind == "ip" else "phone"
+        params: dict[str, object] = {}
+        scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = users.id")
+        deleted_guard = " AND users.deleted_at IS NULL" if ("users", "deleted_at") in available else ""
+        source_guard = (
+            f" AND users.{source_col} IS NOT NULL AND users.{source_col} <> ''"
+            if ("users", source_col) in available else ""
+        )
+        scanned = int((await db.execute(text(
+            f"SELECT COUNT(*) FROM users WHERE ({scope}){deleted_guard}{source_guard}"), params)).scalar() or 0)
+    except Exception:
+        # 与 batch/single delete 同口径：干跑统计失败必须释放预占行，否则同键 5 分钟内被锁死 409。
+        await abort_sensitive_operation(db, reservation)
+        raise
+    result = RegionRefreshResult(
+        kind=kind, provider=provider, dry_run=True, scanned_count=scanned,
+        updated_count=0, adapter_implemented=False,
+    )
+    await finish_sensitive_operation(db, reservation, result.model_dump(mode="json"))
+    return result
+
+
+@router.post("/members/refresh-ip-region", response_model=RegionRefreshResult, summary="一键刷新 IP 属地（敏感，provider 门控）")
+async def refresh_ip_region(
+    idempotency_key: str = Depends(require_sensitive_operation),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> RegionRefreshResult:
+    current.require("matchmaker.member.manage")
+    return await _refresh_region(db, current, "ip", idempotency_key)
+
+
+@router.post("/members/refresh-phone-region", response_model=RegionRefreshResult, summary="一键刷新手机属地（敏感，provider 门控）")
+async def refresh_phone_region(
+    idempotency_key: str = Depends(require_sensitive_operation),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> RegionRefreshResult:
+    current.require("matchmaker.member.manage")
+    return await _refresh_region(db, current, "phone", idempotency_key)
+
+
+def _wechat_columns_ok(available: frozenset[tuple[str, str]]) -> None:
+    # openid/unionid 是 users 基础列；wechat_bound_at 由补列器保证。缺失时拒绝而非写坏 SQL。
+    if ("users", "openid") not in available or ("users", "unionid") not in available:
+        raise HTTPException(503, detail="微信绑定列未就绪：请执行账号生命周期迁移")
+
+
+@router.post("/members/{member_id}/wechat-binding", response_model=MemberWechatBindingResult, summary="为会员绑定微信（敏感，幂等 + 二次确认）")
+async def member_wechat_bind(
+    body: MemberWechatBindRequest,
+    member_id: int = Path(..., ge=1),
+    idempotency_key: str = Depends(require_sensitive_operation),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MemberWechatBindingResult:
+    """A12-微信绑定（第389行）：后台手动将 openid/unionid 关联到会员。敏感写。
+
+    openid 全局唯一（已被他人占用 → 409）；作用域收口 + 软删行不可操作。
+    """
+    current.require("matchmaker.member.manage")
+    available = await _available_columns(db)
+    _wechat_columns_ok(available)
+    reservation, replayed = await begin_sensitive_operation(
+        db,
+        actor_id=current.account.id,
+        operation="matchmaker.member.wechat_bind",
+        idempotency_key=idempotency_key,
+        payload={"member_id": member_id, "body": body.model_dump(mode="json")},
+    )
+    if replayed is not None:
+        return MemberWechatBindingResult(**replayed)
+    params: dict[str, object] = {"member_id": member_id, "openid": body.openid, "unionid": body.unionid}
+    scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = users.id")
+    deleted_guard = " AND users.deleted_at IS NULL" if ("users", "deleted_at") in available else ""
+    try:
+        row = (await db.execute(text(
+            "SELECT users.openid AS openid FROM users WHERE users.id=:member_id"
+            f" AND ({scope}){deleted_guard} FOR UPDATE"), params)).mappings().first()
+        if row is None:
+            await abort_sensitive_operation(db, reservation)
+            raise HTTPException(404, detail="会员不存在或无权限")
+        taken = (await db.execute(text(
+            "SELECT id FROM users WHERE openid=:openid AND id<>:member_id LIMIT 1"),
+            {"openid": body.openid, "member_id": member_id})).first()
+        if taken:
+            await abort_sensitive_operation(db, reservation)
+            raise HTTPException(409, detail="该微信 openid 已绑定其他会员")
+        set_parts = ["openid=:openid", "unionid=:unionid"]
+        if ("users", "wechat_bound_at") in available:
+            set_parts.append("wechat_bound_at=UTC_TIMESTAMP()")
+        await db.execute(text(
+            f"UPDATE users SET {', '.join(set_parts)}, updated_at=UTC_TIMESTAMP() WHERE id=:member_id"), params)
+        await db.execute(text(
+            "INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id, reason)"
+            " VALUES (:actor, 'member.wechat_bind', 'users', :id, :reason)"),
+            {"actor": current.account.id, "id": member_id, "reason": body.reason[:255]})
+        await db.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        await abort_sensitive_operation(db, reservation)
+        raise
+    result = MemberWechatBindingResult(member_id=member_id, wechat_bound=True)
+    await finish_sensitive_operation(db, reservation, result.model_dump(mode="json"))
+    return result
+
+
+@router.delete("/members/{member_id}/wechat-binding", response_model=MemberWechatBindingResult, summary="解绑会员微信（敏感，幂等 + 二次确认）")
+async def member_wechat_unbind(
+    member_id: int = Path(..., ge=1),
+    reason: str = Query("后台解绑", min_length=1, max_length=255, description="解绑理由（记入审计）"),
+    idempotency_key: str = Depends(require_sensitive_operation),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MemberWechatBindingResult:
+    """A12-微信解绑（第389行）：清空会员 openid/unionid/wechat_bound_at。敏感写。
+
+    防锁死：微信-only 账号（无手机号）解绑后将无法登录，拒绝并返回 409，要求先绑手机号。
+    """
+    current.require("matchmaker.member.manage")
+    available = await _available_columns(db)
+    _wechat_columns_ok(available)
+    reservation, replayed = await begin_sensitive_operation(
+        db,
+        actor_id=current.account.id,
+        operation="matchmaker.member.wechat_unbind",
+        idempotency_key=idempotency_key,
+        payload={"member_id": member_id, "reason": reason},
+    )
+    if replayed is not None:
+        return MemberWechatBindingResult(**replayed)
+    params: dict[str, object] = {"member_id": member_id}
+    scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = users.id")
+    deleted_guard = " AND users.deleted_at IS NULL" if ("users", "deleted_at") in available else ""
+    try:
+        row = (await db.execute(text(
+            "SELECT users.openid AS openid, users.phone AS phone FROM users WHERE users.id=:member_id"
+            f" AND ({scope}){deleted_guard} FOR UPDATE"), params)).mappings().first()
+        if row is None:
+            await abort_sensitive_operation(db, reservation)
+            raise HTTPException(404, detail="会员不存在或无权限")
+        if not row["openid"]:
+            await abort_sensitive_operation(db, reservation)
+            raise HTTPException(409, detail="该会员未绑定微信")
+        if not row["phone"]:
+            await abort_sensitive_operation(db, reservation)
+            raise HTTPException(409, detail="该会员未绑定手机号，解绑微信后将无法登录，请先绑定手机号")
+        set_parts = ["openid=NULL", "unionid=NULL"]
+        if ("users", "wechat_bound_at") in available:
+            set_parts.append("wechat_bound_at=NULL")
+        await db.execute(text(
+            f"UPDATE users SET {', '.join(set_parts)}, updated_at=UTC_TIMESTAMP() WHERE id=:member_id"), params)
+        await db.execute(text(
+            "INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id, reason)"
+            " VALUES (:actor, 'member.wechat_unbind', 'users', :id, :reason)"),
+            {"actor": current.account.id, "id": member_id, "reason": reason[:255]})
+        await db.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        await abort_sensitive_operation(db, reservation)
+        raise
+    result = MemberWechatBindingResult(member_id=member_id, wechat_bound=False)
+    await finish_sensitive_operation(db, reservation, result.model_dump(mode="json"))
+    return result
+
+
 @router.get("/members/auth")
 async def member_auth_list(
     page: int = Query(1, ge=1, le=1000),
@@ -621,8 +980,10 @@ async def member_detail(member_id: int = Path(..., ge=1), current: CurrentMatchm
     params: dict[str, object] = {"id": member_id}
     # 越权访问按「不存在」处理（404），避免通过状态码差异枚举他组织会员 ID。
     scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = u.id")
+    # 软删行不可见（A12-会员删除）：与列表同口径，列缺失时不拼。
+    deleted_guard = " AND u.deleted_at IS NULL" if ("users", "deleted_at") in available else ""
     row = (await db.execute(text(f"""SELECT u.id, u.nickname, u.phone, u.gender, u.status, u.avatar, u.birthday, u.is_married, u.created_at,
-        u.last_login_at, u.register_ip AS ip_location, {user_expr('ip_region')} AS ip_region, {user_expr('phone_region')} AS phone_region, {user_expr('login_num')} AS login_num, COALESCE((SELECT up.balance FROM user_points up WHERE up.user_id = u.id ORDER BY up.id DESC LIMIT 1), 0) AS points, {MEMBER_BALANCE_EXPR} AS balance, {profile_expr('residence_city_code')} AS residence_city_code,
+        u.last_login_at, u.register_ip AS ip_location, {user_expr('ip_region')} AS ip_region, {user_expr('phone_region')} AS phone_region, {user_expr('login_num')} AS login_num, COALESCE((SELECT up.balance FROM user_points up WHERE up.user_id = u.id ORDER BY up.id DESC LIMIT 1), 0) AS points, {MEMBER_BALANCE_EXPR} AS balance, (CASE WHEN {user_expr('openid')} IS NOT NULL AND {user_expr('openid')} <> '' THEN 1 ELSE 0 END) AS wechat_bound, {user_expr('wechat_bound_at')} AS wechat_bound_at, {profile_expr('residence_city_code')} AS residence_city_code,
         {profile_expr('height')} AS height, {profile_expr('weight')} AS weight,
         {profile_expr('constellation')} AS constellation, {profile_expr('zodiac')} AS zodiac,
         {profile_expr('household')} AS household, {profile_expr('ethnicity')} AS ethnicity,
@@ -650,7 +1011,7 @@ async def member_detail(member_id: int = Path(..., ge=1), current: CurrentMatchm
         LEFT JOIN user_auth ua ON ua.user_id = u.id
         LEFT JOIN user_privacy pr ON pr.user_id = u.id
         LEFT JOIN (SELECT user_id, MAX(end_at) vip_end_at FROM user_membership WHERE status = 1 GROUP BY user_id) v ON v.user_id = u.id
-        LEFT JOIN {_ASSIGNMENT_DISPLAY_DERIVED} a ON a.user_id = u.id WHERE u.id = :id AND ({scope})"""), params)).mappings().first()
+        LEFT JOIN {_ASSIGNMENT_DISPLAY_DERIVED} a ON a.user_id = u.id WHERE u.id = :id AND ({scope}){deleted_guard}"""), params)).mappings().first()
     if not row:
         from fastapi import HTTPException
         raise HTTPException(404, detail="会员不存在")

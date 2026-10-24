@@ -1,5 +1,6 @@
 """Customer lead management for the independent back office."""
 
+import re
 from datetime import datetime
 from io import BytesIO
 from typing import Any
@@ -33,6 +34,20 @@ LEAD_SELECT = """SELECT id, name, phone, wechat, source, intention_level, status
         FROM customer_lead_tag_relation r JOIN customer_lead_tag t ON t.id = r.tag_id
         WHERE r.lead_id = customer_lead.id) AS tags_raw
     FROM customer_lead"""
+
+_LEAD_GENDER_RE = re.compile(r"\bFROM customer_lead\b")
+
+
+def _apply_gender_column(select_sql: str) -> str:
+    """在客源主表外层 FROM 前补 gender 列。
+
+    用 ``\bFROM customer_lead\b`` 只匹配外层表引用：子查询里的
+    ``FROM customer_lead_tag_relation`` 因 ``customer_lead`` 后紧跟 ``_``（单词字符）
+    不构成词边界，不会被误匹配，避免把 gender 注入标量子查询导致 MySQL 1241
+    （Operand should contain 1 column(s)）。
+    """
+    return _LEAD_GENDER_RE.sub(", CAST(gender AS SIGNED) AS gender FROM customer_lead", select_sql)
+
 
 # 导入模板表头（顺序即模板列顺序）
 _TEMPLATE_HEADERS: list[str] = ["姓名", "手机号", "微信号", "来源", "意向程度", "备注"]
@@ -145,7 +160,7 @@ async def get_lead(
         where.append("deleted_at IS NULL")
     select_sql = LEAD_SELECT
     if "gender" in columns:
-        select_sql = select_sql.replace("FROM customer_lead", ", CAST(gender AS SIGNED) AS gender FROM customer_lead")
+        select_sql = _apply_gender_column(select_sql)
     row = (await db.execute(text(f"{select_sql} WHERE {' AND '.join(where)}"), params)).mappings().first()
     if not row:
         raise HTTPException(404, detail="客源线索不存在")
@@ -302,6 +317,9 @@ async def list_leads(
     hide_called_today: bool | None = None,
     has_phone: bool | None = None,
     has_wechat: bool | None = None,
+    assigned: bool | None = None,
+    audit_status: str | None = None,
+    stored: bool | None = None,
     order: str | None = None,
     scope: str | None = None,
     scope_params: dict[str, Any] | None = None,
@@ -343,6 +361,19 @@ async def list_leads(
     if promoter_id is not None:
         where.append("promoter_id = :promoter_id")
         params["promoter_id"] = promoter_id
+    # B11③ 客源线索缺失筛选：待分派 / 审核状态 / 入库情况。
+    # matchmaker_id、audit_status、converted_user_id 均为 customer_lead 基础列（LEAD_SELECT 已引用）。
+    if assigned is True:
+        where.append("matchmaker_id IS NOT NULL")
+    elif assigned is False:
+        where.append("matchmaker_id IS NULL")
+    if audit_status:
+        where.append("audit_status = :audit_status")
+        params["audit_status"] = audit_status
+    if stored is True:
+        where.append("converted_user_id IS NOT NULL")
+    elif stored is False:
+        where.append("converted_user_id IS NULL")
     if start_date:
         where.append("created_at >= :start_date")
         params["start_date"] = start_date
@@ -415,7 +446,7 @@ async def list_leads(
     order_sql = _LEAD_ORDER_SQL.get(order or "latest", _LEAD_ORDER_SQL["latest"])
     select_sql = LEAD_SELECT
     if "gender" in columns:
-        select_sql = select_sql.replace("FROM customer_lead", ", CAST(gender AS SIGNED) AS gender FROM customer_lead")
+        select_sql = _apply_gender_column(select_sql)
     rows = await db.execute(text(f"{select_sql} WHERE {clause} ORDER BY {order_sql} LIMIT :limit OFFSET :offset"), params)
     count = await db.execute(text(f"SELECT COUNT(*) FROM customer_lead WHERE {clause}"), {k: v for k, v in params.items() if k not in ("limit", "offset")})
     total = int(count.scalar() or 0)
