@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from typing import Any
 
@@ -70,14 +71,56 @@ async def complete(
         return outcome.result.strip()
     raise HTTPException(503, detail="AI服务暂时不可用")
 
+_JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
+_TRAILING_COMMA = re.compile(r",\s*([}\]])")
+
+
 def parse_json(content: str) -> dict[str, Any]:
-    try:
-        value = json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(503, detail="AI返回格式无效") from exc
-    if not isinstance(value, dict):
-        raise HTTPException(503, detail="AI返回格式无效")
-    return value
+    """解析模型返回的 JSON，容忍常见非严格输出。
+
+    兼容三类现实输出：Markdown 代码围栏（```` ```json ````）、JSON 前后的
+    解释性文字、对象/数组末尾的多余逗号。仍然只接受顶层为对象的 JSON：
+    顶层数组或标量一律按非法处理，避免调用方 ``data.get(...)`` 抛
+    ``AttributeError``。
+
+    解析失败只记录长度与首尾片段，不记录原文，防止用户资料进入日志。
+    """
+    text = (content or "").strip()
+
+    # 1) 剥离 Markdown 围栏；围栏不成对时退化为去掉所有 ``` 标记
+    if "```" in text:
+        fence = _JSON_FENCE.search(text)
+        text = (
+            fence.group(1).strip()
+            if fence
+            else re.sub(r"```(?:json)?", "", text).strip()
+        )
+
+    candidates = [text]
+
+    # 2) 截取首个 "{" 到最后一个 "}"，覆盖"JSON 前后有说明文字"的情况
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start and (start, end) != (0, len(text) - 1):
+        candidates.append(text[start : end + 1])
+
+    for candidate in candidates:
+        # 3) 先按原样解析，再尝试去掉尾逗号后解析
+        for attempt in (candidate, _TRAILING_COMMA.sub(r"\1", candidate)):
+            try:
+                value = json.loads(attempt)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(value, dict):
+                raise HTTPException(503, detail="AI返回格式无效")
+            return value
+
+    logger.warning(
+        "ai_json_parse_failed len=%d head=%r tail=%r",
+        len(content or ""),
+        (content or "")[:40],
+        (content or "")[-40:],
+    )
+    raise HTTPException(503, detail="AI返回格式无效")
 
 
 def _prompt_value(prompt: str, label: str) -> str:

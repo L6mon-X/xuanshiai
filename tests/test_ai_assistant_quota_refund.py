@@ -6,7 +6,11 @@ from datetime import UTC, datetime
 import pytest
 from fastapi import HTTPException
 
-from app.schemas.ai import AISearchRequest, AIProfilePolishRequest
+from app.schemas.ai import (
+    AIProfilePolishRequest,
+    AIProfileThoughtfulnessRequest,
+    AISearchRequest,
+)
 from app.services import ai_assistant as service
 
 
@@ -27,6 +31,9 @@ class _Result:
         return list(self._rows)
 
     def one(self):
+        return self._row
+
+    def first(self):
         return self._row
 
 
@@ -144,6 +151,141 @@ async def test_match_page_consumes_once_for_multiple_candidate_explanations(monk
     assert len(result.items) == 2
     assert consumed == [("match", 7)]
     assert explanations == 2
+
+
+class _ThoughtfulnessDb:
+    """按 analyze_thoughtfulness 的查询顺序应答。
+
+    顺序：资料行 → 相册照片数 → 上一次评审 → UPSERT → 回读结果行。
+    """
+
+    def __init__(self, result_row: dict | None = None) -> None:
+        self.calls = 0
+        self.committed = False
+        self._result_row = result_row
+
+    async def execute(self, *_args, **_kwargs):
+        self.calls += 1
+        if self.calls == 1:  # 资料行
+            return _Result(row=_PROFILE_ROW)
+        if self.calls == 2:  # 相册照片数
+            return _Result(scalar_value=0)
+        if self.calls == 3:  # 上一次评审
+            return _Result(row=None)
+        if self.calls == 4:  # UPSERT 评审结果
+            return _Result()
+        if self.calls == 5:  # 回读结果行
+            if self._result_row is None:
+                raise AssertionError("回读结果行未预置")
+            return _Result(row=self._result_row)
+        raise AssertionError(f"unexpected execute call {self.calls}")
+
+    async def commit(self):
+        self.committed = True
+
+
+_PROFILE_ROW = {
+    "nickname": "测试用户",
+    "gender": 1,
+    "birthday": None,
+    "is_married": 1,
+    "avatar": "a.png",
+    "height": 175,
+    "weight": 68,
+    "occupation": "工程师",
+    "industry": None,
+    "education_level": 3,
+    "income": 20000,
+    "residence_province_code": "110000",
+    "residence_city_code": "110100",
+    "residence_district_code": None,
+    "hometown_province_code": None,
+    "hometown_city_code": None,
+    "hometown_district_code": None,
+    "self_intro": "认真生活，也认真工作，喜欢运动和阅读。",
+    "interest_tags": '["阅读"]',
+    "personality_tags": '["温和"]',
+    "mbti": "INFP",
+    "tags": None,
+    "qa_answers": None,
+    "love_view": None,
+    "ideal_partner": None,
+    "hobbies": None,
+    "family_background": None,
+    "single_reason": None,
+    "household": None,
+    "house": None,
+    "car": None,
+    "smoking": None,
+    "constellation": None,
+    "zodiac": None,
+}
+
+
+@pytest.mark.asyncio
+async def test_thoughtfulness_refunds_when_model_output_is_not_json(monkeypatch):
+    """模型输出非法 JSON 时，用心度必须退还额度（与另外四个 AI 接口一致）。"""
+    db = _ThoughtfulnessDb()
+    refunded: list[str] = []
+
+    async def complete_not_json(*_args, **_kwargs):
+        return "好的，我分析完了：你的资料不错"  # 非 JSON
+
+    monkeypatch.setattr(service, "complete", complete_not_json)
+    monkeypatch.setattr(service, "_consume_ai_quota", _consumed("quota:thoughtfulness", refunded))
+    monkeypatch.setattr(service, "refund_daily", lambda key: _record_refund(refunded, key))
+
+    with pytest.raises(HTTPException, match="AI返回格式无效"):
+        await service.analyze_thoughtfulness(
+            db, 7, AIProfileThoughtfulnessRequest(trigger="manual")
+        )
+
+    assert refunded == ["quota:thoughtfulness"]
+    assert db.committed is False
+
+
+@pytest.mark.asyncio
+async def test_thoughtfulness_keeps_quota_after_success(monkeypatch):
+    """生成成功后不退款，避免「失败退、成功也退」导致额度等于没扣。"""
+    now = datetime.now(UTC).replace(tzinfo=None)
+    db = _ThoughtfulnessDb(
+        result_row={
+            "score": 72,
+            "summary": "资料框架完整，可以再补充具体场景。",
+            "todos": json.dumps([], ensure_ascii=False),
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    refunded: list[str] = []
+
+    async def complete_valid(*_args, **_kwargs):
+        return json.dumps(
+            {
+                "score": 72,
+                "summary": "资料框架完整，可以再补充具体场景。",
+                "todos": [
+                    {
+                        "key": "self_intro",
+                        "label": "自我介绍",
+                        "advice": "补充一个具体的生活场景。",
+                        "priority": "medium",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(service, "complete", complete_valid)
+    monkeypatch.setattr(service, "_consume_ai_quota", _consumed("quota:thoughtfulness", refunded))
+    monkeypatch.setattr(service, "refund_daily", lambda key: _record_refund(refunded, key))
+
+    await service.analyze_thoughtfulness(
+        db, 7, AIProfileThoughtfulnessRequest(trigger="manual")
+    )
+
+    assert refunded == []
+    assert db.committed is True
 
 
 @pytest.mark.asyncio

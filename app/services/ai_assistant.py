@@ -211,136 +211,143 @@ async def get_thoughtfulness(db: AsyncSession, user_id: int) -> AIProfileThought
 
 async def analyze_thoughtfulness(db: AsyncSession, user_id: int, request: AIProfileThoughtfulnessRequest) -> AIProfileThoughtfulnessResponse:
     # 编辑页基础工具，不设 VIP 门槛：用心度是面向全员的资料改进指标（未来作为浏览他人资料的门槛）。
-    await _consume_ai_quota(db, user_id, "thoughtfulness", settings.ai_daily_thoughtfulness_limit)
-    profile_row = (await db.execute(text("""SELECT u.nickname, u.gender, u.birthday, u.is_married, u.avatar,
-                       p.height, p.weight, p.occupation, p.industry, p.education_level, p.income,
-                       p.residence_province_code, p.residence_city_code, p.residence_district_code,
-                       p.hometown_province_code, p.hometown_city_code, p.hometown_district_code,
-                       p.self_intro, p.interest_tags, p.personality_tags, p.mbti, p.tags, p.qa_answers
-                       ,p.love_view, p.ideal_partner, p.hobbies, p.family_background,
-                       p.single_reason, p.household, p.house, p.car, p.smoking,
-                       p.constellation, p.zodiac
-                FROM users u LEFT JOIN user_profile p ON p.user_id = u.id WHERE u.id = :user_id"""),
-            {"user_id": user_id})).mappings().first()
-    if profile_row is None:
-        raise HTTPException(404, detail="用户资料不存在")
-    photo_count = int((await db.execute(text(
-        "SELECT COUNT(*) FROM user_media WHERE user_id=:user_id AND deleted_at IS NULL AND media_type='photo'"),
-        {"user_id": user_id})).scalar() or 0)
+    quota_key = await _consume_ai_quota(db, user_id, "thoughtfulness", settings.ai_daily_thoughtfulness_limit)
+    try:
+        profile_row = (await db.execute(text("""SELECT u.nickname, u.gender, u.birthday, u.is_married, u.avatar,
+                           p.height, p.weight, p.occupation, p.industry, p.education_level, p.income,
+                           p.residence_province_code, p.residence_city_code, p.residence_district_code,
+                           p.hometown_province_code, p.hometown_city_code, p.hometown_district_code,
+                           p.self_intro, p.interest_tags, p.personality_tags, p.mbti, p.tags, p.qa_answers
+                           ,p.love_view, p.ideal_partner, p.hobbies, p.family_background,
+                           p.single_reason, p.household, p.house, p.car, p.smoking,
+                           p.constellation, p.zodiac
+                    FROM users u LEFT JOIN user_profile p ON p.user_id = u.id WHERE u.id = :user_id"""),
+                {"user_id": user_id})).mappings().first()
+        if profile_row is None:
+            raise HTTPException(404, detail="用户资料不存在")
+        photo_count = int((await db.execute(text(
+            "SELECT COUNT(*) FROM user_media WHERE user_id=:user_id AND deleted_at IS NULL AND media_type='photo'"),
+            {"user_id": user_id})).scalar() or 0)
 
-    facts: list[str] = []
-    mapping = [
-        ("性别", profile_row["gender"]), ("生日", profile_row["birthday"]), ("婚姻状况", profile_row["is_married"]),
-        ("身高", profile_row["height"]), ("体重", profile_row["weight"]), ("职业", profile_row["occupation"]),
-        ("行业", profile_row["industry"]), ("学历", profile_row["education_level"]), ("收入", profile_row["income"]),
-        ("现居地", profile_row["residence_city_code"]), ("家乡", profile_row["hometown_city_code"]),
-        ("自我介绍", profile_row["self_intro"]), ("兴趣标签", profile_row["interest_tags"]),
-        ("性格标签", profile_row["personality_tags"]), ("MBTI", profile_row["mbti"]),
-        ("标签选择", profile_row["tags"]), ("爱情观", profile_row["love_view"]),
-        ("理想另一半", profile_row["ideal_partner"]), ("兴趣爱好补充", profile_row["hobbies"]),
-        ("家庭背景", profile_row["family_background"]), ("单身原因", profile_row["single_reason"]),
-        ("户籍信息", profile_row["household"]), ("住房情况", profile_row["house"]),
-        ("车辆情况", profile_row["car"]), ("吸烟情况", profile_row["smoking"]),
-        ("星座", profile_row["constellation"]), ("生肖", profile_row["zodiac"]),
-        ("头像", "已上传" if profile_row["avatar"] else "未上传"),
-    ]
-    for label, value in mapping:
-        if value is None or (isinstance(value, str) and value.strip() == ""):
-            facts.append(f"{label}：未填写")
-        else:
-            facts.append(f"{label}：{value}")
-    facts.append(f"相册照片数：{photo_count}")
-    # 「关于我问答」是 user_profile.qa_answers 独立字段，不在上面的 mapping 里；
-    # 不显式读出已保存答案，模型就看不到用户已填写的问答，宣称覆盖全部问答的待办也无从判断。
-    answered_qa = [item for item in _qa_answers_from_value(profile_row["qa_answers"]) if item["answer"] != ""]
-    for item in answered_qa:
-        facts.append(f"关于我问答「{item['question']}」：{item['answer']}")
-    qa_unanswered = max(len(QA_QUESTION_TEXTS) - len(answered_qa), 0)
-    if qa_unanswered > 0:
-        facts.append(f"关于我问答：已回答 {len(answered_qa)} 题，未回答 {qa_unanswered} 题")
-    edited_keys = [k for k in (request.edited_keys or [])[:20] if k in THOUGHTFULNESS_KEY_LABELS]
+        facts: list[str] = []
+        mapping = [
+            ("性别", profile_row["gender"]), ("生日", profile_row["birthday"]), ("婚姻状况", profile_row["is_married"]),
+            ("身高", profile_row["height"]), ("体重", profile_row["weight"]), ("职业", profile_row["occupation"]),
+            ("行业", profile_row["industry"]), ("学历", profile_row["education_level"]), ("收入", profile_row["income"]),
+            ("现居地", profile_row["residence_city_code"]), ("家乡", profile_row["hometown_city_code"]),
+            ("自我介绍", profile_row["self_intro"]), ("兴趣标签", profile_row["interest_tags"]),
+            ("性格标签", profile_row["personality_tags"]), ("MBTI", profile_row["mbti"]),
+            ("标签选择", profile_row["tags"]), ("爱情观", profile_row["love_view"]),
+            ("理想另一半", profile_row["ideal_partner"]), ("兴趣爱好补充", profile_row["hobbies"]),
+            ("家庭背景", profile_row["family_background"]), ("单身原因", profile_row["single_reason"]),
+            ("户籍信息", profile_row["household"]), ("住房情况", profile_row["house"]),
+            ("车辆情况", profile_row["car"]), ("吸烟情况", profile_row["smoking"]),
+            ("星座", profile_row["constellation"]), ("生肖", profile_row["zodiac"]),
+            ("头像", "已上传" if profile_row["avatar"] else "未上传"),
+        ]
+        for label, value in mapping:
+            if value is None or (isinstance(value, str) and value.strip() == ""):
+                facts.append(f"{label}：未填写")
+            else:
+                facts.append(f"{label}：{value}")
+        facts.append(f"相册照片数：{photo_count}")
+        # 「关于我问答」是 user_profile.qa_answers 独立字段，不在上面的 mapping 里；
+        # 不显式读出已保存答案，模型就看不到用户已填写的问答，宣称覆盖全部问答的待办也无从判断。
+        answered_qa = [item for item in _qa_answers_from_value(profile_row["qa_answers"]) if item["answer"] != ""]
+        for item in answered_qa:
+            facts.append(f"关于我问答「{item['question']}」：{item['answer']}")
+        qa_unanswered = max(len(QA_QUESTION_TEXTS) - len(answered_qa), 0)
+        if qa_unanswered > 0:
+            facts.append(f"关于我问答：已回答 {len(answered_qa)} 题，未回答 {qa_unanswered} 题")
+        edited_keys = [k for k in (request.edited_keys or [])[:20] if k in THOUGHTFULNESS_KEY_LABELS]
 
-    previous_row = (await db.execute(text("""SELECT summary, todos
-        FROM ai_profile_thoughtfulness WHERE user_id=:user_id"""), {"user_id": user_id})).mappings().first()
-    previous_summary = str(previous_row["summary"] or "").strip() if previous_row is not None else ""
-    previous_todos = previous_row["todos"] if previous_row is not None else []
-    if isinstance(previous_todos, str):
-        try:
-            previous_todos = json.loads(previous_todos)
-        except Exception:
-            previous_todos = []
-    previous_text = json.dumps({"summary": previous_summary, "todos": previous_todos}, ensure_ascii=False)
-    run_id = request.analysis_run_id or "server-generated"
+        previous_row = (await db.execute(text("""SELECT summary, todos
+            FROM ai_profile_thoughtfulness WHERE user_id=:user_id"""), {"user_id": user_id})).mappings().first()
+        previous_summary = str(previous_row["summary"] or "").strip() if previous_row is not None else ""
+        previous_todos = previous_row["todos"] if previous_row is not None else []
+        if isinstance(previous_todos, str):
+            try:
+                previous_todos = json.loads(previous_todos)
+            except Exception:
+                previous_todos = []
+        previous_text = json.dumps({"summary": previous_summary, "todos": previous_todos}, ensure_ascii=False)
+        run_id = request.analysis_run_id or "server-generated"
 
-    raw = await complete(
-        [
-            {"role": "system", "content": THOUGHTFULNESS_SYSTEM_PROMPT},
-            {"role": "user", "content": (
-                f"THOUGHTFULNESS_REVIEW trigger={request.trigger} "
-                f"analysis_run_id={run_id} "
-                f"edited_keys={','.join(edited_keys) if edited_keys else 'unknown'}\n"
-                f"上一次评审输出（如果存在，本次必须换一种表达并重新组织建议，不能原样复用）：{previous_text}\n"
-                + "\n".join(facts)
-            )},
-        ],
-        json_mode=True,
-        scene="thoughtfulness",
-    )
-    data = parse_json(raw)
-    data = parse_json(raw)
-
-    # 模型偶尔会在资料未变化时复读上一版；追加一次明确的重写指令，保证手动重分析确实重新生成。
-    current_text = json.dumps({"summary": data.get("summary"), "todos": data.get("todos")}, ensure_ascii=False)
-    if previous_summary != "" and current_text == previous_text:
         raw = await complete(
             [
                 {"role": "system", "content": THOUGHTFULNESS_SYSTEM_PROMPT},
                 {"role": "user", "content": (
-                    f"THOUGHTFULNESS_REWRITE analysis_run_id={run_id}\n"
-                    "下面是上一版结果。请重新阅读资料，改写summary并重新排序或改写todos；不得复制上一版任何完整句子。\n"
-                    f"上一版：{previous_text}\n" + "\n".join(facts)
+                    f"THOUGHTFULNESS_REVIEW trigger={request.trigger} "
+                    f"analysis_run_id={run_id} "
+                    f"edited_keys={','.join(edited_keys) if edited_keys else 'unknown'}\n"
+                    f"上一次评审输出（如果存在，本次必须换一种表达并重新组织建议，不能原样复用）：{previous_text}\n"
+                    + "\n".join(facts)
                 )},
             ],
             json_mode=True,
             scene="thoughtfulness",
         )
         data = parse_json(raw)
-    try:
-        score = max(0, min(100, int(data.get("score"))))
-    except (TypeError, ValueError):
-        score = 0
-    summary = str(data.get("summary") or "你的资料整体填写正常，可以继续完善细节。").strip()[:500]
 
-    todo_items = data.get("todos") if isinstance(data.get("todos"), list) else []
-    todos: list[AIProfileThoughtfulnessTodo] = []
-    for item in todo_items[:4]:
-        if not isinstance(item, dict):
-            continue
-        key = str(item.get("key") or "")
-        if key not in THOUGHTFULNESS_KEY_LABELS:
-            continue
-        label = str(item.get("label") or "").strip()[:40] or THOUGHTFULNESS_KEY_LABELS[key]
-        advice = str(item.get("advice") or "").strip()[:300]
-        if not advice:
-            continue
-        priority = str(item.get("priority") or "medium")
-        if priority not in ("high", "medium", "low"):
-            priority = "medium"
-        todos.append(AIProfileThoughtfulnessTodo(key=key, label=label, advice=advice, priority=priority))
+        # 模型偶尔会在资料未变化时复读上一版；追加一次明确的重写指令，保证手动重分析确实重新生成。
+        current_text = json.dumps({"summary": data.get("summary"), "todos": data.get("todos")}, ensure_ascii=False)
+        if previous_summary != "" and current_text == previous_text:
+            raw = await complete(
+                [
+                    {"role": "system", "content": THOUGHTFULNESS_SYSTEM_PROMPT},
+                    {"role": "user", "content": (
+                        f"THOUGHTFULNESS_REWRITE analysis_run_id={run_id}\n"
+                        "下面是上一版结果。请重新阅读资料，改写summary并重新排序或改写todos；不得复制上一版任何完整句子。\n"
+                        f"上一版：{previous_text}\n" + "\n".join(facts)
+                    )},
+                ],
+                json_mode=True,
+                scene="thoughtfulness",
+            )
+            data = parse_json(raw)
+        try:
+            score = max(0, min(100, int(data.get("score"))))
+        except (TypeError, ValueError):
+            score = 0
+        summary = str(data.get("summary") or "你的资料整体填写正常，可以继续完善细节。").strip()[:500]
 
-    await db.execute(text("""INSERT INTO ai_profile_thoughtfulness
-        (user_id, score, summary, todos, edited_keys, model_name)
-        VALUES (:user_id, :score, :summary, :todos, :edited_keys, :model_name)
-        ON DUPLICATE KEY UPDATE score=VALUES(score), summary=VALUES(summary), todos=VALUES(todos),
-            edited_keys=VALUES(edited_keys), model_name=VALUES(model_name)"""), {
-        "user_id": user_id,
-        "score": score,
-        "summary": summary,
-        "todos": json.dumps([t.model_dump() for t in todos], ensure_ascii=False),
-        "edited_keys": json.dumps(edited_keys, ensure_ascii=False),
-        "model_name": settings.ai_model,
-    })
-    await db.commit()
+        todo_items = data.get("todos") if isinstance(data.get("todos"), list) else []
+        todos: list[AIProfileThoughtfulnessTodo] = []
+        for item in todo_items[:4]:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or "")
+            if key not in THOUGHTFULNESS_KEY_LABELS:
+                continue
+            label = str(item.get("label") or "").strip()[:40] or THOUGHTFULNESS_KEY_LABELS[key]
+            advice = str(item.get("advice") or "").strip()[:300]
+            if not advice:
+                continue
+            priority = str(item.get("priority") or "medium")
+            if priority not in ("high", "medium", "low"):
+                priority = "medium"
+            todos.append(AIProfileThoughtfulnessTodo(key=key, label=label, advice=advice, priority=priority))
+
+        await db.execute(text("""INSERT INTO ai_profile_thoughtfulness
+            (user_id, score, summary, todos, edited_keys, model_name)
+            VALUES (:user_id, :score, :summary, :todos, :edited_keys, :model_name)
+            ON DUPLICATE KEY UPDATE score=VALUES(score), summary=VALUES(summary), todos=VALUES(todos),
+                edited_keys=VALUES(edited_keys), model_name=VALUES(model_name)"""), {
+            "user_id": user_id,
+            "score": score,
+            "summary": summary,
+            "todos": json.dumps([t.model_dump() for t in todos], ensure_ascii=False),
+            "edited_keys": json.dumps(edited_keys, ensure_ascii=False),
+            "model_name": settings.ai_model,
+        })
+        await db.commit()
+    except Exception:
+        # 与 assistant_message / polish_profile / search / match 保持一致：
+        # 生成失败（含 parse_json 抛出的 503「AI返回格式无效」）必须退还本次额度，
+        # 否则用户每失败一次就白扣一次日额度。
+        # 边界止于 db.commit()：提交成功后的异常不退款，避免用户白拿一次。
+        await _refund_ai_quota_safely(quota_key)
+        raise
     row = (await db.execute(text("""SELECT score, summary, todos, created_at, updated_at
         FROM ai_profile_thoughtfulness WHERE user_id=:user_id"""), {"user_id": user_id})).mappings().one()
     return _thoughtfulness_row_to_response(row)

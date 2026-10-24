@@ -780,6 +780,7 @@ class DatabaseManager:
             INSERT IGNORE INTO admin_menu
                 (id, parent_id, name, path, menu_type, permission_code, icon, sort, status)
             VALUES
+                (32, 3, '模拟登录会员', NULL, 'button', 'matchmaker.member.impersonate', NULL, 2, 1),
                 (52, 5, '查看约见反馈', NULL, 'button', 'meeting.feedback.read', NULL, 2, 1),
                 (61, 6, '财务操作', NULL, 'button', 'finance.write', NULL, 1, 1),
                 (82, 8, '查看红娘', NULL, 'button', 'matchmaker.read', NULL, 2, 1),

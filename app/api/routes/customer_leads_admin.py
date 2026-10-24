@@ -1,6 +1,6 @@
 """Customer lead management routes."""
 
-from fastapi import APIRouter, Depends, File, Form, Header, Path, Query, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Path, Query, Response, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import CurrentMatchmakerAdmin, declare_permission, get_current_matchmaker_admin, require_sensitive_operation

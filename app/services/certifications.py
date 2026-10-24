@@ -166,9 +166,21 @@ async def get_certifications(db: AsyncSession, user_id: int) -> CertificationsRe
 
 
 async def submit_education(db: AsyncSession, user_id: int, body: EducationCertificationRequest) -> CertificationsResponse:
-    await db.execute(text("""INSERT INTO user_auth (user_id, education, education_verified, education_submitted_at)
-        VALUES (:id,:education,1,UTC_TIMESTAMP()) ON DUPLICATE KEY UPDATE education=:education,
-        education_verified=1, education_fail_reason=NULL, education_submitted_at=UTC_TIMESTAMP(), updated_at=UTC_TIMESTAMP()"""), {"id": user_id, **body.model_dump()})
+    """Legacy JSON 入口：只保存学历字段，不推进审核状态。
+
+    学历认证的审核中状态必须由 ``PUT /users/me/certifications/education/material``
+    在有学校与证件材料的前提下推进。旧入口原先直接把 ``education_verified`` 置 1，
+    会产生「用户端显示审核中、后台却没有任何材料可审」的假状态（用户端因此报
+    「未提交审核材料，但点去认证显示审核中」）。
+    """
+    await db.execute(text("""INSERT INTO user_auth (user_id, education, education_verified)
+        VALUES (:id, :education, 0)
+        ON DUPLICATE KEY UPDATE education = :education,
+            education_verified = CASE
+                WHEN education_cert IS NULL OR education_cert = '' THEN 0
+                ELSE education_verified
+            END,
+            updated_at = UTC_TIMESTAMP()"""), {"id": user_id, "education": body.education})
     await db.commit()
     return await get_certifications(db, user_id)
 

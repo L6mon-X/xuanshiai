@@ -54,13 +54,20 @@ class StubResult:
 
 
 class StubDB:
-    def __init__(self, results=None):
+    def __init__(self, results=None, *, auto_probe: bool = False):
         self.statements: list[tuple[str, dict]] = []
         self._results = list(results or [])
+        self._auto_probe = auto_probe
         self.committed = False
 
     async def execute(self, statement, params=None):
-        self.statements.append((str(statement), dict(params or {})))
+        sql = str(statement)
+        self.statements.append((sql, dict(params or {})))
+        # auto_probe：get_lead 会先探 information_schema 取可选列。这一步是实现
+        # 细节，不该占用业务结果队列——否则队列整体错位，手机号 tuple 会被当成
+        # 整行解包（dictionary update sequence element #0 has length 11）。
+        if self._auto_probe and "information_schema" in sql:
+            return StubResult(rows=[("id",), ("gender",), ("deleted_at",), ("wechat",)])
         if self._results:
             return self._results.pop(0)
         return StubResult()
@@ -181,7 +188,7 @@ def test_lead_serialization_masks_by_default_and_by_level() -> None:
 
 
 def _update_lead_db() -> StubDB:
-    """get_lead → _raw_contact(phone) → _raw_contact(wechat) → 冲突查询 → UPDATE → 审计 → get_lead"""
+    """get_lead → phone → wechat → 冲突查询 → UPDATE → 审计 → get_lead（探列自动应答）。"""
     return StubDB([
         StubResult(first=_lead_row()),
         StubResult(first=(PHONE,)),
@@ -190,7 +197,7 @@ def _update_lead_db() -> StubDB:
         StubResult(),                 # UPDATE
         StubResult(),                 # 审计
         StubResult(first=_lead_row()),
-    ])
+    ], auto_probe=True)
 
 
 @pytest.mark.asyncio
@@ -218,7 +225,7 @@ async def test_lead_update_still_writes_real_new_wechat() -> None:
         StubResult(),
         StubResult(),
         StubResult(first=_lead_row()),
-    ])
+    ], auto_probe=True)
     await update_lead(db, 1, 3, CustomerLeadUpdate(wechat="brand_new_id_77"))
     sql, params = next((s, p) for s, p in db.statements if s.startswith("UPDATE customer_lead"))
     assert params["wechat"] == "brand_new_id_77"
