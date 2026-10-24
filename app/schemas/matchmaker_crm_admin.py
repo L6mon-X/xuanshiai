@@ -1,7 +1,8 @@
 """Member CRM contracts for the independent matchmaker back office."""
 
 from datetime import date, datetime
-from typing import Literal
+from decimal import Decimal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -52,6 +53,36 @@ class MemberListItem(BaseModel):
     intention_level: int | None = None
     last_follow_at: datetime | None = None
     next_follow_at: datetime | None = None
+    # 2026-10-11 新增：会员资料页筛选与展示补列，迁移未执行时 SQL 侧兜底为 NULL/0。
+    source: str | None = None
+    region: str | None = None
+    cert_status: int | None = None
+    wechat_added: int | None = None
+    promoted: int | None = None
+    newcomer: int | None = None
+    activity_signup: int | None = None
+    level: str | None = None
+    fetched_at: datetime | None = None
+    assigned_at: datetime | None = None
+    abandoned: bool = False  # 弃海（member_abandonment 存在未捞回记录）
+    # 2026-10-24 补（B8/A12）：会员列表 4 个展示列 + 最后登录/IP 属地。
+    # 所需 JOIN（users u / user_profile p / user_auth ua）本已存在，纯 SELECT 补列；
+    # 迁移未执行时 SQL 侧按缺列降级返回 NULL，字段全部可选，不会让整页 500。
+    real_name: str | None = None
+    tags: dict[str, Any] | list[Any] | str | None = None
+    last_login_at: datetime | None = None
+    ip_location: str | None = None
+    # A12：积分余额取 user_points 流水最新一条 balance，无流水为 0（无需补列）。
+    points: int = Field(default=0, ge=0)
+    # A12-补列：累计登录次数取 users.login_num，缺列（迁移未执行）时降级为 None。
+    login_num: int | None = None
+    # A12-补列：IP 属地 / 手机号归属地取 users.ip_region / phone_region，
+    # 本轮仅展示不自动解析（缺列降级 None）；ip_location 仍为原始注册 IP。
+    ip_region: str | None = None
+    phone_region: str | None = None
+    # A12-钱包（余额）：取 account_ledger 中 account_type='user' 的可用余额，
+    # 与 finance.get_balance 口径一致（无流水为 0）；纯只读派生，不新建表。
+    balance: Decimal = Field(default=Decimal(0))
 
 
 class MemberPage(BaseModel):
@@ -69,7 +100,10 @@ class MemberDetail(MemberListItem):
     residence_city_code: str | None
     education: str | None = None
     job: str | None = None
-    tags: dict[str, list[str]] | list[str] | None = None
+    # B10：放宽 tags 出参类型。库里历史脏数据可能出现非列表值（如嵌套对象
+    # {"custom_categories": {}}），窄类型会让整个详情接口 500。这里接受任意合法
+    # JSON 结构，保证单个字段的形态差异不会拖垮整个响应。
+    tags: dict[str, Any] | list[Any] | str | None = None
     self_intro: str | None = None
     ideal_partner: str | None = None
     wechat: str | None = None
@@ -112,6 +146,14 @@ class MemberProfileUpdateResponse(BaseModel):
     reason: str
 
 
+class SourceDistributionItem(BaseModel):
+    """来源分布单项：value 为原始 source 值（空值归为 "" 表示未填写），label 用于展示。"""
+
+    value: str
+    label: str
+    count: int
+
+
 class MemberStatistics(BaseModel):
     total: int
     male: int
@@ -121,11 +163,32 @@ class MemberStatistics(BaseModel):
     unassigned: int = 0
     never_followed: int = 0
     follow_due_today: int = 0
+    abandoned: int = 0
+    # B5/A11：会员登记来源占比。含 source 为空的一档（value="" / label="未填写来源"），
+    # 供概览页环形图直接取用，避免前端并发多次列表倒推。
+    source_distribution: list[SourceDistributionItem] = []
+
+
+class MemberOption(BaseModel):
+    """下拉字典项：value 为接口筛选值，label 为界面展示文案。"""
+
+    value: str
+    label: str
+
+
+class MemberOptions(BaseModel):
+    """会员资料页筛选下拉的可选项。
+
+    门店/推广红娘在原界面里是写死的空下拉（选项未填充），这里按当前账号的数据
+    范围动态给值，避免「看得见选不了」。
+    """
+
+    organizations: list[MemberOption] = []
+    promoters: list[MemberOption] = []
 
 
 class MemberAssignmentUpdate(BaseModel):
     matchmaker_id: int | None = Field(default=None, ge=1, description="服务红娘用户 ID；传 null 表示取消分派")
-
 
 class MemberAssignmentResponse(BaseModel):
     user_id: int
@@ -161,3 +224,19 @@ class MatchRecordPage(BaseModel):
     page_size: int
     total: int
     has_more: bool
+
+
+class MatchRecordStatistics(BaseModel):
+    """顶部统计卡口径：待牵线=未分派红娘的待处理，牵线中=已分派红娘的待处理。"""
+
+    total: int
+    pending: int
+    matching: int
+    success: int
+    fail: int
+    closed: int
+
+
+class MatchRecordUpdate(BaseModel):
+    status: Literal[0, 1, 2, 3]
+    reason: str | None = Field(default=None, max_length=255)

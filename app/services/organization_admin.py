@@ -27,7 +27,8 @@ def _mask(phone: str | None) -> str | None:
 
 
 STORE_SELECT = """SELECT o.id, o.code, o.name, o.display_name, o.region_code,
-    o.link_url, o.sort_order, o.qr_code, o.status, o.auto_redirect, o.created_at, o.updated_at,
+    o.link_url, o.sort_order, o.qr_code, o.logo, o.address, o.commission_mode, o.commission_value, o.intro,
+    o.status, o.auto_redirect, o.created_at, o.updated_at,
     (SELECT COUNT(*) FROM organization_member om WHERE om.organization_id = o.id AND om.status = 1) member_count,
     (SELECT COUNT(*) FROM organization_member om WHERE om.organization_id = o.id AND om.status = 1
         AND om.role_code IN ('store_manager', 'store_matchmaker')) matchmaker_count
@@ -38,6 +39,8 @@ def _store_item(row) -> StoreAdminItem:
     data = dict(row)
     data["auto_redirect"] = bool(data["auto_redirect"])
     data["sort_order"] = int(data["sort_order"] or 0)
+    data["commission_mode"] = data.get("commission_mode") or "fixed"
+    data["commission_value"] = float(data.get("commission_value") or 0)
     return StoreAdminItem(**data)
 
 
@@ -72,11 +75,15 @@ async def create_store_admin(
 ) -> StoreAdminItem:
     try:
         result = await db.execute(text("""INSERT INTO organization
-            (org_type, code, name, display_name, region_code, link_url, sort_order, qr_code, auto_redirect, created_by)
-            VALUES ('store', :code, :name, :display_name, :region_code, :link_url, :sort_order, :qr_code, :auto_redirect, :created_by)"""), {
+            (org_type, code, name, display_name, region_code, link_url, sort_order, qr_code,
+             logo, address, commission_mode, commission_value, intro, auto_redirect, created_by)
+            VALUES ('store', :code, :name, :display_name, :region_code, :link_url, :sort_order, :qr_code,
+             :logo, :address, :commission_mode, :commission_value, :intro, :auto_redirect, :created_by)"""), {
             "code": body.code, "name": body.name, "display_name": body.display_name,
             "region_code": body.region_code, "link_url": body.link_url, "sort_order": body.sort_order,
-            "qr_code": body.qr_code, "auto_redirect": int(body.auto_redirect), "created_by": actor_id,
+            "qr_code": body.qr_code, "logo": body.logo, "address": body.address,
+            "commission_mode": body.commission_mode, "commission_value": body.commission_value,
+            "intro": body.intro, "auto_redirect": int(body.auto_redirect), "created_by": actor_id,
         })
         store_id = int(result.lastrowid)
     except IntegrityError:

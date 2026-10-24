@@ -376,11 +376,13 @@ DEFAULT_CONFIGS: dict[str, tuple[str, str, dict[str, Any], list[str]]] = {
         {"levels": [], "mode": "ratio", "default_ratio": 0}, [],
     ),
     "tools_customer_leads": (
-        "客源线索功能配置", "客源线索-功能配置：线索分配、跟进与保护规则。",
+        "客源线索功能配置", "客源线索-功能配置：线索分配、跟进与保护规则；含自由表单字段定义。",
         {"auto_assign": False, "protect_days": 30, "follow_up_tip": "",
          "abandon_days": 15, "daily_new_limit": 10,
          # 客源线索-功能配置页面字段（与前端 UI 一一对应）
-         "name_prefix": "客源", "link_promoter_on_convert": True, "show_converted_in_lead": True}, [],
+         "name_prefix": "客源", "link_promoter_on_convert": True, "show_converted_in_lead": True,
+         # 自由表单-字段管理：自定义字段与内置字段覆盖（内置字段默认值在前端 FIELD_ROWS）
+         "free_form_fields": [], "free_form_overrides": {}}, [],
     ),
     "tools_interactive_function": (
         "互动消息功能设置", "运营工具-互动消息：消息类型开关与频率限制。",
@@ -659,6 +661,74 @@ async def update_config(db: AsyncSession, admin_id: int, namespace: str, request
         "namespace": namespace, "version": next_version, "actor": admin_id, "summary": request.change_summary,
         "before": json.dumps(before, ensure_ascii=False), "after": json.dumps(request.config, ensure_ascii=False),
     })
+    await db.commit()
+    return await get_config(db, namespace)
+
+
+async def patch_config(
+    db: AsyncSession, admin_id: int, namespace: str, changes: dict[str, Any], summary: str
+) -> AdminConfigSnapshot:
+    """局部更新配置域：深度合并进当前版本，不要求客户端维护 version。
+
+    供第三方适配模块（短信/公众号/外呼/合同）的 ``GET|PUT /config`` 使用。
+    敏感键明文同样拒绝（422），版本与审计语义与 :func:`update_config` 一致。
+    """
+    _validate_namespace(namespace)
+    await ensure_defaults(db)
+    row = (
+        await db.execute(
+            text("SELECT * FROM admin_config_snapshot WHERE namespace=:namespace FOR UPDATE"),
+            {"namespace": namespace},
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(404, detail="配置域不存在")
+    sensitive_keys = set(json.loads(row["sensitive_keys_json"] or "[]"))
+    if _contains_plain_sensitive(changes, sensitive_keys):
+        raise HTTPException(422, detail="敏感配置必须通过环境变量或密钥管理系统注入，接口不接受明文")
+    current = json.loads(row["config_json"])
+    if not isinstance(current, dict):
+        raise HTTPException(409, detail="配置域格式异常，无法局部更新")
+
+    def _merge(target: Any, patch: Any) -> Any:
+        if isinstance(patch, dict):
+            result = dict(target) if isinstance(target, dict) else {}
+            for key, value in patch.items():
+                result[key] = _merge(result.get(key), value)
+            return result
+        if isinstance(patch, list):
+            return list(patch)
+        return patch
+
+    merged = _merge(current, changes)
+    next_version = int(row["version"]) + 1
+    await db.execute(
+        text(
+            """UPDATE admin_config_snapshot SET version=:version, config_json=:config_json,
+        updated_by=:updated_by, updated_at=UTC_TIMESTAMP() WHERE namespace=:namespace"""
+        ),
+        {
+            "namespace": namespace,
+            "version": next_version,
+            "config_json": json.dumps(merged, ensure_ascii=False),
+            "updated_by": admin_id,
+        },
+    )
+    await db.execute(
+        text(
+            """INSERT INTO admin_config_audit_log
+        (namespace, version, action, actor_user_id, change_summary, before_config_json, after_config_json)
+        VALUES (:namespace, :version, 'patch', :actor, :summary, :before, :after)"""
+        ),
+        {
+            "namespace": namespace,
+            "version": next_version,
+            "actor": admin_id,
+            "summary": summary,
+            "before": json.dumps(current, ensure_ascii=False),
+            "after": json.dumps(merged, ensure_ascii=False),
+        },
+    )
     await db.commit()
     return await get_config(db, namespace)
 

@@ -4,9 +4,11 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies import CurrentMatchmakerAdmin, get_current_matchmaker_admin
+from app.api.dependencies import CurrentMatchmakerAdmin, declare_permission, get_current_matchmaker_admin
 from app.db.session import get_db
+from app.schemas.admin_home import DashboardHonor, DashboardMonthlyDelta
 from app.schemas.matchmaker_dashboard_admin import MatchmakerDashboardStats
+from app.services import admin_home
 
 router = APIRouter(prefix="/admin/dashboard")
 
@@ -70,4 +72,20 @@ async def dashboard_stats(current: CurrentMatchmakerAdmin = Depends(get_current_
         (SELECT COUNT(*) FROM user_matchmaker_apply a WHERE a.application_type = 'service_matchmaker' AND a.status = 0 AND """ + apply_scope + """ ) AS pending_certification_count,
         (SELECT COUNT(*) FROM users u WHERE u.created_at >= CURDATE() AND """ + member_scope + """ ) AS today_new_member_count"""), params)).mappings().one()
     return MatchmakerDashboardStats(**{key: int(row[key] or 0) for key in MatchmakerDashboardStats.model_fields})
+
+
+@declare_permission("dashboard.read")
+@router.get("/honor", response_model=DashboardHonor, summary="光荣榜聚合（A11，近似口径只读）")
+async def dashboard_honor(current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> DashboardHonor:
+    """概览页光荣榜。牵线/约见按 D-16 作用域收口；活动数、脱单数为近似口径。"""
+    current.require("dashboard.read")
+    return await admin_home.honor(db, current)
+
+
+@declare_permission("dashboard.read")
+@router.get("/monthly-delta", response_model=DashboardMonthlyDelta, summary="统计卡本月增量（A11，只读）")
+async def dashboard_monthly_delta(current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> DashboardMonthlyDelta:
+    """概览页统计卡「本月 +X」。按现有表 created_at/start_at 自然月内计数，无补列/新表。"""
+    current.require("dashboard.read")
+    return await admin_home.monthly_delta(db, current)
 

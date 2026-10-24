@@ -81,6 +81,25 @@ _ORDER_BY = {
 }
 
 
+def _apply_scope(
+    where: list[str],
+    params: dict[str, Any],
+    scope: str | None,
+    scope_params: dict[str, Any] | None,
+) -> None:
+    """把四档作用域谓词并入查询（D-16）。
+
+    `partner_team` / `partner_membership` / `commission_entry` 自身都不带组织列，
+    归属信息只存在于 ``resource_assignment``；因此作用域谓词由路由层用
+    `CurrentMatchmakerAdmin.scope_exists_clause`（唯一实现）包装成 EXISTS 后下传，
+    服务层只负责拼接。
+    """
+    if not scope:
+        return
+    params.update(scope_params or {})
+    where.append(f"({scope})")
+
+
 def _dt(value: Any) -> datetime | None:
     if value is None:
         return None
@@ -138,9 +157,13 @@ async def list_partners(
     level_id: int | None = None,
     status: int | None = None,
     sort: str = "created_desc",
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> PartnerStaffPage:
     conditions = ["1 = 1"]
     params: dict[str, object] = {"limit": page_size, "offset": (page - 1) * page_size}
+    _apply_scope(conditions, params, scope, scope_params)
     if keyword:
         conditions.append(
             "(u.nickname LIKE CONCAT('%', :keyword, '%') "
@@ -177,7 +200,15 @@ async def list_partners(
     )
 
 
-async def partner_statistics(db: AsyncSession) -> PartnerStatistics:
+async def partner_statistics(
+    db: AsyncSession,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> PartnerStatistics:
+    where = ["1 = 1"]
+    params: dict[str, Any] = {}
+    _apply_scope(where, params, scope, scope_params)
     row = (
         await db.execute(
             text(
@@ -196,8 +227,10 @@ async def partner_statistics(db: AsyncSession) -> PartnerStatistics:
                 COALESCE(SUM((SELECT SUM(ce.amount) FROM commission_entry ce
                     WHERE ce.beneficiary_type = 'partner' AND ce.beneficiary_id = t.owner_user_id
                       AND ce.status <> 'REVERSED')), 0) AS total_commission
-                {_FROM_BODY}"""
-            )
+                {_FROM_BODY}
+                WHERE {' AND '.join(where)}"""
+            ),
+            params,
         )
     ).mappings().first()
     return PartnerStatistics(
@@ -247,10 +280,19 @@ async def _resolve_user_id(db: AsyncSession, body: PartnerStaffCreate) -> int:
     return int(user_id)
 
 
-async def get_partner(db: AsyncSession, team_id: int) -> PartnerStaffDetail:
+async def get_partner(
+    db: AsyncSession,
+    team_id: int,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> PartnerStaffDetail:
+    where = ["t.id = :id"]
+    params: dict[str, Any] = {"id": team_id}
+    _apply_scope(where, params, scope, scope_params)
     row = (
         await db.execute(
-            text(f"{_SELECT_BODY} WHERE t.id = :id"), {"id": team_id}
+            text(f"{_SELECT_BODY} WHERE {' AND '.join(where)}"), params
         )
     ).mappings().first()
     if not row:
@@ -273,12 +315,21 @@ async def get_partner(db: AsyncSession, team_id: int) -> PartnerStaffDetail:
 
 
 async def create_partner(
-    db: AsyncSession, actor_account_id: int, body: PartnerStaffCreate
+    db: AsyncSession,
+    actor_account_id: int,
+    body: PartnerStaffCreate,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> PartnerStaffDetail:
     user_id = await _resolve_user_id(db, body)
+    # 目标用户必须在当前账号的数据范围内，否则越权建档（D-16）。
+    user_where = ["id = :id", "status = 1"]
+    user_params: dict[str, Any] = {"id": user_id}
+    _apply_scope(user_where, user_params, scope, scope_params)
     user = (
         await db.execute(
-            text("SELECT id, nickname FROM users WHERE id = :id AND status = 1"), {"id": user_id}
+            text(f"SELECT id, nickname FROM users WHERE {' AND '.join(user_where)}"), user_params
         )
     ).mappings().first()
     if not user:
@@ -343,19 +394,32 @@ async def create_partner(
         },
     )
     await db.commit()
-    return await get_partner(db, team_id)
+    return await get_partner(db, team_id, scope=scope, scope_params=scope_params)
 
 
 async def update_partner(
-    db: AsyncSession, team_id: int, body: PartnerStaffUpdate, actor_account_id: int
+    db: AsyncSession,
+    team_id: int,
+    body: PartnerStaffUpdate,
+    actor_account_id: int,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> PartnerStaffDetail:
-    existing = await get_partner(db, team_id)
+    existing = await get_partner(db, team_id, scope=scope, scope_params=scope_params)
     values = body.model_dump(exclude_unset=True)
+    # API 字段名与表列名并非一一对应：请求体用 team_name，partner_team 的列叫 name。
+    # 直接按字段名拼列名会生成 `team_name` = ...，MySQL 报 1054 Unknown column。
+    if "team_name" in values:
+        values["name"] = values.pop("team_name")
     if values:
         assignments = ", ".join(f"`{key}` = :{key}" for key in values)
+        update_where = ["id = :id"]
+        update_params: dict[str, Any] = {**values, "id": team_id}
+        _apply_scope(update_where, update_params, scope, scope_params)
         await db.execute(
-            text(f"UPDATE partner_team SET {assignments}, updated_at = UTC_TIMESTAMP() WHERE id = :id"),
-            {**values, "id": team_id},
+            text(f"UPDATE partner_team SET {assignments}, updated_at = UTC_TIMESTAMP() WHERE {' AND '.join(update_where)}"),
+            update_params,
         )
         await db.execute(
             text("""INSERT INTO business_audit_log
@@ -372,12 +436,19 @@ async def update_partner(
             },
         )
         await db.commit()
-    return await get_partner(db, team_id) if values else existing
+    return await get_partner(db, team_id, scope=scope, scope_params=scope_params) if values else existing
 
 
-async def delete_partner(db: AsyncSession, team_id: int, actor_account_id: int) -> dict[str, Any]:
+async def delete_partner(
+    db: AsyncSession,
+    team_id: int,
+    actor_account_id: int,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """关闭合伙人：把团队置为关闭、成员关系全部移出，并撤销 partner 角色。"""
-    partner = await get_partner(db, team_id)
+    partner = await get_partner(db, team_id, scope=scope, scope_params=scope_params)
     await db.execute(
         text("""UPDATE partner_membership
             SET status = 2, left_at = UTC_TIMESTAMP(), changed_by = :actor,
@@ -385,9 +456,12 @@ async def delete_partner(db: AsyncSession, team_id: int, actor_account_id: int) 
             WHERE team_id = :team_id AND status = 1"""),
         {"team_id": team_id, "actor": actor_account_id},
     )
+    close_where = ["id = :id"]
+    close_params: dict[str, Any] = {"id": team_id}
+    _apply_scope(close_where, close_params, scope, scope_params)
     await db.execute(
-        text("UPDATE partner_team SET status = 2, updated_at = UTC_TIMESTAMP() WHERE id = :id"),
-        {"id": team_id},
+        text(f"UPDATE partner_team SET status = 2, updated_at = UTC_TIMESTAMP() WHERE {' AND '.join(close_where)}"),
+        close_params,
     )
     await db.execute(
         text("""UPDATE user_role SET status = 3, revoked_at = UTC_TIMESTAMP(),
@@ -453,9 +527,13 @@ async def list_relations(
     team_id: int | None = None,
     keyword: str | None = None,
     status: int | None = None,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> PartnerRelationPage:
     conditions = ["1 = 1"]
     params: dict[str, object] = {"limit": page_size, "offset": (page - 1) * page_size}
+    _apply_scope(conditions, params, scope, scope_params)
     if team_id is not None:
         conditions.append("pm.team_id = :team_id")
         params["team_id"] = team_id
@@ -478,7 +556,8 @@ async def list_relations(
             await db.execute(
                 text(
                     f"""SELECT COUNT(*) FROM partner_membership pm
-                    JOIN users u ON u.id = pm.promoter_id WHERE {where}"""
+                    JOIN users u ON u.id = pm.promoter_id
+                    LEFT JOIN partner_team t ON t.id = pm.team_id WHERE {where}"""
                 ),
                 {k: v for k, v in params.items() if k not in {"limit", "offset"}},
             )
@@ -494,18 +573,27 @@ async def list_relations(
     )
 
 
-async def list_team_options(db: AsyncSession) -> list[PartnerTeamOption]:
-    """团队下拉：只取 status=1 的团队，供人工绑定与筛选使用。"""
+async def list_team_options(
+    db: AsyncSession,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> list[PartnerTeamOption]:
+    """团队下拉：只取 status=1 的团队，供人工绑定与筛选使用（带数据范围，D-16）。"""
+    where = ["t.status = 1"]
+    params: dict[str, Any] = {}
+    _apply_scope(where, params, scope, scope_params)
     rows = await db.execute(
         text(
-            """SELECT t.id, t.name, t.owner_user_id, u.nickname AS owner_name,
+            f"""SELECT t.id, t.name, t.owner_user_id, u.nickname AS owner_name,
                 t.level_id, lc.level_name
             FROM partner_team t
             LEFT JOIN users u ON u.id = t.owner_user_id
             LEFT JOIN partner_level_config lc ON lc.level_id = t.level_id
-            WHERE t.status = 1
+            WHERE {' AND '.join(where)}
             ORDER BY t.id DESC"""
-        )
+        ),
+        params,
     )
     return [
         PartnerTeamOption(
@@ -521,13 +609,21 @@ async def list_team_options(db: AsyncSession) -> list[PartnerTeamOption]:
 
 
 async def bind_relation(
-    db: AsyncSession, body: PartnerRelationBind, actor_account_id: int
+    db: AsyncSession,
+    body: PartnerRelationBind,
+    actor_account_id: int,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> PartnerRelationResult:
     """人工绑定：已在其它团队的推广红娘先记录为「变更」移出，再落到目标团队。"""
+    team_where = ["t.id = :id", "t.status = 1"]
+    team_params: dict[str, Any] = {"id": body.team_id}
+    _apply_scope(team_where, team_params, scope, scope_params)
     team = (
         await db.execute(
-            text("SELECT id, name FROM partner_team WHERE id = :id AND status = 1"),
-            {"id": body.team_id},
+            text(f"SELECT t.id, t.name FROM partner_team t WHERE {' AND '.join(team_where)}"),
+            team_params,
         )
     ).mappings().first()
     if not team:
@@ -607,12 +703,24 @@ async def bind_relation(
 
 
 async def remove_relation(
-    db: AsyncSession, relation_id: int, body: PartnerRelationRemove, actor_account_id: int
+    db: AsyncSession,
+    relation_id: int,
+    body: PartnerRelationRemove,
+    actor_account_id: int,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> PartnerRelationResult:
+    where = ["pm.id = :id"]
+    params: dict[str, Any] = {"id": relation_id}
+    _apply_scope(where, params, scope, scope_params)
     relation = (
         await db.execute(
-            text("SELECT id, promoter_id, team_id, status FROM partner_membership WHERE id = :id"),
-            {"id": relation_id},
+            text(f"""SELECT pm.id, pm.promoter_id, pm.team_id, pm.status
+                FROM partner_membership pm
+                LEFT JOIN partner_team t ON t.id = pm.team_id
+                WHERE {' AND '.join(where)}"""),
+            params,
         )
     ).mappings().first()
     if not relation:
@@ -704,9 +812,13 @@ async def list_commission_entries(
     rule_id: int | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> PartnerCommissionEntryPage:
     conditions = ["ce.beneficiary_type = 'partner'"]
     params: dict[str, object] = {"limit": page_size, "offset": (page - 1) * page_size}
+    _apply_scope(conditions, params, scope, scope_params)
     if partner_id is not None:
         conditions.append("ce.beneficiary_id = :partner_id")
         params["partner_id"] = partner_id
@@ -744,16 +856,25 @@ async def list_commission_entries(
     )
 
 
-async def commission_entry_options(db: AsyncSession) -> PartnerCommissionEntryOptions:
+async def commission_entry_options(
+    db: AsyncSession,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> PartnerCommissionEntryOptions:
+    opt_where = ["t.status = 1"]
+    opt_params: dict[str, Any] = {}
+    _apply_scope(opt_where, opt_params, scope, scope_params)
     partner_rows = await db.execute(
         text(
-            """SELECT t.owner_user_id AS id, t.id AS team_id, t.name AS team_name,
+            f"""SELECT t.owner_user_id AS id, t.id AS team_id, t.name AS team_name,
                 u.nickname AS name, u.avatar
             FROM partner_team t
             JOIN users u ON u.id = t.owner_user_id
-            WHERE t.status = 1
+            WHERE {' AND '.join(opt_where)}
             ORDER BY t.id DESC"""
-        )
+        ),
+        opt_params,
     )
     rule_rows = await db.execute(
         text(
@@ -784,12 +905,18 @@ async def create_commission_entry(
     db: AsyncSession,
     actor_account_id: int,
     body: PartnerCommissionEntryCreate,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> PartnerCommissionEntryCreateResult:
     """后台手工录入一笔合伙人分成：写 commission_entry + account_ledger（计入合伙人余额）。"""
+    team_where = ["t.owner_user_id = :uid", "t.status = 1"]
+    team_params: dict[str, Any] = {"uid": body.partner_user_id}
+    _apply_scope(team_where, team_params, scope, scope_params)
     team = (
         await db.execute(
-            text("SELECT id, name FROM partner_team WHERE owner_user_id = :uid AND status = 1"),
-            {"uid": body.partner_user_id},
+            text(f"SELECT t.id, t.name FROM partner_team t WHERE {' AND '.join(team_where)}"),
+            team_params,
         )
     ).mappings().first()
     if not team:

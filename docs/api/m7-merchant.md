@@ -35,6 +35,19 @@
 
 路径子串映射见 `app/api/dependencies.py`。
 
+### 1.2.1 数据范围（D-16 收口，2026-10-12 批次 B）
+
+商家管理 / 商品管理 / 商家订单的**全部后台端点**已接入 `get_current_matchmaker_admin` 的**四档数据范围**（`ALL / SELF / STORE / ORGANIZATION`）：
+
+| 资源 | 归属锚点 | 关联 |
+|---|---|---|
+| 商家（含商品、订单经 `merchant_id` 间接归属） | `merchant.admin_user_id` | `scope_assignment.user_id = m.admin_user_id` |
+
+- 商品列表 / 订单列表的**计数 SQL 也带 JOIN**（`LEFT JOIN merchant m`）以复用同一谓词。
+- `create_merchant` 走「INSERT 后同事务带 scope 再查 → 越权 `rollback` 并 404」，不落脏数据。
+- 「商家分类」（`merchant_category`）为**全局配置表，不收敛**，仅权限码约束。
+- 越权读统一 **404**；越权写不落库；未绑定组织/红娘 → **fail-closed**（`1 = 0`）。完整口径见 `后台数据范围与敏感操作-2026-10-04.md` §1.3.1。
+
 ### 1.3 响应与异常
 
 - 分页壳 `{ items, page, page_size, total, has_more }`，字典下拉直接 list。
@@ -373,3 +386,4 @@ CREATE TABLE `merchant_order` (
 ## 十一、变更记录
 
 - **2026-09-12 v1.0** —— M7-B 首版（商家 + 商品 + 订单 + 配置）
+- **2026-10-11 v1.1** —— `GET /admin/merchant-orders` 与 `GET /admin/merchant-orders/export` 新增 `search_type`（`product` 按商品关键词 / `phone` 按买家手机），用于指定 `keyword` 的匹配目标；默认 `product`，与历史行为一致，向后兼容。完整契约见 `docs/api/后台筛选参数补全-2026-10-11.md`

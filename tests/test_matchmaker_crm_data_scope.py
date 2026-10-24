@@ -23,6 +23,27 @@ from app.schemas.matchmaker_admin import MatchmakerAdminAccount
 SELF_MATCHMAKER_USER_ID = 7
 ORGANIZATION_ID = 10
 
+# `members()` 在 2026-10-11 补齐后台筛选参数后新增的 query 参数。单元测试直接调用路由
+# 函数（不经 FastAPI 解析），未显式传值的参数拿到的是 `Query` 默认对象而不是 None，
+# 因此这里显式补齐；新增参数时同步补充本字典。
+NEW_MEMBER_FILTER_DEFAULTS: dict[str, object] = {
+    "search_type": None, "source": None, "region": None, "xiangqin_status": None,
+    "realname": None, "cert_status": None, "organization_id": None, "matchmaker_id": None,
+    "promoter_id": None, "age_min": None, "age_max": None, "height_min": None,
+    "height_max": None, "marriage": None, "education": None, "occupation": None,
+    "income": None, "income_min": None, "income_max": None,
+    "residence": None, "hometown": None, "hukou": None, "religion": None,
+    "car": None, "level": None, "tags": None, "offline_vip": None, "promoted": None,
+    "newcomer": None, "activity_signup": None, "wechat_added": None, "behavior_type": None,
+    "created_start": None, "created_end": None, "assigned_start": None, "assigned_end": None,
+    "order": None,
+    # 2026-10-16/17 新增：列表可见但无查询参数的列，以及收入上下限。
+    "intention_level": None, "house": None, "ethnicity": None,
+    "constellation": None, "zodiac": None,
+    # A9/B3：弃海筛选（true仅弃海 / false排除弃海）。
+    "abandoned": None,
+}
+
 
 def _admin(scope: str, *, permissions: set[str] | None = None, matchmaker_user_id: int | None = SELF_MATCHMAKER_USER_ID, organization_id: int | None = ORGANIZATION_ID) -> CurrentMatchmakerAdmin:
     return CurrentMatchmakerAdmin(
@@ -44,12 +65,13 @@ def _admin(scope: str, *, permissions: set[str] | None = None, matchmaker_user_i
 class StubResult:
     """最小可用结果对象，按需返回行 / 标量。"""
 
-    def __init__(self, *, rows=None, scalar=None, first=None, one=None, rowcount=0):
+    def __init__(self, *, rows=None, scalar=None, first=None, one=None, rowcount=0, lastrowid=1):
         self._rows = list(rows or [])
         self._scalar = scalar
         self._first = first
         self._one = one
         self.rowcount = rowcount
+        self.lastrowid = lastrowid
 
     def all(self):
         return list(self._rows)
@@ -76,6 +98,7 @@ class StubDB:
         self.statements: list[tuple[str, dict]] = []
         self._results = list(results or [])
         self.committed = False
+        self.rolled_back = False
 
     async def execute(self, statement, params=None):
         self.statements.append((str(statement), dict(params or {})))
@@ -90,8 +113,15 @@ class StubDB:
     async def commit(self):
         self.committed = True
 
+    async def rollback(self):
+        self.rolled_back = True
+
     def sql(self) -> str:
         return "\n".join(text for text, _ in self.statements)
+
+
+# D-9：改派 / 批量改状态已纳入统一幂等，直调服务层须显式传 idempotency_key。
+IDEMPOTENCY_KEY = "crm-scope-test-key"
 
 
 # --------------------------------------------------------------------------- #
@@ -178,6 +208,7 @@ async def test_member_list_applies_scope_predicate() -> None:
         sort_by="created_at",
         current=_admin("SELF"),
         db=db,
+        **NEW_MEMBER_FILTER_DEFAULTS,
     )
     assert page.total == 0
     assert "scope_assignment.matchmaker_id = :scope_matchmaker_user_id" in db.sql()
@@ -200,6 +231,7 @@ async def test_member_list_filters_by_organization_for_org_account() -> None:
         sort_by="created_at",
         current=_admin("ORGANIZATION"),
         db=db,
+        **NEW_MEMBER_FILTER_DEFAULTS,
     )
     assert "scope_assignment.organization_id IN (SELECT id FROM organization" in db.sql()
     assert db.statements[1][1]["scope_organization_id"] == ORGANIZATION_ID
@@ -221,6 +253,7 @@ async def test_member_list_returns_nothing_for_unbound_account() -> None:
         sort_by="created_at",
         current=_admin("ORGANIZATION", matchmaker_user_id=None, organization_id=None),
         db=db,
+        **NEW_MEMBER_FILTER_DEFAULTS,
     )
     assert page.total == 0
     assert "1 = 0" in db.sql()
@@ -228,13 +261,16 @@ async def test_member_list_returns_nothing_for_unbound_account() -> None:
 
 @pytest.mark.asyncio
 async def test_member_statistics_scopes_vip_subquery() -> None:
-    keys = ("total", "male", "female", "vip", "active", "unassigned", "never_followed", "follow_due_today")
+    keys = ("total", "male", "female", "vip", "active", "unassigned", "never_followed", "follow_due_today", "abandoned")
     db = StubDB([StubResult(one={key: 0 for key in keys})])
     stats = await crm.member_statistics(current=_admin("STORE"), db=db)
     assert stats.total == 0
+    assert stats.abandoned == 0
     assert db.statements[0][1].get("scope_store_id") == ORGANIZATION_ID
     # VIP 子查询必须使用独立别名同口径收口，禁止统计全平台 VIP。
     assert "vip_scope_assignment.user_id = vm.user_id" in db.sql()
+    # 弃海计数同样必须收口到账号数据范围（A9/B3）。
+    assert "abandoned_scope_assignment.user_id = au.id" in db.sql()
     assert "org_type = 'store'" in db.sql()
 
 
@@ -292,35 +328,57 @@ async def test_member_assignment_out_of_scope_is_rejected() -> None:
         await crm.member_assignment(
             member_id=99,
             body=crm.MemberAssignmentUpdate(matchmaker_id=5),
+            idempotency_key=IDEMPOTENCY_KEY,
             current=_admin("ORGANIZATION"),
             db=db,
         )
     assert exc.value.status_code == 404
     assert "scope_assignment.organization_id" in db.statements[0][0]
     assert db.committed is False
+    # 越权在幂等预占之前拦截，不留幂等残留行。
+    assert not any("api_idempotency_record" in s for s, _ in db.statements)
 
 
 @pytest.mark.asyncio
 async def test_batch_member_status_update_is_scoped_for_unbound_account() -> None:
-    db = StubDB([StubResult(scalar=0)])
+    db = StubDB([StubResult(lastrowid=1), StubResult(rows=[]), StubResult(rowcount=0), StubResult(rowcount=1)])
     result = await crm.batch_member_status(
         body=crm.MemberBatchStatus(member_ids=[1, 2, 3], status=2, reason="批量越权测试"),
+        idempotency_key=IDEMPOTENCY_KEY,
         current=_admin("ORGANIZATION", matchmaker_user_id=None, organization_id=None),
         db=db,
     )
     assert result["updated"] == 0
-    assert "1 = 0" in db.statements[0][0]
+    assert result["rejected_ids"] == [1, 2, 3]
+    assert "1 = 0" in db.sql()
 
 
 @pytest.mark.asyncio
 async def test_batch_member_status_allows_platform_account() -> None:
-    db = StubDB([StubResult(scalar=0)])
+    db = StubDB([StubResult(lastrowid=1), StubResult(rows=[(1,)]), StubResult(rowcount=1), StubResult(rowcount=1)])
     await crm.batch_member_status(
         body=crm.MemberBatchStatus(member_ids=[1], status=2, reason="平台批量"),
+        idempotency_key=IDEMPOTENCY_KEY,
         current=_admin("ALL"),
         db=db,
     )
-    assert "AND (1 = 1)" in db.statements[0][0]
+    assert "AND (1 = 1)" in db.sql()
+
+
+@pytest.mark.asyncio
+async def test_batch_member_status_uses_idempotency_operation() -> None:
+    """D-9：批量改状态必须落统一幂等预占（operation + idempotency_key）。"""
+    db = StubDB([StubResult(lastrowid=1), StubResult(rows=[(1,)]), StubResult(rowcount=1), StubResult(rowcount=1)])
+    await crm.batch_member_status(
+        body=crm.MemberBatchStatus(member_ids=[1], status=2, reason="幂等校验"),
+        idempotency_key=IDEMPOTENCY_KEY,
+        current=_admin("ALL"),
+        db=db,
+    )
+    reserve_sql, reserve_params = db.statements[0]
+    assert "INSERT INTO api_idempotency_record" in reserve_sql
+    assert reserve_params["operation"] == "matchmaker.member.batch_status"
+    assert reserve_params["idempotency_key"] == IDEMPOTENCY_KEY
 
 
 # --------------------------------------------------------------------------- #
@@ -347,7 +405,36 @@ async def test_member_auth_list_is_scoped() -> None:
 @pytest.mark.asyncio
 async def test_match_records_are_scoped_by_from_user() -> None:
     db = StubDB([StubResult(rows=[]), StubResult(scalar=0)])
-    page = await crm.match_records(page=1, page_size=20, search=None, current=_admin("SELF"), db=db)
+    page = await crm.match_records(
+        page=1, page_size=20, search=None, date_from=None, date_to=None,
+        matchmaker_id=None, status_group=None, current=_admin("SELF"), db=db,
+    )
     assert page.total == 0
     assert "scope_assignment.user_id = a.from_user_id" in db.statements[0][0]
     assert "scope_matchmaker_user_id" in db.statements[1][0]
+
+
+@pytest.mark.asyncio
+async def test_match_records_filter_by_date_and_matchmaker() -> None:
+    """牵线记录页的日期区间与红娘筛选必须落到真实列上。
+
+    回归点：`ra`（归属红娘派生表）原先只加在 SELECT 段，COUNT 查询没有它，
+    一旦按红娘筛选，计数 SQL 就会因缺 join 直接报错。
+    """
+    db = StubDB([StubResult(rows=[]), StubResult(scalar=0)])
+    await crm.match_records(
+        page=1, page_size=20, search=None,
+        date_from="2026-01-01", date_to="2026-12-31", matchmaker_id=5, status_group=None,
+        current=_admin("SELF"), db=db,
+    )
+    rows_sql, rows_params = db.statements[0]
+    count_sql, count_params = db.statements[1]
+    assert "a.created_at >= :date_from" in rows_sql
+    # 结束日按「含当日」处理，补到次日 00:00 前
+    assert "a.created_at < DATE_ADD(:date_to, INTERVAL 1 DAY)" in rows_sql
+    assert "ra.matchmaker_id = :matchmaker_id" in rows_sql
+    assert rows_params["date_from"] == "2026-01-01" and rows_params["matchmaker_id"] == 5
+    # COUNT 必须同样带 join，否则按红娘筛选时计数报错
+    assert "resource_assignment" in count_sql
+    assert "ra.matchmaker_id = :matchmaker_id" in count_sql
+    assert count_params["matchmaker_id"] == 5

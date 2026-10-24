@@ -118,6 +118,20 @@ def test_partner_update_requires_at_least_one_field() -> None:
     assert PartnerStaffUpdate(level_id=2).level_id == 2
 
 
+def test_partner_update_maps_team_name_to_real_column() -> None:
+    """`team_name` 是 API 字段，partner_team 的列叫 `name`。
+
+    回归点：update_partner 曾按字段名直接拼列名，生成 `team_name` = :team_name，
+    MySQL 报 1054 Unknown column 'team_name'，编辑合伙人必 500。
+    """
+    source = inspect.getsource(partner_service.update_partner)
+    assert 'values.pop("team_name")' in source, "team_name 必须先映射到 name 再拼 UPDATE"
+    assert 'values["name"]' in source
+    # 其余可更新字段与列名一致，不应被改名
+    for field in ("level_id", "status", "open_mode"):
+        assert field in PartnerStaffUpdate.model_fields
+
+
 def test_partner_item_money_fields_are_str() -> None:
     item = PartnerStaffItem(
         id=1,

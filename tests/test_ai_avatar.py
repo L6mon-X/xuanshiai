@@ -635,3 +635,139 @@ def test_ai_avatar_message_exposes_optional_bounded_idempotency_key() -> None:
     )
     assert schema["minLength"] == 1
     assert schema["maxLength"] == 128
+
+
+def test_ai_avatar_uses_one_shared_daily_quota_key_and_limit() -> None:
+    import inspect
+
+    source = inspect.getsource(ai_avatar._consume_quota)
+    assert 'daily_quota_key("ai-avatar", viewer_user_id)' in source
+    assert "settings.ai_avatar_daily_limit" in source
+    assert 'daily_quota_key("ai-avatar", viewer_id)' in inspect.getsource(
+        ai_avatar.send_ai_message
+    )
+
+
+# ---------------------------------------------------------------------------
+# FIX-04（AI-08）：分身调用审计链路 —— 成功/失败终态共用入站请求编号。
+# ---------------------------------------------------------------------------
+
+
+def _avatar_provider_context() -> ai_avatar.AiAvatarContext:
+    return ai_avatar.AiAvatarContext(
+        profile=AiAvatarProfileResponse(id=2, name="测试用户", interests=["徒步"]),
+        public_posts=(),
+    )
+
+
+def _enable_avatar_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ai_avatar.settings, "ai_master_enabled", True)
+    monkeypatch.setattr(ai_avatar.settings, "ai_avatar_provider", "openai_compatible")
+    monkeypatch.setattr(ai_avatar.settings, "ai_avatar_base_url", "https://provider.example/v1")
+    monkeypatch.setattr(ai_avatar.settings, "ai_avatar_model", "test-model")
+    monkeypatch.setattr(ai_avatar.settings, "ai_avatar_api_key", None)
+
+
+def _mock_http(monkeypatch: pytest.MonkeyPatch, handler) -> None:
+    original_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+
+    def client_factory(**kwargs: object) -> httpx.AsyncClient:
+        return original_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(ai_avatar.httpx, "AsyncClient", client_factory)
+
+
+def _capture_audit(monkeypatch: pytest.MonkeyPatch) -> list:
+    events: list = []
+
+    async def fake_record(event) -> None:
+        events.append(event)
+
+    monkeypatch.setattr(ai_avatar, "record_generation_audit", fake_record)
+    return events
+
+
+@pytest.mark.asyncio
+async def test_avatar_audit_success_uses_inbound_request_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": "这是 AI 回答。"}}]})
+
+    _enable_avatar_provider(monkeypatch)
+    _mock_http(monkeypatch, handler)
+    events = _capture_audit(monkeypatch)
+    token = ai_avatar.request_id_context.set("req-inbound-001")
+    try:
+        reply = await ai_avatar.call_ai_provider(_avatar_provider_context(), [], "你好")
+    finally:
+        ai_avatar.request_id_context.reset(token)
+    assert reply == "这是 AI 回答。"
+    assert len(events) == 1
+    event = events[0]
+    assert event.request_id == "req-inbound-001"
+    assert event.status == "succeeded"
+    assert event.error_code is None
+    assert event.duration_ms is not None
+
+
+@pytest.mark.asyncio
+async def test_avatar_audit_timeout_records_failed_with_same_request_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("timed out", request=request)
+
+    _enable_avatar_provider(monkeypatch)
+    _mock_http(monkeypatch, handler)
+    events = _capture_audit(monkeypatch)
+    token = ai_avatar.request_id_context.set("req-inbound-002")
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            await ai_avatar.call_ai_provider(_avatar_provider_context(), [], "你好")
+    finally:
+        ai_avatar.request_id_context.reset(token)
+    assert exc_info.value.status_code == 504
+    assert len(events) == 1
+    event = events[0]
+    assert event.request_id == "req-inbound-002"
+    assert event.status == "failed"
+    assert event.error_code == "AI_TIMEOUT"
+
+
+@pytest.mark.asyncio
+async def test_avatar_audit_http_error_records_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "upstream"})
+
+    _enable_avatar_provider(monkeypatch)
+    _mock_http(monkeypatch, handler)
+    events = _capture_audit(monkeypatch)
+    with pytest.raises(HTTPException) as exc_info:
+        await ai_avatar.call_ai_provider(_avatar_provider_context(), [], "你好")
+    assert exc_info.value.status_code == 503
+    assert len(events) == 1
+    assert events[0].status == "failed"
+    assert events[0].error_code == "AI_PROVIDER_ERROR"
+    assert events[0].request_id != "-"
+
+
+@pytest.mark.asyncio
+async def test_avatar_audit_invalid_response_records_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"unexpected": "shape"})
+
+    _enable_avatar_provider(monkeypatch)
+    _mock_http(monkeypatch, handler)
+    events = _capture_audit(monkeypatch)
+    with pytest.raises(HTTPException) as exc_info:
+        await ai_avatar.call_ai_provider(_avatar_provider_context(), [], "你好")
+    assert exc_info.value.status_code == 503
+    assert len(events) == 1
+    assert events[0].status == "failed"
+    assert events[0].error_code == "AI_INVALID_RESPONSE"

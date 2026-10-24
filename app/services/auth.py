@@ -2,16 +2,19 @@
 
 import asyncio
 import hashlib
+import json
 import secrets
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import httpx
 from fastapi import HTTPException
+from redis.exceptions import RedisError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.redis import SMS_COMPENSATE_LUA, SMS_ISSUE_LUA, redis_client
 from app.core.security import (
     create_token,
     encrypt_sensitive,
@@ -42,16 +45,122 @@ def normalize_user_agent(user_agent: str | None) -> str | None:
 
 
 class SmsStore:
-    """Process-local fallback for development; production must use Redis."""
+    """短信验证码存储。
+
+    D-20：以 Redis 为唯一真源（多实例一致、重启不丢），键带 TTL。
+    开发/测试环境在 Redis 不可用时退回进程内字典；生产环境 Redis 不可用时
+    fail-closed（503），绝不降级为进程内状态。
+    """
 
     def __init__(self) -> None:
         self._items: dict[tuple[str, str], dict[str, Any]] = {}
         self._daily: dict[tuple[str, str], tuple[date, int]] = {}
         self._lock = asyncio.Lock()
 
-    async def issue(self, phone: str, purpose: str, ip: str, device_id: str | None) -> int:
-        if settings.sms_provider.lower() == "disabled":
-            await get_sms_provider().send_code(phone, purpose, "")
+    # ---- Redis 键 ----
+    @staticmethod
+    def _code_key(phone: str, purpose: str) -> str:
+        return f"sms:code:{phone}:{purpose}"
+
+    @staticmethod
+    def _interval_key(phone: str, purpose: str) -> str:
+        return f"sms:interval:{phone}:{purpose}"
+
+    @staticmethod
+    def _daily_key(phone: str, purpose: str) -> str:
+        return f"sms:daily:{phone}:{purpose}:{datetime.now(UTC).date().isoformat()}"
+
+    @staticmethod
+    def _fallback_enabled() -> bool:
+        return settings.environment in {"development", "testing"}
+
+    @staticmethod
+    def _seconds_to_utc_midnight(now: datetime) -> int:
+        reset_at = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        return max(60, int((reset_at - now).total_seconds()))
+
+    # ---- Redis 实现 ----
+    async def _issue_redis(self, phone: str, purpose: str, ip: str, device_id: str | None, code: str) -> str:
+        now = datetime.now(UTC)
+        interval_key = self._interval_key(phone, purpose)
+        daily_key = self._daily_key(phone, purpose)
+        payload = json.dumps(
+            {
+                "hash": hash_passwordless_code(code),
+                "sent_at": now.isoformat(),
+                "expires_at": (now + timedelta(seconds=settings.sms_code_expire_seconds)).isoformat(),
+                "attempts": 0,
+                "locked_until": None,
+                "ip": ip,
+                "device_id": device_id,
+            },
+            ensure_ascii=False,
+        )
+        result = await redis_client.eval(
+            SMS_ISSUE_LUA,
+            3,
+            interval_key,
+            daily_key,
+            self._code_key(phone, purpose),
+            settings.sms_send_interval_seconds,
+            settings.sms_daily_limit,
+            self._seconds_to_utc_midnight(now),
+            payload,
+            settings.sms_code_expire_seconds,
+        )
+        if int(result) == -1:
+            ttl = await redis_client.ttl(interval_key)
+            retry = int(ttl) if isinstance(ttl, int) and ttl > 0 else settings.sms_send_interval_seconds
+            raise HTTPException(429, detail=f"发送过于频繁，请{max(1, retry)}秒后重试")
+        if int(result) == -2:
+            raise HTTPException(429, detail="今日验证码发送次数已达上限")
+        return payload
+
+    async def _compensate_redis(self, phone: str, purpose: str, payload: str) -> None:
+        await redis_client.eval(
+            SMS_COMPENSATE_LUA,
+            3,
+            self._interval_key(phone, purpose),
+            self._daily_key(phone, purpose),
+            self._code_key(phone, purpose),
+            payload,
+        )
+
+    async def _rollback_local(self, phone: str, purpose: str) -> None:
+        async with self._lock:
+            key = (phone, purpose)
+            if key in self._items:
+                self._items.pop(key, None)
+                day, count = self._daily.get(key, (datetime.now(UTC).date(), 0))
+                self._daily[key] = (day, max(0, count - 1))
+
+    async def _verify_redis(self, phone: str, purpose: str, code: str) -> None:
+        key = self._code_key(phone, purpose)
+        raw = await redis_client.get(key)
+        if not raw:
+            raise HTTPException(400, detail="验证码不存在或已过期")
+        item = json.loads(raw)
+        now = datetime.now(UTC)
+        locked_until = item.get("locked_until")
+        if locked_until and datetime.fromisoformat(locked_until) > now:
+            raise HTTPException(429, detail="验证码错误次数过多，请稍后重试")
+        if datetime.fromisoformat(item["expires_at"]) <= now:
+            await redis_client.delete(key)
+            raise HTTPException(400, detail="验证码已过期")
+        ttl = await redis_client.ttl(key)
+        ttl = int(ttl) if isinstance(ttl, int) and ttl > 0 else settings.sms_code_expire_seconds
+        if not secrets.compare_digest(item["hash"], hash_passwordless_code(code)):
+            item["attempts"] = int(item.get("attempts") or 0) + 1
+            if item["attempts"] >= 3:
+                item["locked_until"] = (now + timedelta(minutes=15)).isoformat()
+                await redis_client.set(key, json.dumps(item, ensure_ascii=False), ex=ttl)
+                raise HTTPException(429, detail="验证码错误次数过多，请15分钟后重试")
+            await redis_client.set(key, json.dumps(item, ensure_ascii=False), ex=ttl)
+            raise HTTPException(400, detail="验证码错误")
+        await redis_client.delete(key)
+
+    # ---- 进程内回退（仅 development / testing）----
+    async def _issue_local(self, phone: str, purpose: str, ip: str, device_id: str | None, code: str) -> None:
         now = datetime.now(UTC)
         async with self._lock:
             key = (phone, purpose)
@@ -65,8 +174,6 @@ class SmsStore:
                 count = 0
             if count >= settings.sms_daily_limit:
                 raise HTTPException(429, detail="今日验证码发送次数已达上限")
-            code = settings.sms_mock_code if settings.sms_provider.lower() == "mock" else f"{secrets.randbelow(1_000_000):06d}"
-            await get_sms_provider().send_code(phone, purpose, code)
             self._items[key] = {
                 "hash": hash_passwordless_code(code),
                 "sent_at": now,
@@ -77,9 +184,8 @@ class SmsStore:
                 "device_id": device_id,
             }
             self._daily[count_key] = (now.date(), count + 1)
-        return settings.sms_code_expire_seconds
 
-    async def verify(self, phone: str, purpose: str, code: str) -> None:
+    async def _verify_local(self, phone: str, purpose: str, code: str) -> None:
         now = datetime.now(UTC)
         async with self._lock:
             item = self._items.get((phone, purpose))
@@ -97,6 +203,40 @@ class SmsStore:
                     raise HTTPException(429, detail="验证码错误次数过多，请15分钟后重试")
                 raise HTTPException(400, detail="验证码错误")
             self._items.pop((phone, purpose), None)
+
+    async def issue(self, phone: str, purpose: str, ip: str, device_id: str | None) -> int:
+        if settings.sms_provider.lower() == "disabled":
+            await get_sms_provider().send_code(phone, purpose, "")
+        code = settings.sms_mock_code if settings.sms_provider.lower() == "mock" else f"{secrets.randbelow(1_000_000):06d}"
+        reserved_payload: str | None = None
+        using_local = False
+        try:
+            reserved_payload = await self._issue_redis(phone, purpose, ip, device_id, code)
+        except RedisError as exc:
+            if not self._fallback_enabled():
+                raise HTTPException(503, detail="Redis服务未配置或暂时不可用") from exc
+            await self._issue_local(phone, purpose, ip, device_id, code)
+            using_local = True
+        try:
+            await get_sms_provider().send_code(phone, purpose, code)
+        except Exception:
+            try:
+                if using_local:
+                    await self._rollback_local(phone, purpose)
+                elif reserved_payload is not None:
+                    await self._compensate_redis(phone, purpose, reserved_payload)
+            except RedisError:
+                pass
+            raise
+        return settings.sms_code_expire_seconds
+
+    async def verify(self, phone: str, purpose: str, code: str) -> None:
+        try:
+            await self._verify_redis(phone, purpose, code)
+        except RedisError as exc:
+            if not self._fallback_enabled():
+                raise HTTPException(503, detail="Redis服务未配置或暂时不可用") from exc
+            await self._verify_local(phone, purpose, code)
 
 
 sms_store = SmsStore()
@@ -199,6 +339,22 @@ async def ensure_default_user_role(db: AsyncSession, user_id: int) -> None:
         ON DUPLICATE KEY UPDATE status = 1"""), {"user_id": user_id})
 
 
+async def touch_login(db: AsyncSession, user_id: int, extra_set: str = "") -> None:
+    """登录时刷新 last_login_at，并在 users.login_num 列已迁移时自增登录次数（A12）。
+
+    login_num 为补列项：迁移未执行的环境（information_schema 查不到该列）静默跳过自增，
+    不抛 Unknown column。登录为写路径，这里一次轻量探测保证跨环境兼容。
+    """
+    has_login_num = (await db.execute(text("""SELECT 1 FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' AND COLUMN_NAME = 'login_num'"""))).first()
+    set_clause = "last_login_at = UTC_TIMESTAMP()"
+    if extra_set:
+        set_clause = f"{extra_set}, {set_clause}"
+    if has_login_num:
+        set_clause = f"login_num = login_num + 1, {set_clause}"
+    await db.execute(text(f"UPDATE users SET {set_clause} WHERE id = :id"), {"id": user_id})
+
+
 async def login_phone(db: AsyncSession, request: PhoneLoginRequest, ip: str | None, user_agent: str | None) -> dict[str, Any]:
     if request.purpose != "login":
         raise HTTPException(422, detail="手机号登录验证码用途必须为login")
@@ -206,7 +362,7 @@ async def login_phone(db: AsyncSession, request: PhoneLoginRequest, ip: str | No
     user_agent = normalize_user_agent(user_agent)
     async with db.begin():
         user_id = await get_or_create_user_by_phone(db, request.phone, ip)
-        await db.execute(text("UPDATE users SET phone_verified_at = UTC_TIMESTAMP(), last_login_at = UTC_TIMESTAMP() WHERE id = :id"), {"id": user_id})
+        await touch_login(db, user_id)
         tokens = await create_session(db, user_id, request.device_id, request.platform, request.app_version, ip, user_agent)
         await db.execute(text("INSERT INTO user_login_log (user_id, login_type, ip, device) VALUES (:id, 2, :ip, :device)"), {"id": user_id, "ip": ip, "device": user_agent})
     tokens["need_bind_phone"] = False
@@ -223,7 +379,7 @@ async def login_wechat(db: AsyncSession, request: WechatLoginRequest, ip: str | 
             raise HTTPException(403, detail="账号当前不可用")
         if row:
             user_id = row["id"]
-            await db.execute(text("UPDATE users SET nickname = COALESCE(:nickname, nickname), avatar = COALESCE(:avatar, avatar), last_login_at = UTC_TIMESTAMP() WHERE id = :id"), {"id": user_id, "nickname": request.nickname, "avatar": request.avatar})
+            await touch_login(db, user_id, extra_set="nickname = COALESCE(:nickname, nickname), avatar = COALESCE(:avatar, avatar)")
             phone = row["phone"]
         else:
             if not await platform_registration_open(db):
@@ -252,7 +408,7 @@ async def login_existing_account(db: AsyncSession, request: ExistingAccountLogin
         if not row["password"] or not verify_password(request.password, row["password"]):
             raise HTTPException(401, detail="手机号或密码错误")
         await ensure_default_user_role(db, int(row["id"]))
-        await db.execute(text("UPDATE users SET last_login_at = UTC_TIMESTAMP() WHERE id = :id"), {"id": row["id"]})
+        await touch_login(db, int(row["id"]))
         tokens = await create_session(db, int(row["id"]), request.device_id, request.platform, request.app_version, ip, user_agent)
         await db.execute(text("INSERT INTO user_login_log (user_id, login_type, ip, device) VALUES (:id, 3, :ip, :device)"), {"id": row["id"], "ip": ip, "device": user_agent})
     tokens["need_bind_phone"] = not bool(row["phone"])
@@ -277,13 +433,25 @@ async def bind_phone(db: AsyncSession, user_id: int, request: BindPhoneRequest, 
 
 
 async def refresh_session(db: AsyncSession, request: RefreshRequest, ip: str | None, user_agent: str | None) -> dict[str, Any]:
+    disabled_user_id: int | None = None
     async with db.begin():
-        result = await db.execute(text("SELECT id, user_id, device_id, platform, app_version, refresh_expire_at FROM user_session WHERE refresh_token_hash = :hash AND status = 1 FOR UPDATE"), {"hash": hash_token(request.refresh_token)})
+        result = await db.execute(text("""SELECT s.id, s.user_id, s.device_id, s.platform, s.app_version,
+            s.refresh_expire_at, u.status AS user_status
+            FROM user_session s JOIN users u ON u.id = s.user_id
+            WHERE s.refresh_token_hash = :hash AND s.status = 1 FOR UPDATE"""), {"hash": hash_token(request.refresh_token)})
         row = result.mappings().first()
         if not row or row["refresh_expire_at"] <= datetime.now(UTC).replace(tzinfo=None):
             raise HTTPException(401, detail="刷新令牌无效或已过期")
-        await db.execute(text("UPDATE user_session SET status = 2, revoked_at = UTC_TIMESTAMP(), revoke_reason = 'rotated' WHERE id = :id"), {"id": row["id"]})
-        tokens = await create_session(db, row["user_id"], row["device_id"], row["platform"], row["app_version"], ip, user_agent)
+        # D-19：被封禁 / 停用账号不得通过刷新令牌续命；同时失效其全部在线会话。
+        if int(row["user_status"]) != 1:
+            disabled_user_id = int(row["user_id"])
+            await db.execute(text("""UPDATE user_session SET status = 2, revoked_at = UTC_TIMESTAMP(),
+                revoke_reason = 'user_disabled' WHERE user_id = :uid AND status = 1"""), {"uid": disabled_user_id})
+        else:
+            await db.execute(text("UPDATE user_session SET status = 2, revoked_at = UTC_TIMESTAMP(), revoke_reason = 'rotated' WHERE id = :id"), {"id": row["id"]})
+            tokens = await create_session(db, row["user_id"], row["device_id"], row["platform"], row["app_version"], ip, user_agent)
+    if disabled_user_id is not None:
+        raise HTTPException(403, detail="账号状态异常，请重新登录")
     result = await db.execute(text("SELECT phone IS NOT NULL AS has_phone FROM users WHERE id = :id"), {"id": row["user_id"]})
     tokens["need_bind_phone"] = not bool(result.scalar())
     return tokens
@@ -291,6 +459,106 @@ async def refresh_session(db: AsyncSession, request: RefreshRequest, ip: str | N
 
 async def revoke_session(db: AsyncSession, session_id: int) -> None:
     await db.execute(text("UPDATE user_session SET status = 2, revoked_at = UTC_TIMESTAMP(), revoke_reason = 'logout' WHERE id = :id AND status = 1"), {"id": session_id})
+
+
+# A12-模拟登录：受限短时只读会话。默认 15 分钟过期，token 带 imp 声明，
+# 由 app/main.py 只读中间件拒绝写操作。不触发登录奖励/在线标记等普通登录副作用。
+IMPERSONATION_TOKEN_EXPIRE_MINUTES = 15
+
+
+async def create_impersonation_session(
+    db: AsyncSession,
+    admin_id: int,
+    user_id: int,
+    ip: str | None,
+    user_agent: str | None,
+) -> dict[str, Any]:
+    """为后台管理员签发一个面向目标用户的短时只读模拟会话，返回仅含 access_token。
+
+    安全收口：目标账号必须存在且 status=1；会话带 impersonated_by（缺列时降级不写，
+    仍由 token 声明保证只读）；审计写入 business_audit_log（admin.impersonate.create）。
+    """
+    user = (await db.execute(
+        text("SELECT id, status FROM users WHERE id = :id"), {"id": user_id}
+    )).mappings().first()
+    if not user:
+        raise HTTPException(404, detail="目标用户不存在")
+    if int(user["status"]) != 1:
+        raise HTTPException(409, detail="目标账号当前不可用，无法模拟登录")
+    has_col = (await db.execute(text(
+        """SELECT 1 FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_session' AND COLUMN_NAME = 'impersonated_by'"""
+    ))).first()
+    minutes = getattr(settings, "impersonation_token_expire_minutes", None) or IMPERSONATION_TOKEN_EXPIRE_MINUTES
+    refresh = random_token()
+    now = datetime.now(UTC).replace(tzinfo=None)
+    access_expire = now + timedelta(minutes=minutes)
+    params: dict[str, Any] = {
+        "user_id": user_id,
+        "refresh_hash": hash_token(refresh),
+        "device_id": f"impersonate:{admin_id}",
+        "ip": ip,
+        "ua": normalize_user_agent(user_agent),
+        "access_expire": access_expire,
+        "refresh_expire": access_expire,
+    }
+    if has_col:
+        params["imp_by"] = admin_id
+        insert_result = await db.execute(
+            text(
+                """INSERT INTO user_session
+                   (user_id, refresh_token_hash, device_id, platform, ip, user_agent,
+                    created_at, last_used_at, access_expire_at, refresh_expire_at, status, impersonated_by)
+                   VALUES (:user_id, :refresh_hash, :device_id, 'impersonation', :ip, :ua,
+                           UTC_TIMESTAMP(), UTC_TIMESTAMP(), :access_expire, :refresh_expire, 1, :imp_by)"""
+            ),
+            params,
+        )
+    else:
+        insert_result = await db.execute(
+            text(
+                """INSERT INTO user_session
+                   (user_id, refresh_token_hash, device_id, platform, ip, user_agent,
+                    created_at, last_used_at, access_expire_at, refresh_expire_at, status)
+                   VALUES (:user_id, :refresh_hash, :device_id, 'impersonation', :ip, :ua,
+                           UTC_TIMESTAMP(), UTC_TIMESTAMP(), :access_expire, :refresh_expire, 1)"""
+            ),
+            params,
+        )
+    session_id = int(insert_result.lastrowid)
+    access = create_token(
+        user_id, session_id, "access", timedelta(minutes=minutes), extra={"imp": admin_id}
+    )
+    await db.execute(
+        text("UPDATE user_session SET access_token_hash = :hash WHERE id = :id"),
+        {"hash": hash_token(access), "id": session_id},
+    )
+    await db.execute(
+        text(
+            """INSERT INTO business_audit_log
+               (actor_user_id, action, resource_type, resource_id, reason, after_json)
+               VALUES (:admin_id, 'admin.impersonate.create', 'user', :user_id, :reason, :after_json)"""
+        ),
+        {
+            "admin_id": admin_id,
+            "user_id": user_id,
+            "reason": "后台模拟登录",
+            "after_json": json.dumps(
+                {"session_id": session_id, "expires_in_minutes": minutes, "read_only": True},
+                ensure_ascii=False,
+            ),
+        },
+    )
+    await db.commit()
+    return {
+        "access_token": access,
+        "token_type": "bearer",
+        "expires_in": minutes * 60,
+        "impersonated_user_id": user_id,
+        "session_id": session_id,
+        "read_only": True,
+        "impersonated_by": admin_id,
+    }
 
 
 async def accept_agreement(db: AsyncSession, user_id: int, agreement_type: str, version: str, content_hash: str | None, scene: str | None, ip: str | None, device_id: str | None) -> None:
@@ -333,10 +601,12 @@ async def submit_realname(db: AsyncSession, user_id: int, request: RealNameReque
     return {"status": 1, "id_card_masked": mask_id_card(request.id_card)}
 
 
-async def list_realname_reviews(db: AsyncSession, *, page: int, page_size: int, status: int | None = None, search: str | None = None):
+async def list_realname_reviews(db: AsyncSession, *, page: int, page_size: int, status: int | None = None, search: str | None = None, scope: str | None = None, scope_params: dict[str, object] | None = None):
     from app.schemas.admin import RealnameReviewItem, RealnameReviewPage
     where = "1=1"
-    params: dict[str, object] = {}
+    params: dict[str, object] = dict(scope_params or {})
+    if scope:
+        where += f" AND ({scope})"
     if status is not None:
         where += " AND ua.realname_status = :status"
         params["status"] = status
@@ -352,6 +622,66 @@ async def list_realname_reviews(db: AsyncSession, *, page: int, page_size: int, 
     return RealnameReviewPage(items=[RealnameReviewItem(**dict(row)) for row in rows[offset:offset + page_size]], page=page, page_size=page_size, total=total, has_more=page * page_size < total)
 
 
+REALNAME_STATUS_PASSED = 2
+REALNAME_STATUS_FAILED = 3
+REALNAME_STATUS_MANUAL = 4
+
+# 审核通过 / 未通过时人脸标记的取值（face_verified：1 通过 2 未通过 0 未核验）。
+_FACE_VERIFIED_BY_STATUS = {
+    REALNAME_STATUS_PASSED: 1,
+    REALNAME_STATUS_FAILED: 2,
+    REALNAME_STATUS_MANUAL: 0,
+}
+
+
+async def apply_realname_review(
+    db: AsyncSession,
+    user_id: int,
+    status: int,
+    reason: str | None,
+    admin_id: int,
+    *,
+    sync_face: bool = False,
+) -> None:
+    """实名审核统一落列（D-14）。
+
+    `realname_status` 是 C 端门禁的**唯一读取列**（`dependencies.py` 要求 ==2）；
+    `face_verified` 是人脸核验标记（`get_face_verified_user` 要求 ==1）。
+    两个后台入口必须经此函数写入 realname_status，避免「在会员认证后台通过实名
+    却不满足 C 端门禁」的双写分裂。
+
+    ``sync_face=True`` 时同步写入人脸标记：仅「会员认证后台」使用，因为它的审核
+    记录携带人脸照片与评分（face_photo / face_score），审核即等价于人脸核验；
+    纯实名审核入口保持只写 realname_status，不越权授予发帖所需的人脸标记。
+
+    调用方负责前置校验与事务提交。
+    """
+    if status not in _FACE_VERIFIED_BY_STATUS:
+        raise HTTPException(422, detail="不支持的实名认证审核状态")
+    assignments = [
+        "realname_status=:status",
+        "auth_status=:status",
+        "auth_step=:auth_step",
+        "fail_reason=:reason",
+        "reviewed_by=:admin_id",
+        "reviewed_at=UTC_TIMESTAMP()",
+        "updated_at=UTC_TIMESTAMP()",
+    ]
+    params: dict[str, Any] = {
+        "status": status,
+        "auth_step": 4 if status == REALNAME_STATUS_PASSED else 5 if status == REALNAME_STATUS_FAILED else 3,
+        "reason": reason,
+        "admin_id": admin_id,
+        "user_id": user_id,
+    }
+    if sync_face:
+        assignments.append("face_verified=:face")
+        params["face"] = _FACE_VERIFIED_BY_STATUS[status]
+    await db.execute(
+        text(f"UPDATE user_auth SET {', '.join(assignments)} WHERE user_id=:user_id"), params
+    )
+
+
 async def review_realname(db: AsyncSession, user_id: int, status: int, reason: str | None, admin_id: int):
     from app.schemas.admin import RealnameReviewResponse
     if status not in (2, 3, 4):
@@ -361,9 +691,7 @@ async def review_realname(db: AsyncSession, user_id: int, status: int, reason: s
         raise HTTPException(404, detail="实名认证记录不存在")
     if int(row["realname_status"]) != 1:
         raise HTTPException(409, detail="当前实名认证不在审核中")
-    await db.execute(text("""UPDATE user_auth SET realname_status=:status, auth_status=:status,
-        auth_step=:auth_step, fail_reason=:reason, reviewed_by=:admin_id, reviewed_at=UTC_TIMESTAMP(), updated_at=UTC_TIMESTAMP()
-        WHERE user_id=:user_id"""), {"status": status, "auth_step": 4 if status == 2 else 5 if status == 3 else 3, "reason": reason, "admin_id": admin_id, "user_id": user_id})
+    await apply_realname_review(db, user_id, status, reason, admin_id)
     await db.commit()
     return RealnameReviewResponse(user_id=user_id, realname_status=status, reason=reason)
 

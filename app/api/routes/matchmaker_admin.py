@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies import CurrentMatchmakerAdmin, get_current_matchmaker_admin
+from app.api.dependencies import CurrentMatchmakerAdmin, get_current_matchmaker_admin, require_sensitive_operation
 from app.db.session import get_db
 from app.schemas.matchmaker_admin import (
     MatchmakerAdminLoginRequest, MatchmakerAdminMeResponse, MatchmakerAdminRefreshRequest,
@@ -16,6 +16,8 @@ from app.schemas.matchmaker import (
     MatchmakerServiceRequestResponse, MatchmakerCard, MatchmakerAdminServiceRequestUpdate,
 )
 from app.services.matchmaker_admin_auth import login, logout, refresh
+from app.core.security import hash_password, verify_password
+from app.schemas.matchmaker_admin_account import MatchmakerAdminPasswordChange
 from app.services.matchmaker import (
     admin_create_service_product, admin_list_service_requests, admin_update_service_product,
     admin_update_service_request, get_matchmaker, get_service_product, list_matchmakers,
@@ -23,6 +25,11 @@ from app.services.matchmaker import (
 )
 from app.schemas.organization import ResourceAssignmentCreate, ResourceAssignmentResponse, StoreCreate, StoreMemberCreate, StoreMemberResponse, StoreResponse
 from app.services.organization import add_store_member, assign_resource, create_store, get_store, list_stores
+from app.services.sensitive_operations import (
+    abort_sensitive_operation,
+    begin_sensitive_operation,
+    finish_sensitive_operation,
+)
 from app.api.dependencies import CurrentUser
 from sqlalchemy import text
 
@@ -75,8 +82,33 @@ async def admin_logout(current: CurrentMatchmakerAdmin = Depends(get_current_mat
     await logout(db, current.session_id)
 
 
+@router.post("/auth/change-password", status_code=204, summary="修改当前后台账号密码")
+async def change_password(
+    body: MatchmakerAdminPasswordChange,
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    row = (await db.execute(
+        text("SELECT password_hash FROM matchmaker_admin_account WHERE id = :id FOR UPDATE"),
+        {"id": current.account.id},
+    )).mappings().first()
+    if not row or not verify_password(body.old_password, row["password_hash"]):
+        raise HTTPException(status_code=400, detail="旧密码不正确")
+    if body.old_password == body.new_password:
+        raise HTTPException(status_code=400, detail="新密码不能与旧密码相同")
+    await db.execute(
+        text("UPDATE matchmaker_admin_account SET password_hash = :password_hash, failed_count = 0, locked_until = NULL, updated_at = UTC_TIMESTAMP() WHERE id = :id"),
+        {"password_hash": hash_password(body.new_password), "id": current.account.id},
+    )
+    await db.execute(
+        text("INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id, reason) VALUES (:actor_id, 'admin_account.password.change', 'matchmaker_admin_account', :resource_id, NULL)"),
+        {"actor_id": current.account.id, "resource_id": current.account.id},
+    )
+    await db.commit()
+
+
 @router.get("/matchmakers", response_model=MatchmakerPage, summary="查询红娘列表")
-async def matchmakers(page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=50), keyword: str | None = Query(None, max_length=64), available: bool | None = Query(None), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> MatchmakerPage:
+async def matchmakers(page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=100), keyword: str | None = Query(None, max_length=64), available: bool | None = Query(None), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> MatchmakerPage:
     return await list_matchmakers(
         db, page, page_size, keyword=keyword, available=available, admin=current
     )
@@ -136,6 +168,16 @@ def _legacy_actor(current: CurrentMatchmakerAdmin) -> CurrentUser:
     return CurrentUser(id=current.account.id, session_id=current.session_id, phone=None, status=1, realname_status=2)
 
 
+def _store_scope(current: CurrentMatchmakerAdmin) -> tuple[str, dict[str, object]]:
+    """旧版门店路由（/branches）的 D-10 作用域谓词。
+
+    四档判定统一由 `CurrentMatchmakerAdmin.scope_organization_clause` 提供，路由不做
+    二次分支；未绑定组织时返回 `1 = 0`（fail-closed）。
+    """
+    params: dict[str, object] = {}
+    return current.scope_organization_clause(params, column="id"), params
+
+
 @router.get("/statistics", response_model=MatchmakerStatistics, summary="查询红娘后台统计")
 async def statistics(current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> MatchmakerStatistics:
     current.require("matchmaker.read")
@@ -154,7 +196,8 @@ async def statistics(current: CurrentMatchmakerAdmin = Depends(get_current_match
 
 @router.get("/branches", response_model=list[StoreResponse], summary="查询门店")
 async def branches(current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> list[StoreResponse]:
-    return await list_stores(db)
+    scope, params = _store_scope(current)
+    return await list_stores(db, scope=scope, params=params)
 
 
 @router.post("/branches", response_model=StoreResponse, status_code=201, summary="创建门店")
@@ -164,23 +207,66 @@ async def create_branch(body: StoreCreate, current: CurrentMatchmakerAdmin = Dep
 
 @router.get("/branches/{branch_id}", response_model=StoreResponse, summary="查询门店详情")
 async def branch_detail(branch_id: int = Path(..., ge=1), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> StoreResponse:
-    return await get_store(db, branch_id)
+    scope, params = _store_scope(current)
+    return await get_store(db, branch_id, scope=scope, params=params)
 
 
 @router.post("/branches/{branch_id}/members", response_model=StoreMemberResponse, status_code=201, summary="添加门店成员")
 async def branch_member(branch_id: int = Path(..., ge=1), body: StoreMemberCreate = ..., current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> StoreMemberResponse:
+    # D-10：先按数据范围校验门店可见性（越权按 404），再委派既有加成员逻辑。
+    scope, params = _store_scope(current)
+    await get_store(db, branch_id, scope=scope, params=params)
+    member_params: dict[str, object] = {"target_user_id": body.user_id}
+    member_scope = current.scope_exists_clause(member_params, correlation="scope_assignment.user_id = users.id")
+    target = await db.execute(text(f"SELECT id FROM users WHERE id = :target_user_id AND ({member_scope}) FOR UPDATE"), member_params)
+    if not target.scalar():
+        raise HTTPException(404, detail="目标用户不在当前数据范围内")
     return await add_store_member(db, _legacy_actor(current), branch_id, body)
 
 
-@router.post("/assignments", response_model=ResourceAssignmentResponse, status_code=201, summary="分配会员资源")
-async def assignment(body: ResourceAssignmentCreate, current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> ResourceAssignmentResponse:
-    return await assign_resource(db, _legacy_actor(current), body)
+@router.post("/assignments", response_model=ResourceAssignmentResponse, status_code=201, summary="分配会员资源（幂等 + 二次确认）")
+async def assignment(body: ResourceAssignmentCreate, idempotency_key: str = Depends(require_sensitive_operation), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> ResourceAssignmentResponse:
+    # D-10：目标门店/红娘必须在数据范围内，否则可把会员分配到范围外的组织/红娘。
+    if body.organization_id is not None:
+        params: dict[str, object] = {"target_org_id": body.organization_id}
+        scope = current.scope_organization_clause(params, column="id")
+        in_scope = await db.execute(text(
+            f"SELECT 1 FROM organization WHERE id = :target_org_id AND org_type = 'store' AND ({scope})"
+        ), params)
+        if not in_scope.scalar():
+            raise HTTPException(403, detail="目标门店不在当前数据范围内")
+    if body.matchmaker_id is not None:
+        guard_params: dict[str, object] = {"target_matchmaker_id": body.matchmaker_id}
+        guard_scope = _matchmaker_scope_filter(current, guard_params, "a.user_id", "asg")
+        in_scope = await db.execute(text(
+            f"SELECT 1 FROM user_matchmaker_apply a WHERE a.user_id = :target_matchmaker_id "
+            f"AND a.application_type = 'service_matchmaker' AND ({guard_scope})"
+        ), guard_params)
+        if not in_scope.scalar():
+            raise HTTPException(403, detail="目标红娘不在当前数据范围内")
+    reservation, replayed = await begin_sensitive_operation(
+        db,
+        actor_id=current.account.id,
+        operation="matchmaker.assignment.create",
+        idempotency_key=idempotency_key,
+        payload={"body": body.model_dump(mode="json")},
+    )
+    if replayed is not None:
+        return ResourceAssignmentResponse(**replayed)
+    try:
+        result = await assign_resource(db, _legacy_actor(current), body)
+    except Exception:
+        await abort_sensitive_operation(db, reservation)
+        raise
+    await finish_sensitive_operation(db, reservation, result.model_dump(mode="json"))
+    return result
 
 
 @router.get("/assignments", response_model=ResourceAssignmentPage, summary="查询资源分配记录")
 async def assignments(page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=100), user_id: int | None = Query(None, ge=1), matchmaker_id: int | None = Query(None, ge=1), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> ResourceAssignmentPage:
-    conditions = ["1=1"]
-    params: dict[str, int] = {"limit": page_size, "offset": (page - 1) * page_size}
+    # D-10：资源分配记录按四档数据范围收口（此前为无条件 `1=1`，任何门店账号都能看全平台）。
+    params: dict[str, object] = {"limit": page_size, "offset": (page - 1) * page_size}
+    conditions = [current.scope_clause(params, user_column="matchmaker_id", organization_column="organization_id")]
     if user_id is not None:
         conditions.append("user_id = :user_id")
         params["user_id"] = user_id

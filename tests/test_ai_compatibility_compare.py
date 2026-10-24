@@ -9,9 +9,7 @@ from __future__ import annotations
 import pytest
 
 from app.services.ai.base import (
-    CompatibilityCompareDirection,
     CompatibilityCompareRequest,
-    CompatibilityCompareResult,
     ProviderError,
     ProviderErrorKind,
 )

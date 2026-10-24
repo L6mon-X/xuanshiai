@@ -1,6 +1,7 @@
 """Member administration services backed by existing user tables."""
 
 import json
+from typing import Any
 
 from fastapi import HTTPException
 from sqlalchemy import text
@@ -15,6 +16,7 @@ from app.schemas.matchmaker_member_admin import (
     MatchmakerMemberUpdate,
     MemberAuditLogItem,
 )
+from app.schemas.matchmaker_crm_admin import MemberOption, MemberOptions
 
 
 def _mask_phone(phone: str | None) -> str | None:
@@ -73,8 +75,8 @@ async def create_member(
     if duplicate.scalar():
         raise HTTPException(409, detail="手机号已注册")
     result = await db.execute(text("""INSERT INTO users
-        (phone, nickname, gender, birthday, is_married, avatar, status)
-        VALUES (:phone, :nickname, :gender, :birthday, :is_married, :avatar, 1)"""), {
+        (phone, nickname, gender, birthday, is_married, avatar, source, status)
+        VALUES (:phone, :nickname, :gender, :birthday, :is_married, :avatar, :source, 1)"""), {
         **body.model_dump(exclude={"remark"}), "phone": body.phone,
     })
     member_id = int(result.lastrowid)
@@ -114,7 +116,21 @@ async def update_member(
     if is_masked_value(values.get("wechat")):
         values.pop("wechat")
     remark = values.pop("remark", None)
-    user_values = {key: values.pop(key) for key in ("nickname", "gender", "birthday", "is_married", "avatar") if key in values}
+    phone = values.pop("phone", None)
+    if phone is not None:
+        # 手机号是登录标识，必须全局唯一；换号时排除会员自身，避免「改成自己的号」被判重。
+        taken = (await db.execute(
+            text("SELECT id FROM users WHERE phone = :phone AND id <> :id"), {"phone": phone, "id": member_id},
+        )).scalar()
+        if taken:
+            raise HTTPException(409, detail="手机号已被其他会员占用")
+    user_values = {key: values.pop(key) for key in ("nickname", "gender", "birthday", "is_married", "avatar", "wechat_added", "promoted", "newcomer") if key in values}
+    # 两列在库里是 tinyint，bool 需要显式转成 1/0，驱动不会替我们做。
+    for flag in ("promoted", "newcomer"):
+        if flag in user_values and user_values[flag] is not None:
+            user_values[flag] = 1 if user_values[flag] else 0
+    if phone is not None:
+        user_values["phone"] = phone
     auth_values = {key: values.pop(key) for key in ("education", "school", "job", "company", "auth_status") if key in values}
     match_status = values.pop("match_status", None) if "match_status" in values else None
     profile_columns: set[str] = set()
@@ -258,3 +274,29 @@ async def member_audit_logs(
         FROM business_audit_log WHERE resource_type = 'user' AND resource_id = :id
         ORDER BY id DESC LIMIT 200"""), {"id": member_id})
     return [MemberAuditLogItem(**dict(row)) for row in result.mappings().all()]
+
+
+async def member_options(db: AsyncSession, *, admin: Any) -> MemberOptions:
+    """会员资料页「门店 / 推广红娘」筛选下拉的取值。
+
+    两列在原界面里都是未填充的写死下拉（选了不发参），这里给出真实候选：
+    门店按账号的组织数据范围收口（SELF / 未绑定组织拿不到门店，与 /stores 同口径），
+    推广红娘为全局配置型字典（与客源页 lead_options 同口径，只认应用记录）。
+    """
+    org_params: dict[str, object] = {}
+    org_scope = admin.scope_organization_clause(org_params, column="o.id")
+    organizations = [
+        MemberOption(value=str(row["id"]), label=row["label"])
+        for row in (await db.execute(text(f"""SELECT o.id,
+                COALESCE(NULLIF(o.display_name, ''), NULLIF(o.name, ''), o.code, CONCAT('门店', o.id)) AS label
+            FROM organization o WHERE o.org_type = 'store' AND ({org_scope})
+            ORDER BY o.sort_order DESC, o.id DESC LIMIT 200"""), org_params)).mappings().all()
+    ]
+    promoters = [
+        MemberOption(value=str(row["id"]), label=row["label"])
+        for row in (await db.execute(text("""SELECT u.id,
+                COALESCE(NULLIF(u.nickname, ''), u.phone, CONCAT('用户', u.id)) AS label
+            FROM user_matchmaker_apply a JOIN users u ON u.id = a.user_id
+            WHERE a.application_type = 'promoter' AND a.status = 1 ORDER BY u.id LIMIT 200"""))).mappings().all()
+    ]
+    return MemberOptions(organizations=organizations, promoters=promoters)

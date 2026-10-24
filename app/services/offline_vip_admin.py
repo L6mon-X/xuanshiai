@@ -61,6 +61,24 @@ _KEYWORD_SQL = (
 _DEFAULT_PACKAGES = ["基础服务套餐", "标准服务套餐", "尊享服务套餐", "私人定制套餐"]
 
 
+def _apply_scope(
+    where: list[str],
+    params: dict[str, Any],
+    scope: str | None,
+    scope_params: dict[str, Any] | None,
+) -> None:
+    """把四档数据范围谓词并入查询（D-16）。
+
+    `offline_vip` 无组织列，归属按会员（`v.user_id`）的 ``resource_assignment``
+    判定（与会员 CRM / 会员跟进一致）；谓词由路由层用
+    `CurrentMatchmakerAdmin.scope_exists_clause`（唯一实现）生成后下传。
+    """
+    if not scope:
+        return
+    params.update(scope_params or {})
+    where.append(f"({scope})")
+
+
 def _int(value: Any) -> int:
     return int(value or 0)
 
@@ -135,6 +153,61 @@ def _row(payload: dict[str, Any]) -> OfflineVipItem:
     )
 
 
+# 服务状态：`progress` 是服务进度，service_status 是「服务期是否仍在」的独立维度。
+# 库中无退费字段，「无退费风险」按「仍在服务期且已履约约见数达到承诺数」判定
+# （承诺数为 0 视为无风险），判定口径写在 docs/api/offline-vip.md。
+_SERVICE_STATUS_SQL = {
+    "active": "v.service_end IS NOT NULL AND v.service_end >= CURDATE()",
+    "expired": "v.service_end IS NOT NULL AND v.service_end < CURDATE()",
+    "no_refund_risk": (
+        "v.service_end IS NOT NULL AND v.service_end >= CURDATE()"
+        " AND v.success_meet_count >= v.promise_meet_count"
+    ),
+}
+
+# 统计/排序维度：`member_last_paid` 与 `member_history_paid` 按会员维度聚合，
+# `monthly_sales` / `yearly_sales` / `monthly_champion` 按销售红娘维度聚合销售额。
+_SORT_BY_SQL = {
+    "member_last_paid": "COALESCE((SELECT MAX(po.pay_time) FROM payment_order po WHERE po.user_id = v.user_id AND po.status = 1), '1970-01-01') DESC, v.id DESC",
+    "member_history_paid": "COALESCE((SELECT SUM(po.amount) FROM payment_order po WHERE po.user_id = v.user_id AND po.status = 1), 0) DESC, v.id DESC",
+    "monthly_sales": "COALESCE(_month.amount, 0) DESC, v.id DESC",
+    "yearly_sales": "COALESCE(_year.amount, 0) DESC, v.id DESC",
+    "monthly_champion": "COALESCE(_month.amount, 0) DESC, COALESCE(_year.amount, 0) DESC, v.id DESC",
+}
+
+# 表头列排序白名单（与上面的统计维度 sort_by 是两回事）：
+# 值全部由服务端写死，不拼接用户输入。
+COLUMN_SORT_SQL = {
+    "sign_date": "v.sign_date DESC, v.id DESC",
+    "package": "v.package_name ASC, v.id DESC",
+    "progress": "v.progress ASC, v.id DESC",
+    # last_follow_at 是 SELECT 里的子查询别名，MySQL 不允许在 ORDER BY 里引用，
+    # 这里把同一个子查询再写一遍。
+    "last_follow": "COALESCE((SELECT MAX(f.created_at) FROM member_follow_up f WHERE f.user_id = v.user_id), '1970-01-01') DESC, v.id DESC",
+    "amount": "v.contract_amount DESC, v.id DESC",
+    "matchmaker": "v.service_matchmaker_id ASC, v.id DESC",
+    "id": "v.id DESC",
+}
+
+# 销售额排序要额外左连接当月/当年已支付订单汇总，未选这些维度时不附加 join。
+_SALES_JOIN = """
+LEFT JOIN (SELECT v2.sales_matchmaker_id AS matchmaker_id, SUM(po.amount) AS amount
+           FROM offline_vip v2 JOIN payment_order po
+             ON po.user_id = v2.user_id AND po.status = 1
+           WHERE v2.deleted_at IS NULL AND v2.sales_matchmaker_id IS NOT NULL
+             AND po.pay_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01')
+           GROUP BY v2.sales_matchmaker_id) _month
+  ON _month.matchmaker_id = v.sales_matchmaker_id
+LEFT JOIN (SELECT v3.sales_matchmaker_id AS matchmaker_id, SUM(po.amount) AS amount
+           FROM offline_vip v3 JOIN payment_order po
+             ON po.user_id = v3.user_id AND po.status = 1
+           WHERE v3.deleted_at IS NULL AND v3.sales_matchmaker_id IS NOT NULL
+             AND po.pay_time >= MAKEDATE(YEAR(CURDATE()), 1)
+           GROUP BY v3.sales_matchmaker_id) _year
+  ON _year.matchmaker_id = v.sales_matchmaker_id
+"""
+
+
 async def list_vips(
     db: AsyncSession,
     page: int,
@@ -146,10 +219,17 @@ async def list_vips(
     sign_start: str | None = None,
     sign_end: str | None = None,
     keyword: str | None = None,
+    service_status: str | None = None,
+    sort_by: str | None = None,
+    column_sort: str | None = None,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> OfflineVipPage:
     """线下VIP 分页列表。progress 为空表示「全部」。"""
     conditions = ["v.deleted_at IS NULL"]
     params: dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size}
+    _apply_scope(conditions, params, scope, scope_params)
     if progress:
         conditions.append("v.progress = :progress")
         params["progress"] = progress
@@ -171,14 +251,22 @@ async def list_vips(
     if keyword:
         conditions.append(_KEYWORD_SQL)
         params["keyword"] = keyword
+    if service_status in _SERVICE_STATUS_SQL:
+        conditions.append(_SERVICE_STATUS_SQL[service_status])
     where = " AND ".join(conditions)
+    # 销售额维度需要带汇总 join；其余排序不附加 join，避免改变既有查询计划。
+    join = _SALES_JOIN if sort_by in ("monthly_sales", "yearly_sales", "monthly_champion") else ""
+    order_by = _SORT_BY_SQL.get(sort_by or "", "v.id DESC")
+    # 表头点击排序优先：它更贴近用户的即时意图，未点表头时沿用原统计维度排序。
+    if column_sort in COLUMN_SORT_SQL:
+        order_by = COLUMN_SORT_SQL[column_sort]
     rows = await db.execute(
-        text(f"{_SELECT_BODY} WHERE {where} ORDER BY v.id DESC LIMIT :limit OFFSET :offset"),
+        text(f"{_SELECT_BODY}{join} WHERE {where} ORDER BY {order_by} LIMIT :limit OFFSET :offset"),
         params,
     )
     count_params = {k: v for k, v in params.items() if k not in ("limit", "offset")}
     total = _int(
-        (await db.scalar(text(f"SELECT COUNT(*) {_COUNT_BODY} WHERE {where}"), count_params))
+        (await db.scalar(text(f"SELECT COUNT(*) {_COUNT_BODY}{join} WHERE {where}"), count_params))
     )
     return OfflineVipPage(
         items=[_row(dict(row)) for row in rows.mappings().all()],
@@ -189,7 +277,12 @@ async def list_vips(
     )
 
 
-async def statistics(db: AsyncSession) -> OfflineVipStatistics:
+async def statistics(
+    db: AsyncSession,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> OfflineVipStatistics:
     """线下VIP 顶部 10 张统计卡。
 
     口径（详见 docs/api/offline-vip.md）：
@@ -197,10 +290,13 @@ async def statistics(db: AsyncSession) -> OfflineVipStatistics:
     - 即将到期：service_end 落在今天起 30 天内；
     - 已退费：offline_vip 无退费字段，无数据源，恒为 0。
     """
+    where = ["v.deleted_at IS NULL"]
+    params: dict[str, Any] = {}
+    _apply_scope(where, params, scope, scope_params)
     row = (
         await db.execute(
             text(
-                """
+                f"""
                 SELECT
                     COUNT(*) AS vip_count,
                     COALESCE(SUM(v.service_end IS NOT NULL AND v.service_end >= CURDATE()
@@ -216,9 +312,10 @@ async def statistics(db: AsyncSession) -> OfflineVipStatistics:
                         AS promise_meet_month,
                     COALESCE(SUM(v.progress IN ('paused','breakup')), 0) AS refund_risk_count
                 FROM offline_vip v
-                WHERE v.deleted_at IS NULL
+                WHERE {' AND '.join(where)}
                 """
-            )
+            ),
+            params,
         )
     ).mappings().one()
     store_count = _int(
@@ -241,8 +338,17 @@ async def statistics(db: AsyncSession) -> OfflineVipStatistics:
     )
 
 
-async def options(db: AsyncSession) -> OfflineVipOptions:
-    """筛选/抽屉下拉选项：服务红娘、销售红娘、推广红娘、套餐类型。"""
+async def options(
+    db: AsyncSession,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> OfflineVipOptions:
+    """筛选/抽屉下拉选项：服务红娘、销售红娘、推广红娘、套餐类型。
+
+    「套餐类型」取自本账号可见的线下VIP记录（带作用域，D-16）；红娘为全局
+    配置型字典，不随数据范围收敛。
+    """
     staff_rows = (
         await db.execute(
             text(
@@ -275,13 +381,17 @@ async def options(db: AsyncSession) -> OfflineVipOptions:
         OfflineVipOption(id=int(row["id"]), name=str(row["name"] or f"推广红娘#{int(row['id'])}"))
         for row in promoter_rows
     ]
+    package_where = ["package_name IS NOT NULL", "package_name <> ''", "deleted_at IS NULL"]
+    package_params: dict[str, Any] = {}
+    _apply_scope(package_where, package_params, scope, scope_params)
     package_rows = (
         await db.execute(
             text(
-                "SELECT DISTINCT package_name FROM offline_vip"
-                " WHERE package_name IS NOT NULL AND package_name <> '' AND deleted_at IS NULL"
+                "SELECT DISTINCT package_name FROM offline_vip v"
+                f" WHERE {' AND '.join(package_where)}"
                 " ORDER BY package_name"
-            )
+            ),
+            package_params,
         )
     ).scalars().all()
     packages = [str(item) for item in package_rows if item]
@@ -293,11 +403,22 @@ async def options(db: AsyncSession) -> OfflineVipOptions:
     )
 
 
-async def _resolve_member(db: AsyncSession, body: OfflineVipCreate) -> int:
-    """解析「会员账号」：优先 user_id，其次按 lookup 模糊搜索（昵称/手机/姓名/编号）。"""
+async def _resolve_member(
+    db: AsyncSession,
+    body: OfflineVipCreate,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> int:
+    """解析「会员账号」：优先 user_id，其次按 lookup 模糊搜索（昵称/手机/姓名/编号）。
+
+    两种入口都带数据范围：越权会员按「不存在」返回 404（D-16）。
+    """
     if body.user_id:
+        where = ["u.id = :id", "u.status = 1"]
+        params: dict[str, Any] = {"id": body.user_id}
+        _apply_scope(where, params, scope, scope_params)
         found = await db.scalar(
-            text("SELECT id FROM users WHERE id = :id AND status = 1"), {"id": body.user_id}
+            text(f"SELECT u.id FROM users u WHERE {' AND '.join(where)}"), params
         )
         if not found:
             raise HTTPException(404, detail="会员不存在或已停用")
@@ -315,9 +436,12 @@ async def _resolve_member(db: AsyncSession, body: OfflineVipCreate) -> int:
             )
         else:
             condition = f"{column} = :keyword"
+        lookup_where = ["u.status = 1", condition]
+        lookup_params: dict[str, Any] = {"keyword": keyword}
+        _apply_scope(lookup_where, lookup_params, scope, scope_params)
         found = await db.scalar(
-            text(f"SELECT u.id FROM users u WHERE u.status = 1 AND {condition} ORDER BY u.id DESC LIMIT 1"),
-            {"keyword": keyword},
+            text(f"SELECT u.id FROM users u WHERE {' AND '.join(lookup_where)} ORDER BY u.id DESC LIMIT 1"),
+            lookup_params,
         )
         if not found:
             raise HTTPException(404, detail="未找到匹配的会员，请核对昵称/手机/姓名/编号")
@@ -325,9 +449,16 @@ async def _resolve_member(db: AsyncSession, body: OfflineVipCreate) -> int:
     raise HTTPException(400, detail="请填写会员账号（昵称/手机/姓名/编号）")
 
 
-async def create_vip(db: AsyncSession, account_id: int, body: OfflineVipCreate) -> OfflineVipItem:
+async def create_vip(
+    db: AsyncSession,
+    account_id: int,
+    body: OfflineVipCreate,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> OfflineVipItem:
     """新增线下VIP记录。"""
-    user_id = await _resolve_member(db, body)
+    user_id = await _resolve_member(db, body, scope, scope_params)
     duplicate = await db.scalar(
         text("SELECT id FROM offline_vip WHERE user_id = :uid AND deleted_at IS NULL LIMIT 1"),
         {"uid": user_id},
@@ -369,13 +500,21 @@ async def create_vip(db: AsyncSession, account_id: int, body: OfflineVipCreate) 
         {"actor": account_id, "id": vip_id},
     )
     await db.commit()
-    return await get_vip(db, vip_id)
+    return await get_vip(db, vip_id, scope=scope, scope_params=scope_params)
 
 
-async def _fetch_row(db: AsyncSession, vip_id: int) -> dict[str, Any]:
+async def _fetch_row(
+    db: AsyncSession,
+    vip_id: int,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    where = ["v.id = :id", "v.deleted_at IS NULL"]
+    params: dict[str, Any] = {"id": vip_id}
+    _apply_scope(where, params, scope, scope_params)
     row = (
         await db.execute(
-            text(f"{_SELECT_BODY} WHERE v.id = :id AND v.deleted_at IS NULL"), {"id": vip_id}
+            text(f"{_SELECT_BODY} WHERE {' AND '.join(where)}"), params
         )
     ).mappings().first()
     if not row:
@@ -383,15 +522,27 @@ async def _fetch_row(db: AsyncSession, vip_id: int) -> dict[str, Any]:
     return dict(row)
 
 
-async def get_vip(db: AsyncSession, vip_id: int) -> OfflineVipItem:
-    return _row(await _fetch_row(db, vip_id))
+async def get_vip(
+    db: AsyncSession,
+    vip_id: int,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> OfflineVipItem:
+    return _row(await _fetch_row(db, vip_id, scope, scope_params))
 
 
 async def update_vip(
-    db: AsyncSession, vip_id: int, account_id: int, body: OfflineVipUpdate
+    db: AsyncSession,
+    vip_id: int,
+    account_id: int,
+    body: OfflineVipUpdate,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> OfflineVipItem:
     """编辑线下VIP；success_meet_count 发生变化时写入人工修改记录。"""
-    current = await _fetch_row(db, vip_id)
+    current = await _fetch_row(db, vip_id, scope, scope_params)
     payload = body.model_dump(exclude_unset=True)
     payload.pop("meet_change_remark", None)
 
@@ -414,8 +565,11 @@ async def update_vip(
             meet_record = (before, body.success_meet_count, body.meet_change_remark)
 
     if assignments:
+        # 写路径同样带作用域谓词（D-16）：读校验与写之间若归属变化，UPDATE 也不越权落库。
+        update_where = ["id = :id", "deleted_at IS NULL"]
+        _apply_scope(update_where, params, scope, scope_params)
         await db.execute(
-            text(f"UPDATE offline_vip SET {', '.join(assignments)} WHERE id = :id AND deleted_at IS NULL"),
+            text(f"UPDATE offline_vip SET {', '.join(assignments)} WHERE {' AND '.join(update_where)}"),
             params,
         )
     if meet_record is not None:
@@ -441,14 +595,20 @@ async def update_vip(
         {"actor": account_id, "id": vip_id},
     )
     await db.commit()
-    return await get_vip(db, vip_id)
+    return await get_vip(db, vip_id, scope=scope, scope_params=scope_params)
 
 
 async def list_meet_logs(
-    db: AsyncSession, vip_id: int, page: int, page_size: int
+    db: AsyncSession,
+    vip_id: int,
+    page: int,
+    page_size: int,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> OfflineVipMeetLogPage:
     """成功约见次数人工修改记录分页。"""
-    await _fetch_row(db, vip_id)
+    await _fetch_row(db, vip_id, scope, scope_params)
     rows = await db.execute(
         text(
             "SELECT l.id, l.vip_id, l.before_count, l.after_count, l.remark,"

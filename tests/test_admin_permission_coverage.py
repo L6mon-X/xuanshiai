@@ -179,6 +179,7 @@ def test_permission_exemption_is_limited_to_auth_endpoints() -> None:
     assert set(PERMISSION_EXEMPT_SUFFIXES) == {
         "/admin/matchmaker/auth/me",
         "/admin/matchmaker/auth/logout",
+        "/admin/matchmaker/auth/change-password",
     }
     # 业务路由不得再被 "/auth/" 子串误豁免（历史上 member 实名审核曾被放行）。
     assert not _is_permission_exempt("/api/v1/admin/members/auth/realname-reviews")

@@ -169,8 +169,11 @@ async def report_appeals(
     )
 
 
-@router.patch(
+# 前端页面调用的是 POST，语义与 PATCH 完全一致（同一 body、同一幂等结果），
+# 因此两个方法挂到同一个 handler 上，不复制实现。
+@router.api_route(
     "/report-appeals/{appeal_id}/review",
+    methods=["PATCH", "POST"],
     response_model=ReportAppealReviewResponse,
     summary="复审举报申诉",
 )
@@ -185,8 +188,9 @@ async def review_appeal(
     )
 
 
-@router.patch(
+@router.api_route(
     "/community/posts/{post_id}/moderation",
+    methods=["PATCH", "POST"],
     response_model=ContentModerationResponse,
     summary="下架或恢复动态",
 )
@@ -208,8 +212,9 @@ async def moderate_post(
     return ContentModerationResponse(target_type="post", target_id=post_id, status=body.status, reason=body.reason)
 
 
-@router.patch(
+@router.api_route(
     "/community/comments/{comment_id}/moderation",
+    methods=["PATCH", "POST"],
     response_model=ContentModerationResponse,
     summary="下架或恢复评论",
 )
@@ -231,8 +236,9 @@ async def moderate_comment(
     return ContentModerationResponse(target_type="comment", target_id=comment_id, status=body.status, reason=body.reason)
 
 
-@router.patch(
+@router.api_route(
     "/community/paper-planes/{plane_id}/moderation",
+    methods=["PATCH", "POST"],
     response_model=ContentModerationResponse,
     summary="下架或恢复纸飞机",
 )

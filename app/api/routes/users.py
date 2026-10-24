@@ -1,6 +1,7 @@
 """当前用户资料、媒体和择偶要求接口。"""
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, Request, UploadFile
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import CurrentUser, get_current_user
@@ -37,8 +38,44 @@ from app.services.profile import (
     get_profile_overview,
     update_nickname,
 )
+from app.schemas.user_cancellation_admin import UserCancellationSelfResponse
+from app.services.user_cancellation_admin import (
+    cancel_user_cancellation,
+    get_current_user_cancellation,
+    request_user_cancellation,
+)
 
 router = APIRouter(prefix="/users/me")
+
+
+class CancellationRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
+
+
+@router.get("/cancellation", response_model=UserCancellationSelfResponse | None, summary="查询当前账号注销申请")
+async def cancellation_status(
+    current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+) -> UserCancellationSelfResponse | None:
+    return await get_current_user_cancellation(db, current.id)
+
+
+@router.post("/cancellation", response_model=UserCancellationSelfResponse, status_code=201, summary="提交账号注销申请")
+async def request_cancellation(
+    body: CancellationRequest,
+    request: Request,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> UserCancellationSelfResponse:
+    return await request_user_cancellation(
+        db, current.id, body.reason, request.client.host if request.client else None
+    )
+
+
+@router.delete("/cancellation", response_model=UserCancellationSelfResponse, summary="取消待审核的账号注销申请")
+async def cancel_cancellation(
+    current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+) -> UserCancellationSelfResponse:
+    return await cancel_user_cancellation(db, current.id)
 
 
 @router.get("/overview", response_model=ProfileOverviewResponse, summary="获取我的页面聚合信息")

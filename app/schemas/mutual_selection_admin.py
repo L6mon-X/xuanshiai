@@ -28,11 +28,23 @@ class MutualActivityBase(BaseModel):
     success_mode: Literal["show_wechat", "contact_matchmaker"] = "show_wechat"
     notice_html: str | None = Field(default=None, max_length=10000)
     success_notice: str | None = Field(default=None, max_length=10000)
+    # B2：报名 / 互选时间窗、活动收费与微信展示开关
+    signup_start_time: datetime | None = None
+    signup_end_time: datetime | None = None
+    mutual_start_time: datetime | None = None
+    mutual_end_time: datetime | None = None
+    activity_fee: float | None = Field(default=None, ge=0, le=1000000, description="活动收费金额；null 表示不收费")
+    show_wechat_direct: bool = True
+    show_matchmaker_push: bool = False
 
     @model_validator(mode="after")
     def validate_times(self) -> "MutualActivityBase":
         if self.end_time <= self.start_time:
             raise ValueError("end_time 必须晚于 start_time")
+        if self.signup_start_time and self.signup_end_time and self.signup_end_time <= self.signup_start_time:
+            raise ValueError("signup_end_time 必须晚于 signup_start_time")
+        if self.mutual_start_time and self.mutual_end_time and self.mutual_end_time <= self.mutual_start_time:
+            raise ValueError("mutual_end_time 必须晚于 mutual_start_time")
         return self
 
 
@@ -63,6 +75,13 @@ class MutualActivityUpdate(BaseModel):
     success_mode: Literal["show_wechat", "contact_matchmaker"] | None = None
     notice_html: str | None = Field(default=None, max_length=10000)
     success_notice: str | None = Field(default=None, max_length=10000)
+    signup_start_time: datetime | None = None
+    signup_end_time: datetime | None = None
+    mutual_start_time: datetime | None = None
+    mutual_end_time: datetime | None = None
+    activity_fee: float | None = Field(default=None, ge=0, le=1000000)
+    show_wechat_direct: bool | None = None
+    show_matchmaker_push: bool | None = None
     visible: bool | None = None
     sort: int | None = Field(default=None, ge=-1000000, le=1000000)
 
@@ -91,6 +110,10 @@ class MutualActivityPage(BaseModel):
     page_size: int
     total: int
     has_more: bool
+
+
+class MutualActivityOfflineRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=255, description="下线原因，写入审计")
 
 
 class MutualParticipant(BaseModel):

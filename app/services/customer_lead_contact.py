@@ -36,25 +36,34 @@ async def find_conflicting_lead_id(
     exclude_lead_id: int | None = None,
 ) -> int | None:
     """返回占用该联系方式的有效线索 id；phone/wechat 均为空或无冲突时返回 None。"""
-    conditions: list[str] = []
+    contact_conditions: list[str] = []
     params: dict[str, Any] = {}
     if normalize_contact(phone):
-        conditions.append("phone = :conflict_phone")
+        contact_conditions.append("phone = :conflict_phone")
         params["conflict_phone"] = normalize_contact(phone)
     if normalize_contact(wechat):
-        conditions.append("wechat = :conflict_wechat")
+        contact_conditions.append("wechat = :conflict_wechat")
         params["conflict_wechat"] = normalize_contact(wechat)
-    if not conditions:
+    if not contact_conditions:
         return None
+    # 自身排除必须与联系方式组做 AND；并进 OR 组会让条件恒真，导致任何编辑都误判冲突。
+    exclude_clause = ""
     if exclude_lead_id is not None:
+        exclude_clause = " AND id != :conflict_exclude_id"
         params["conflict_exclude_id"] = exclude_lead_id
     exclusion = ", ".join(f"'{status}'" for status in LEAD_INACTIVE_STATUSES)
-    # 联系方式条件之间是 OR，但「排除自己」必须和它们 AND：
-    # 拼进 OR 里会让任意 id≠自身的行都命中，恢复/编辑必然误报 409。
-    clauses = [f"status NOT IN ({exclusion})", f"({' OR '.join(conditions)})"]
-    if exclude_lead_id is not None:
-        clauses.append("id != :conflict_exclude_id")
-    query = f"SELECT id FROM customer_lead WHERE {' AND '.join(clauses)} ORDER BY id LIMIT 1"
+    # 软删除迁移已执行时，被删除的客源不再占用联系方式（与生成列 deleted_at 判定一致）；
+    # 未执行迁移时缺列，静默跳过该谓词，保证「先发版后迁移」不报错。
+    active_clause = ""
+    cols = (await db.execute(text("""SELECT COLUMN_NAME FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'customer_lead' AND COLUMN_NAME = 'deleted_at'"""))).all()
+    if cols:
+        active_clause = "AND deleted_at IS NULL "
+    query = (
+        f"SELECT id FROM customer_lead WHERE status NOT IN ({exclusion}) "
+        f"{active_clause}"
+        f"AND ({' OR '.join(contact_conditions)}){exclude_clause} ORDER BY id LIMIT 1"
+    )
     return await db.scalar(text(query), params)
 
 

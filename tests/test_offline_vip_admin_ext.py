@@ -151,3 +151,33 @@ def test_create_accepts_dates_and_decimal_amount() -> None:
     assert body.sign_date == date(2026, 9, 1)
     assert body.contract_amount == Decimal("19800.00")
     assert body.attach_urls == ["/storage/contract/a.webp"]
+
+
+def test_column_sort_whitelist_is_server_side_fixed_sql() -> None:
+    """表头列排序只认白名单，且不引用 offline_vip 上不存在的列。
+
+    回归点：`last_follow` 一度写成 `v.last_follow_at`，而该列并不存在于
+    offline_vip（跟进时间是 SELECT 里的子查询别名），线上直接 500。
+    """
+    from app.services.offline_vip_admin import COLUMN_SORT_SQL
+
+    assert set(COLUMN_SORT_SQL) == {
+        "sign_date", "package", "progress", "last_follow", "amount", "matchmaker", "id",
+    }
+    for key, sql in COLUMN_SORT_SQL.items():
+        # 全部是服务端常量片段，不含任何绑定占位符（不接受用户输入拼接）
+        assert ":" not in sql, key
+    assert "v.last_follow_at" not in COLUMN_SORT_SQL["last_follow"]
+    assert "member_follow_up" in COLUMN_SORT_SQL["last_follow"]
+
+
+def test_column_sort_param_is_optional_and_patterned() -> None:
+    """非法排序键在路由层 422，不进 SQL。"""
+    params = client.get("/openapi.json").json()["paths"]["/api/v1/admin/offline-vips"]["get"]["parameters"]
+    column_sort = next(item for item in params if item["name"] == "column_sort")
+    assert column_sort["required"] is False
+    # Optional 参数在 OpenAPI 里是 anyOf[string, null]，pattern 挂在第一个分支上
+    patterns = [branch.get("pattern") for branch in column_sort["schema"].get("anyOf", [])]
+    pattern = next(item for item in patterns if item)
+    assert "sign_date" in pattern and "last_follow" in pattern
+    assert "nope" not in pattern

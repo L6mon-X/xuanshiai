@@ -245,6 +245,9 @@ class DatabaseManager:
                 "deletion_scheduled_at": "`deletion_scheduled_at` datetime DEFAULT NULL",
                 "deletion_cancelled_at": "`deletion_cancelled_at` datetime DEFAULT NULL",
                 "deleted_at": "`deleted_at` datetime DEFAULT NULL",
+                "login_num": "`login_num` int NOT NULL DEFAULT 0 COMMENT '累计登录次数（A12）'",
+                "ip_region": "`ip_region` varchar(64) DEFAULT NULL COMMENT 'IP 属地（A12，展示用，待解析回填）'",
+                "phone_region": "`phone_region` varchar(64) DEFAULT NULL COMMENT '手机号归属地（A12，展示用，待解析回填）'",
             },
             "user_auth": {
                 "realname_status": "`realname_status` tinyint NOT NULL DEFAULT '0' COMMENT '0未认证 1认证中 2通过 3失败 4人工复核 5撤销'",
@@ -484,6 +487,9 @@ class DatabaseManager:
                 "pay_status": "`pay_status` tinyint NOT NULL DEFAULT '0' COMMENT '0未支付 1已支付'",
                 "pay_method": "`pay_method` varchar(32) DEFAULT NULL COMMENT '支付方式'",
             },
+            "user_session": {
+                "impersonated_by": "`impersonated_by` bigint unsigned DEFAULT NULL COMMENT '模拟登录发起管理员 id（A12）'",
+            },
         }
 
         for table_name, columns in required_columns.items():
@@ -496,6 +502,75 @@ class DatabaseManager:
         self._ensure_idempotency_contract(cursor)
         self._ensure_ai_advisor_indexes(cursor)
         self._ensure_customer_lead_contact_uniqueness(cursor)
+        self._ensure_customer_lead_soft_delete_and_source(cursor)
+
+    def _ensure_customer_lead_soft_delete_and_source(self, cursor):
+        """客源软删除列 + 来源字典表（旧库幂等补齐）。
+
+        镜像 migrations/customer_lead_gaps/20261024_01_..._up.sql：
+        - customer_lead 补 deleted_at / deleted_by 与索引 idx_customer_lead_deleted；
+        - 旧库已有的 active_phone / active_wechat 生成列定义不含 deleted_at，
+          需检测并重建为「软删除也置 NULL」，才能让删除后的客源不再占用联系方式；
+        - 新建 customer_lead_source 字典表并幂等播种常见来源（INSERT IGNORE）。
+        """
+        try:
+            cursor.execute("SHOW TABLES LIKE 'customer_lead'")
+            if not cursor.fetchone():
+                return
+            self._ensure_table_columns(cursor, "`customer_lead`", self._named_columns({
+                "gender": "tinyint NOT NULL DEFAULT 0 COMMENT '性别 0未知 1男 2女（A13）'",
+                "deleted_at": "datetime DEFAULT NULL COMMENT '软删除时间；空为有效'",
+                "deleted_by": "bigint unsigned DEFAULT NULL COMMENT '删除操作人 matchmaker_admin_account.id'",
+            }))
+            self._ensure_optional_index(cursor, "customer_lead", "idx_customer_lead_deleted", "(`deleted_at`)")
+            # 生成列旧定义不引用 deleted_at，软删除后仍会占用联系方式唯一键；
+            # 检测到缺引用时重建（先删唯一索引与列，再按新定义重建）。
+            for column, ddl, base in (
+                ("active_phone", "varchar(32)", "phone"),
+                ("active_wechat", "varchar(128)", "wechat"),
+            ):
+                cursor.execute(
+                    "SELECT GENERATION_EXPRESSION FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'customer_lead' "
+                    "AND COLUMN_NAME = %s",
+                    (column,),
+                )
+                row = cursor.fetchone()
+                if not row or "deleted_at" in (row[0] or ""):
+                    continue
+                cursor.execute(f"ALTER TABLE `customer_lead` DROP INDEX `uk_customer_lead_{column}`")
+                cursor.execute(f"ALTER TABLE `customer_lead` DROP COLUMN `{column}`")
+                cursor.execute(
+                    f"ALTER TABLE `customer_lead` ADD COLUMN `{column}` {ddl} GENERATED ALWAYS AS "
+                    f"(CASE WHEN `status` IN ('LOST','CLOSED') OR `deleted_at` IS NOT NULL "
+                    f"THEN NULL ELSE NULLIF(TRIM(`{base}`), '') END) STORED"
+                )
+                cursor.execute(
+                    f"ALTER TABLE `customer_lead` ADD UNIQUE KEY `uk_customer_lead_{column}` (`{column}`)"
+                )
+                logger.info(f"✅ 已重建 customer_lead.{column} 生成列（纳入 deleted_at 判定）")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS `customer_lead_source` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `name` varchar(64) NOT NULL COMMENT '来源名称',
+                    `color` varchar(16) DEFAULT NULL COMMENT '展示颜色',
+                    `enabled` tinyint NOT NULL DEFAULT 1 COMMENT '是否启用 1是 0否',
+                    `sort` int NOT NULL DEFAULT 0 COMMENT '排序，越小越靠前',
+                    `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_customer_lead_source` (`name`),
+                    KEY `idx_customer_lead_source_sort` (`enabled`, `sort`, `id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='客源来源字典配置'
+            """)
+            cursor.execute("""
+                INSERT IGNORE INTO customer_lead_source (name, sort, enabled) VALUES
+                ('抖音', 10, 1), ('微信群', 20, 1), ('本地群', 30, 1), ('身边朋友', 40, 1),
+                ('同行群', 50, 1), ('朋友圈', 60, 1), ('朋友介绍', 70, 1), ('QQ', 80, 1),
+                ('其他渠道', 90, 1), ('落地页', 100, 1), ('批量导入', 110, 1)
+            """)
+        except Exception as exc:
+            logger.warning(f"⚠️ customer_lead 软删除列/来源字典表迁移失败: {exc}")
 
     def _ensure_ai_advisor_indexes(self, cursor):
         """补齐 AI 军师旧表的幂等索引，避免重复请求重复扣额度。"""
@@ -717,6 +792,62 @@ class DatabaseManager:
                 (71, 7, '维护门店', NULL, 'button', 'matchmaker.organization.manage', NULL, 1, 1),
                 (81, 8, '编辑红娘', NULL, 'button', 'matchmaker.manage', NULL, 1, 1)
         """)
+        # D-17：补齐被 URL 权限映射 / @declare_permission / require() 引用、但未登记
+        # 菜单种子的权限码（此前只有 `*` 超管可用，普通后台账号访问必 403）。
+        # 保留 id 100+ 段位，避免与上面的既有 id 冲突；INSERT IGNORE 幂等。
+        cursor.execute("""
+            INSERT IGNORE INTO admin_menu
+                (id, parent_id, name, path, menu_type, permission_code, icon, sort, status)
+            VALUES
+                (32, 3, '模拟登录会员', NULL, 'button', 'matchmaker.member.impersonate', NULL, 2, 1),
+                (52, 5, '查看约见反馈', NULL, 'button', 'meeting.feedback.read', NULL, 2, 1),
+                (61, 6, '财务操作', NULL, 'button', 'finance.write', NULL, 1, 1),
+                (82, 8, '查看红娘', NULL, 'button', 'matchmaker.read', NULL, 2, 1),
+                (100, NULL, '平台配置', '/platform-config', 'menu', 'platform.config.read', 'setting', 100, 1),
+                (101, NULL, '消息管理', '/messages', 'menu', 'message.read', 'message', 110, 1),
+                (102, NULL, '内容治理', '/community', 'menu', 'community.read', 'community', 120, 1),
+                (103, NULL, '活动管理', '/activities', 'menu', 'community.activity.read', 'activity', 130, 1),
+                (104, NULL, '商家联盟', '/merchant', 'menu', 'merchant.read', 'merchant', 140, 1),
+                (105, NULL, '短视频', '/short-video', 'menu', 'video.read', 'video', 150, 1),
+                (106, NULL, '奖励规则', '/reward-rules', 'menu', 'reward.read', 'reward', 160, 1),
+                (107, NULL, '佣金等级', '/commission-levels', 'menu', 'commission.read', 'commission', 170, 1),
+                (108, NULL, '服务商品', '/service-products', 'menu', 'matchmaker.product.read', 'product', 180, 1),
+                (109, NULL, '分派配置', '/apportion-config', 'menu', 'matchmaker.apportion.read', 'apportion', 190, 1),
+                (110, NULL, '红娘申请', '/matchmaker-applications', 'menu', 'matchmaker.application.read', 'apply', 200, 1),
+                (111, NULL, '系统工单', '/tickets', 'menu', 'matchmaker.system.read', 'ticket', 210, 1),
+                (1001, 100, '编辑平台配置', NULL, 'button', 'platform.config.write', NULL, 1, 1),
+                (1011, 101, '消息处置', NULL, 'button', 'message.manage', NULL, 1, 1),
+                (1021, 102, '内容处置', NULL, 'button', 'community.moderate', NULL, 1, 1),
+                (1031, 103, '活动编辑', NULL, 'button', 'community.activity.manage', NULL, 1, 1),
+                (1041, 104, '商家编辑', NULL, 'button', 'merchant.manage', NULL, 1, 1),
+                (1051, 105, '短视频编辑', NULL, 'button', 'video.manage', NULL, 1, 1),
+                (1061, 106, '奖励规则编辑', NULL, 'button', 'reward.write', NULL, 1, 1),
+                (1071, 107, '佣金等级编辑', NULL, 'button', 'commission.write', NULL, 1, 1),
+                (1081, 108, '商品编辑', NULL, 'button', 'matchmaker.product.manage', NULL, 1, 1),
+                (1091, 109, '分派配置编辑', NULL, 'button', 'matchmaker.apportion.write', NULL, 1, 1),
+                (1101, 110, '红娘申请审核', NULL, 'button', 'matchmaker.application.review', NULL, 1, 1),
+                (1111, 111, '工单处置', NULL, 'button', 'matchmaker.system.manage', NULL, 1, 1),
+                (112, NULL, '短信管理', '/sms', 'menu', 'platform.sms.read', 'message', 220, 1),
+                (113, NULL, '公众号管理', '/wechat-mp', 'menu', 'platform.wechat.read', 'wechat', 230, 1),
+                (114, NULL, '电子合同', '/e-contracts', 'menu', 'finance.contract.read', 'contract', 240, 1),
+                (115, NULL, '素材库', '/materials', 'menu', 'platform.material.read', 'media', 250, 1),
+                (116, NULL, '二维码管理', '/qrcodes', 'menu', 'platform.qrcode.read', 'qrcode', 260, 1),
+                (117, NULL, '电话外呼', '/outbound-call', 'menu', 'platform.outbound.read', 'phone', 270, 1),
+                (118, NULL, '销售话术库', '/sales-library', 'menu', 'platform.sales.read', 'sales', 280, 1),
+                (119, NULL, '相亲卡管理', '/lovecard', 'menu', 'platform.lovecard.read', 'lovecard', 290, 1),
+                (120, NULL, '互动内容', '/interact-content', 'menu', 'platform.interact.read', 'chat', 300, 1),
+                (121, NULL, '联盟活动', '/active-alliance', 'menu', 'platform.alliance.read', 'alliance', 310, 1),
+                (1121, 112, '短信编辑', NULL, 'button', 'platform.sms.write', NULL, 1, 1),
+                (1131, 113, '公众号编辑', NULL, 'button', 'platform.wechat.write', NULL, 1, 1),
+                (1141, 114, '合同编辑', NULL, 'button', 'finance.contract.write', NULL, 1, 1),
+                (1151, 115, '素材编辑', NULL, 'button', 'platform.material.write', NULL, 1, 1),
+                (1161, 116, '二维码编辑', NULL, 'button', 'platform.qrcode.write', NULL, 1, 1),
+                (1171, 117, '外呼编辑', NULL, 'button', 'platform.outbound.write', NULL, 1, 1),
+                (1181, 118, '话术编辑', NULL, 'button', 'platform.sales.write', NULL, 1, 1),
+                (1191, 119, '相亲卡编辑', NULL, 'button', 'platform.lovecard.write', NULL, 1, 1),
+                (1201, 120, '互动内容编辑', NULL, 'button', 'platform.interact.write', NULL, 1, 1),
+                (1211, 121, '联盟活动编辑', NULL, 'button', 'platform.alliance.write', NULL, 1, 1)
+        """)
         cursor.execute("""
             INSERT IGNORE INTO matchmaker_tutorial (id, title, content, link_url, status)
             VALUES (
@@ -764,13 +895,13 @@ class DatabaseManager:
         column_specs = {
             "active_phone": (
                 "ADD COLUMN `active_phone` varchar(32) GENERATED ALWAYS AS "
-                "(CASE WHEN `status` IN ('LOST','CLOSED') THEN NULL ELSE NULLIF(TRIM(`phone`), '') END) STORED "
-                "COMMENT '有效手机号（弃海/关闭为NULL，唯一）'"
+                "(CASE WHEN `status` IN ('LOST','CLOSED') OR `deleted_at` IS NOT NULL THEN NULL ELSE NULLIF(TRIM(`phone`), '') END) STORED "
+                "COMMENT '有效手机号（弃海/关闭/删除为NULL，唯一）'"
             ),
             "active_wechat": (
                 "ADD COLUMN `active_wechat` varchar(128) GENERATED ALWAYS AS "
-                "(CASE WHEN `status` IN ('LOST','CLOSED') THEN NULL ELSE NULLIF(TRIM(`wechat`), '') END) STORED "
-                "COMMENT '有效微信（弃海/关闭为NULL，唯一）'"
+                "(CASE WHEN `status` IN ('LOST','CLOSED') OR `deleted_at` IS NOT NULL THEN NULL ELSE NULLIF(TRIM(`wechat`), '') END) STORED "
+                "COMMENT '有效微信（弃海/关闭/删除为NULL，唯一）'"
             ),
         }
         unique_specs = {
@@ -1113,7 +1244,10 @@ class DatabaseManager:
                     `is_single_pledge` tinyint DEFAULT '0' COMMENT '是否签署单身承诺 0否 1是',
                     `data_complete_rate` tinyint DEFAULT '0' COMMENT '资料完整度 0-100',
                     `register_ip` varchar(64) DEFAULT NULL,
+                    `ip_region` varchar(64) DEFAULT NULL COMMENT 'IP 属地（A12，展示用，待解析回填）',
+                    `phone_region` varchar(64) DEFAULT NULL COMMENT '手机号归属地（A12，展示用，待解析回填）',
                     `last_login_at` datetime DEFAULT NULL,
+                    `login_num` int NOT NULL DEFAULT 0 COMMENT '累计登录次数（A12）',
                     `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
                     `updated_at` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     PRIMARY KEY (`id`),
@@ -1189,11 +1323,13 @@ class DatabaseManager:
                     `refresh_expire_at` datetime NOT NULL,
                     `revoked_at` datetime DEFAULT NULL,
                     `revoke_reason` varchar(64) DEFAULT NULL,
+                    `impersonated_by` bigint unsigned DEFAULT NULL COMMENT '模拟登录发起管理员 id（A12，NULL=正常登录会话）',
                     `status` tinyint NOT NULL DEFAULT '1' COMMENT '1有效 2撤销 3过期',
                     PRIMARY KEY (`id`),
                     UNIQUE KEY `uk_refresh_token_hash` (`refresh_token_hash`),
                     KEY `idx_session_user_status` (`user_id`,`status`),
                     KEY `idx_session_device` (`device_id`),
+                    KEY `idx_session_impersonated_by` (`impersonated_by`),
                     KEY `idx_session_refresh_expire` (`refresh_expire_at`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='用户登录会话'
             """,
@@ -3285,6 +3421,10 @@ class DatabaseManager:
         self._ensure_m6_columns(cursor)
         # M7 活动报名（offline_activity 补字段 + activity_signup 补字段）+ 商家/短视频分类种子
         self._ensure_m7_columns(cursor)
+        # 后台筛选参数补列（users / user_profile / customer_lead / admin_content_item）
+        self._ensure_filter_columns(cursor)
+        # B2 互选活动：报名/互选时间窗、活动收费与微信展示开关
+        self._ensure_mutual_selection_columns(cursor)
 
         # M10 账号注销申请 + 平台工单反馈（旧库幂等补齐）
         # 两张表已由 BUSINESS_TABLES 中 CREATE TABLE IF NOT EXISTS 直接创建，
@@ -3433,6 +3573,24 @@ class DatabaseManager:
             "link_url": "varchar(255) DEFAULT NULL COMMENT '分站访问链接'",
             "sort_order": "int NOT NULL DEFAULT 0 COMMENT '显示排序，数字越大越靠前'",
             "qr_code": "varchar(500) DEFAULT NULL COMMENT '分站链接/二维码图片地址'",
+            # B1：门店页面「独立 LOGO / 地址 / 分成方式 / 门店简介」四项
+            "logo": "varchar(500) DEFAULT NULL COMMENT '门店独立 LOGO'",
+            "address": "varchar(255) DEFAULT NULL COMMENT '门店地址'",
+            "commission_mode": "varchar(16) NOT NULL DEFAULT 'fixed' COMMENT 'fixed 固定金额 / ratio 按比例'",
+            "commission_value": "decimal(12,2) NOT NULL DEFAULT 0.00 COMMENT '固定金额或比例值（ratio 时为百分比）'",
+            "intro": "text COMMENT '门店简介'",
+        }))
+
+    def _ensure_mutual_selection_columns(self, cursor) -> None:
+        """B2：互选活动补充报名/互选时间窗、活动收费与微信展示开关（旧库幂等补齐）。"""
+        self._ensure_table_columns(cursor, "`mutual_selection_activity`", self._named_columns({
+            "signup_start_time": "datetime DEFAULT NULL COMMENT '活动报名开始时间'",
+            "signup_end_time": "datetime DEFAULT NULL COMMENT '活动报名结束时间'",
+            "mutual_start_time": "datetime DEFAULT NULL COMMENT '互选开始时间'",
+            "mutual_end_time": "datetime DEFAULT NULL COMMENT '互选结束时间'",
+            "activity_fee": "decimal(10,2) DEFAULT NULL COMMENT '活动收费金额；NULL 表示不收费'",
+            "show_wechat_direct": "tinyint NOT NULL DEFAULT 1 COMMENT '显示双方微信自己加'",
+            "show_matchmaker_push": "tinyint NOT NULL DEFAULT 0 COMMENT '提示联系红娘推送微信号'",
         }))
 
     def _ensure_m6_columns(self, cursor) -> None:
@@ -3536,6 +3694,48 @@ class DatabaseManager:
             INSERT IGNORE INTO short_video_category (name, sort, status)
             VALUES ('关于我们', 1, 1), ('脱单干货', 2, 1), ('活动瞬间', 3, 1), ('优质嘉宾', 4, 1), ('直播切片', 5, 1)
         """)
+
+    def _ensure_filter_columns(self, cursor) -> None:
+        """后台筛选参数补列（旧库幂等补齐）。
+
+        镜像 migrations/filters/20261011_01_admin_filter_columns_up.sql：会员资料、
+        客源线索、内容类筛选项在旧库没有对应列，不补齐新版筛选 SQL 会报 Unknown column。
+        所有新增 NOT NULL 列都带默认值，存量行落到默认值，不改写业务数据。
+        """
+        self._ensure_table_columns(cursor, "`users`", self._named_columns({
+            "source": "varchar(32) DEFAULT NULL COMMENT '会员登记来源：后台添加/红娘录入/批量导入/自己注册/落地页/父母登记/线索入库/活动入库/找搭子'",
+            "region": "varchar(16) DEFAULT NULL COMMENT '证件或户籍地区：mainland中国大陆/hmt港澳台/overseas国外'",
+            "cert_status": "tinyint NOT NULL DEFAULT 0 COMMENT '身份认证状态 0未认证 1已认证 2待审核 3认证失败'",
+            "wechat_added": "tinyint NOT NULL DEFAULT 0 COMMENT '加微信结果 0未添加 1已加上 2没加上'",
+            "promoted": "tinyint NOT NULL DEFAULT 0 COMMENT '置顶推广 0否 1是'",
+            "newcomer": "tinyint NOT NULL DEFAULT 0 COMMENT '新人推荐 0否 1是'",
+            "activity_signup": "tinyint NOT NULL DEFAULT 0 COMMENT '活动报名 0否 1是'",
+            "level": "varchar(32) DEFAULT NULL COMMENT '会员级别'",
+            "fetched_at": "datetime DEFAULT NULL COMMENT '最近一次被红娘捞取的时间'",
+        }))
+        self._ensure_table_columns(cursor, "`user_profile`", self._named_columns({
+            "car": "varchar(32) DEFAULT NULL COMMENT '购车情况'",
+            "household": "varchar(128) DEFAULT NULL COMMENT '户口所在地'",
+        }))
+        self._ensure_table_columns(cursor, "`customer_lead`", self._named_columns({
+            "age": "int DEFAULT NULL COMMENT '年龄'",
+            "height": "int DEFAULT NULL COMMENT '身高cm'",
+            "marriage": "varchar(32) DEFAULT NULL COMMENT '婚况'",
+            "education": "varchar(32) DEFAULT NULL COMMENT '学历'",
+            "occupation": "varchar(128) DEFAULT NULL COMMENT '职业'",
+            "residence": "varchar(128) DEFAULT NULL COMMENT '现居地'",
+            "hometown": "varchar(128) DEFAULT NULL COMMENT '家乡'",
+            "xiangqin_status": "tinyint NOT NULL DEFAULT 0 COMMENT '相亲状态 0未填 1公开相亲 2委托红娘 3完全私密 4关闭相亲 5已经脱单'",
+            "bind_mode": "varchar(16) DEFAULT NULL COMMENT '落户方式 bind绑定已有账号/auto自动生成账号/custom自定义创建'",
+            "wechat_added": "tinyint NOT NULL DEFAULT 0 COMMENT '加微信结果 0未添加 1已加上 2没加上'",
+            "assigned_at": "datetime DEFAULT NULL COMMENT '最近一次分派时间'",
+        }))
+        # admin_content_item 的域特有字段按设计存放在 extra_json，筛选走
+        # JSON_EXTRACT，不需要补列（见 migrations/filters/README.md）。
+        self._ensure_optional_index(cursor, "users", "idx_users_source", "(`source`)")
+        self._ensure_optional_index(cursor, "users", "idx_users_fetched", "(`fetched_at`)")
+        self._ensure_optional_index(cursor, "customer_lead", "idx_customer_lead_assigned", "(`assigned_at`)")
+        self._ensure_optional_index(cursor, "customer_lead", "idx_customer_lead_xiangqin", "(`xiangqin_status`)")
 
     def _ensure_optional_index(self, cursor, table_name: str, index_name: str, definition: str) -> None:
         """幂等创建索引：表不存在或索引已存在时静默跳过。"""

@@ -15,12 +15,14 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
 from app.api.router import OPENAPI_TAGS, api_router
 from app.api.routes.admin_home import legacy_router as admin_home_legacy_router
+from app.api.routes.compatibility import legacy_router as compatibility_legacy_router
 from app.core.config import settings
 from app.core.logging import configure_logging, request_id_context
+from app.core.security import impersonation_admin_id
 from app.db.session import engine, session_factory
 from app.services.media_access import MediaAccessUnavailable, verify_media_access
 
@@ -169,6 +171,27 @@ def create_app() -> FastAPI:
         finally:
             request_id_context.reset(context_token)
 
+    _IMPERSONATION_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+    @application.middleware("http")
+    async def enforce_impersonation_readonly(request: Request, call_next) -> Response:
+        """A12-模拟登录：只读守卫。
+
+        带 imp 声明的短时模拟令牌只能执行安全方法（GET/HEAD/OPTIONS），
+        任何写方法（POST/PUT/PATCH/DELETE）一律 403。令牌无效/无声明直接
+        透传，交由各路由的鉴权依赖处理（普通登录/后台管理员令牌不受影响）。
+        """
+        if request.method in _IMPERSONATION_WRITE_METHODS:
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                token = auth_header[7:].strip()
+                if token and impersonation_admin_id(token) is not None:
+                    return JSONResponse(
+                        status_code=403,
+                        content={"detail": "模拟登录态为只读，不允许执行写操作"},
+                    )
+        return await call_next(request)
+
     # Minimal Linux images may not register WebP in Python's MIME table.
     mimetypes.add_type("image/webp", ".webp")
     mimetypes.add_type("video/mp4", ".mp4")
@@ -185,6 +208,7 @@ def create_app() -> FastAPI:
     application.include_router(api_router, prefix=settings.api_prefix)
     # The captured production admin uses these compatibility paths without /api/v1.
     application.include_router(admin_home_legacy_router)
+    application.include_router(compatibility_legacy_router)
 
     @application.get("/", tags=["系统"])
     async def root() -> dict[str, str]:

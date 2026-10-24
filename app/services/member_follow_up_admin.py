@@ -26,6 +26,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.services.media_access import MEDIA_CATEGORY_FOLLOW_UP, sign_media_url
 from app.schemas.member_follow_up_admin import (
+    MemberCallRecordListPage,
+    MemberCallRecordRow,
     MemberFollowUp,
     MemberFollowUpImportResult,
     MemberFollowUpListPage,
@@ -40,6 +42,19 @@ _METHOD_LABELS: dict[str, str] = {
     "WECHAT": "微信",
     "VISIT": "面谈",
     "OTHER": "其他",
+}
+
+# 通话方向库内枚举 -> 中文
+_CALL_DIRECTION_LABELS: dict[str, str] = {
+    "INBOUND": "呼入",
+    "OUTBOUND": "呼出",
+}
+
+# 通话状态库内枚举 -> 中文
+_CALL_STATUS_LABELS: dict[str, str] = {
+    "COMPLETED": "已完成",
+    "MISSED": "未接听",
+    "FAILED": "失败",
 }
 
 # 导入模板表头（顺序即模板列顺序）
@@ -124,8 +139,39 @@ SELECT
     COALESCE(SUM(DATE_FORMAT(created_at, '%Y-%m')
         = DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 1 MONTH), '%Y-%m')), 0)
         AS last_month_count
-FROM member_follow_up
+FROM member_follow_up f
 """
+
+
+def _apply_scope(
+    where: list[str],
+    params: dict[str, Any],
+    scope: str | None,
+    scope_params: dict[str, Any] | None,
+) -> None:
+    """把四档数据范围谓词并入查询（D-16）。
+
+    `member_follow_up` 自身不带归属列，归属在会员（`f.user_id`）的
+    ``resource_assignment``；谓词由路由层用
+    `CurrentMatchmakerAdmin.scope_exists_clause`（唯一实现）生成后下传。
+    """
+    if not scope:
+        return
+    params.update(scope_params or {})
+    where.append(f"({scope})")
+
+
+async def _member_visible(
+    db: AsyncSession,
+    user_id: int,
+    scope: str | None,
+    scope_params: dict[str, Any] | None,
+) -> bool:
+    """会员是否存在且在当前账号的数据范围内（D-16，越权返回 False -> 404）。"""
+    where = ["id = :id"]
+    params: dict[str, Any] = {"id": user_id}
+    _apply_scope(where, params, scope, scope_params)
+    return bool(await db.scalar(text(f"SELECT 1 FROM users WHERE {' AND '.join(where)}"), params))
 
 
 def _to_int(value: Any) -> int:
@@ -134,6 +180,27 @@ def _to_int(value: Any) -> int:
 
 def _method_label(method: str | None) -> str:
     return _METHOD_LABELS.get(str(method or "").upper(), "其他")
+
+
+def _call_row(payload: dict[str, Any]) -> MemberCallRecordRow:
+    """数据库行 -> 通话记录列表行。"""
+    direction = str(payload.get("direction") or "OUTBOUND").upper()
+    status = str(payload.get("status") or "COMPLETED").upper()
+    duration = payload.get("duration_seconds")
+    return MemberCallRecordRow(
+        id=int(payload["id"]),
+        user_id=int(payload["user_id"]),
+        member_code=payload.get("member_code") or f"G{int(payload['user_id']):06d}",
+        nickname=payload.get("nickname"),
+        matchmaker_name=payload.get("matchmaker_name") or "admin",
+        direction=direction,
+        direction_label=_CALL_DIRECTION_LABELS.get(direction, "呼出"),
+        status=status,
+        status_label=_CALL_STATUS_LABELS.get(status, "已完成"),
+        duration_seconds=int(duration) if duration is not None else None,
+        remark=payload.get("remark"),
+        created_at=payload.get("created_at"),
+    )
 
 
 def _row(payload: dict[str, Any]) -> MemberFollowUpRow:
@@ -163,12 +230,17 @@ async def list_follow_ups(
     page_size: int,
     keyword: str | None = None,
     intention_level: int | None = None,
+    wechat_added: int | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> MemberFollowUpListPage:
     """跟进全览分页列表。keyword 匹配昵称/手机号/实名/会员编号。"""
     conditions = ["1=1"]
     params: dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size}
+    _apply_scope(conditions, params, scope, scope_params)
     if keyword:
         conditions.append(
             "(u.nickname LIKE CONCAT('%', :keyword, '%')"
@@ -180,6 +252,9 @@ async def list_follow_ups(
     if intention_level is not None:
         conditions.append("p.intention_level = :intention_level")
         params["intention_level"] = intention_level
+    if wechat_added is not None:
+        conditions.append("u.wechat_added = :wechat_added")
+        params["wechat_added"] = wechat_added
     if start_date:
         conditions.append("f.created_at >= :start_date")
         params["start_date"] = start_date
@@ -207,9 +282,85 @@ async def list_follow_ups(
     )
 
 
-async def follow_up_summary(db: AsyncSession) -> MemberFollowUpSummary:
+_CALL_LIST_BODY = """
+SELECT c.id, c.user_id, c.direction, c.status, c.duration_seconds, c.remark, c.created_at,
+       u.nickname,
+       CONCAT('G', LPAD(u.id, 6, '0')) AS member_code,
+       COALESCE(acc.display_name, mk.nickname, 'admin') AS matchmaker_name
+FROM member_call_record c
+JOIN users u ON u.id = c.user_id
+LEFT JOIN matchmaker_admin_account acc ON acc.id = c.created_by
+LEFT JOIN users mk ON mk.id = c.created_by
+"""
+
+_CALL_COUNT_BODY = """
+FROM member_call_record c
+JOIN users u ON u.id = c.user_id
+"""
+
+
+async def list_call_records(
+    db: AsyncSession,
+    page: int,
+    page_size: int,
+    keyword: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> MemberCallRecordListPage:
+    """通话记录跨会员分页列表（跟进全览页签）。keyword 匹配昵称/手机号/实名/会员编号。"""
+    conditions = ["1=1"]
+    params: dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size}
+    _apply_scope(conditions, params, scope, scope_params)
+    if keyword:
+        conditions.append(
+            "(u.nickname LIKE CONCAT('%', :keyword, '%')"
+            " OR u.phone LIKE CONCAT('%', :keyword, '%')"
+            " OR CONCAT('G', LPAD(u.id, 6, '0')) LIKE CONCAT('%', :keyword, '%'))"
+        )
+        params["keyword"] = keyword
+    if start_date:
+        conditions.append("c.created_at >= :start_date")
+        params["start_date"] = start_date
+    if end_date:
+        conditions.append("c.created_at < DATE_ADD(:end_date, INTERVAL 1 DAY)")
+        params["end_date"] = end_date
+    where = " AND ".join(conditions)
+    rows = await db.execute(
+        text(
+            f"{_CALL_LIST_BODY} WHERE {where}"
+            " ORDER BY c.created_at DESC, c.id DESC LIMIT :limit OFFSET :offset"
+        ),
+        params,
+    )
+    count_params = {k: v for k, v in params.items() if k not in ("limit", "offset")}
+    total = _to_int(
+        (await db.scalar(text(f"SELECT COUNT(*) {_CALL_COUNT_BODY} WHERE {where}"), count_params))
+    )
+    return MemberCallRecordListPage(
+        items=[_call_row(dict(row)) for row in rows.mappings().all()],
+        page=page,
+        page_size=page_size,
+        total=total,
+        has_more=page * page_size < total,
+    )
+
+
+async def follow_up_summary(
+    db: AsyncSession,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> MemberFollowUpSummary:
     """跟进全览 8 个时间统计卡计数。"""
-    row = (await db.execute(text(_SUMMARY_SQL))).mappings().one()
+    where = ["1=1"]
+    params: dict[str, Any] = {}
+    _apply_scope(where, params, scope, scope_params)
+    row = (
+        await db.execute(text(f"{_SUMMARY_SQL} WHERE {' AND '.join(where)}"), params)
+    ).mappings().one()
     return MemberFollowUpSummary(
         all=_to_int(row["all_count"]),
         today=_to_int(row["today_count"]),
@@ -350,6 +501,9 @@ async def import_follow_ups(
     account_id: int,
     data: bytes,
     filename: str,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> MemberFollowUpImportResult:
     """解析上传的 Excel，按手机号匹配会员后批量写入历史跟进记录。
 
@@ -397,9 +551,12 @@ async def import_follow_ups(
             errors.append(f"第 {excel_row} 行：缺少跟进内容")
             continue
 
+        lookup_where = ["phone = :phone", "status = 1"]
+        lookup_params: dict[str, Any] = {"phone": phone}
+        _apply_scope(lookup_where, lookup_params, scope, scope_params)
         user_id = await db.scalar(
-            text("SELECT id FROM users WHERE phone = :phone AND status = 1 LIMIT 1"),
-            {"phone": phone},
+            text(f"SELECT id FROM users WHERE {' AND '.join(lookup_where)} LIMIT 1"),
+            lookup_params,
         )
         if not user_id:
             failed += 1
@@ -592,14 +749,21 @@ def _sign_follow_up_media(item: MemberFollowUp, viewer: int) -> MemberFollowUp:
 
 
 async def get_member_follow_ups(
-    db: AsyncSession, member_id: int, page: int, page_size: int, *, viewer: int
+    db: AsyncSession,
+    member_id: int,
+    page: int,
+    page_size: int,
+    *,
+    viewer: int,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> MemberFollowUpPage:
     """查询单个会员的跟进记录（含图片/录音与跟进红娘称呼），倒序分页。
 
     ``viewer`` 为当前后台账号 id：附件 URL 按其重签，挂载层验签时校验该
-    账号仍处于启用状态。
+    账号仍处于启用状态。越权访问（会员不在数据范围内）统一 404，不泄露存在性。
     """
-    if not await db.scalar(text("SELECT 1 FROM users WHERE id = :id"), {"id": member_id}):
+    if not await _member_visible(db, member_id, scope, scope_params):
         raise HTTPException(404, detail="会员不存在")
     params: dict[str, Any] = {"uid": member_id, "limit": page_size, "offset": (page - 1) * page_size}
     rows = await db.execute(
@@ -627,14 +791,18 @@ async def create_follow_up_with_media(
     voice: UploadFile | None,
     voice_duration_sec: int | None,
     actor_id: int,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> MemberFollowUp:
     """新增跟进记录，支持文字 + 图片（转 webp，最多 9 张）+ 录音。
 
     ``matchmaker_id`` 为空时记录当前操作账号；提供时必须是启用中的后台账号。
     图片存 ``{upload_dir}/{member_id}/follow-up-img-{uuid}.webp``，录音存
     ``follow-up-voice-{uuid}.{ext}``；URL 形如 ``/storage/uploads/{member_id}/...``。
+    越权（会员不在数据范围内）返回 404，不落库（D-16）。
     """
-    if not await db.scalar(text("SELECT 1 FROM users WHERE id = :id"), {"id": member_id}):
+    if not await _member_visible(db, member_id, scope, scope_params):
         raise HTTPException(404, detail="会员不存在")
 
     normalized_content = (content or "").strip()

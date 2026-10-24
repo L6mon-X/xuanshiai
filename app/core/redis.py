@@ -75,11 +75,33 @@ class LoopAwareRedis:
 redis_client = LoopAwareRedis(settings.redis_url)
 _local_quota_counts: dict[str, int] = {}
 _local_window_counts: dict[str, tuple[float, int]] = {}
+# Distinct daily members already charged (mirrors the Redis Set used by
+# ``consume_daily_unique``); keys already carry the UTC date, so entries for
+# previous days never collide and no explicit expiry is needed here.
+_local_seen: dict[str, set[str]] = {}
 
 CONSUME_DAILY_LUA = """
 local value = redis.call('INCR', KEYS[1])
 if value == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
 if value > tonumber(ARGV[1]) then redis.call('DECR', KEYS[1]); return 0 end
+return 1
+"""
+
+# Charge a daily quota once per distinct member (e.g. one profile view per
+# target user per day). KEYS[1] is the seen-set, KEYS[2] the counter, ARGV[1]
+# the member, ARGV[2] the limit, ARGV[3] the TTL in seconds.
+# Returns 1 = charged, 0 = limit reached, -1 = member already charged today
+# (caller must let the request through without consuming anything).
+# The seen-set TTL is refreshed on every new member so the set and the counter
+# both expire at the next UTC midnight.
+CONSUME_DAILY_UNIQUE_LUA = """
+if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1 then return -1 end
+local used = tonumber(redis.call('GET', KEYS[2]) or '0')
+if used >= tonumber(ARGV[2]) then return 0 end
+redis.call('SADD', KEYS[1], ARGV[1])
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+local value = redis.call('INCR', KEYS[2])
+if value == 1 then redis.call('EXPIRE', KEYS[2], ARGV[3]) end
 return 1
 """
 
@@ -103,6 +125,26 @@ if value > tonumber(ARGV[1]) then return 0 end
 return 1
 """
 
+SMS_ISSUE_LUA = """
+if redis.call('SET', KEYS[1], '1', 'EX', ARGV[1], 'NX') == false then return -1 end
+local used = tonumber(redis.call('GET', KEYS[2]) or '0')
+if used >= tonumber(ARGV[2]) then redis.call('DEL', KEYS[1]); return -2 end
+local next = redis.call('INCR', KEYS[2])
+if next == 1 then redis.call('EXPIRE', KEYS[2], ARGV[3]) end
+redis.call('SET', KEYS[3], ARGV[4], 'EX', ARGV[5])
+return 1
+"""
+
+SMS_COMPENSATE_LUA = """
+if redis.call('GET', KEYS[3]) == ARGV[1] then
+  redis.call('DEL', KEYS[1], KEYS[3])
+  local used = tonumber(redis.call('GET', KEYS[2]) or '0')
+  if used > 0 then redis.call('DECR', KEYS[2]) end
+  return 1
+end
+return 0
+"""
+
 
 def daily_quota_key(prefix: str, user_id: int) -> str:
     """Build a daily quota key using UTC date (aligned with consume_daily TTL reset)."""
@@ -122,6 +164,21 @@ def _consume_local(key: str, limit: int) -> bool:
     return True
 
 
+def _consume_daily_unique_local(
+    seen_key: str, counter_key: str, member: str, limit: int
+) -> int:
+    """In-process mirror of ``CONSUME_DAILY_UNIQUE_LUA`` for non-Redis dev runs."""
+    seen = _local_seen.setdefault(seen_key, set())
+    if member in seen:
+        return -1
+    used = _local_quota_counts.get(counter_key, 0)
+    if used >= limit:
+        return 0
+    seen.add(member)
+    _local_quota_counts[counter_key] = used + 1
+    return 1
+
+
 async def consume_daily(key: str, limit: int) -> bool:
     """Atomically consume one daily quota item, failing closed if Redis is unavailable."""
     try:
@@ -134,6 +191,52 @@ async def consume_daily(key: str, limit: int) -> bool:
         if _local_fallback_enabled():
             return _consume_local(key, limit)
         raise HTTPException(503, detail="Redis服务未配置或暂时不可用") from exc
+
+
+async def consume_daily_unique(
+    seen_key: str, counter_key: str, member: str, limit: int
+) -> int:
+    """Charge a daily quota once per distinct member.
+
+    Returns ``1`` when the member is new and a slot was consumed, ``0`` when the
+    daily limit is already reached, and ``-1`` when this member was already
+    charged today — callers must let ``-1`` through without consuming anything
+    (viewing the same profile twice must only cost one slot).
+    """
+    try:
+        now = datetime.now(UTC)
+        reset_at = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        ttl = max(60, int((reset_at - now).total_seconds()))
+        result = await redis_client.eval(
+            CONSUME_DAILY_UNIQUE_LUA, 2, seen_key, counter_key, member, limit, ttl
+        )
+        return int(result)
+    except RedisError as exc:
+        if _local_fallback_enabled():
+            return _consume_daily_unique_local(seen_key, counter_key, member, limit)
+        raise HTTPException(503, detail="Redis服务未配置或暂时不可用") from exc
+
+
+async def mark_daily_member(seen_key: str, member: str) -> bool:
+    """Record ``member`` as already charged for the day.
+
+    Used by pools that cannot be consumed atomically with Redis (the DB-backed
+    points grant). Failing to record it is not fatal: the worst case is charging
+    the same target twice later, so this never raises for the caller.
+    """
+    try:
+        now = datetime.now(UTC)
+        reset_at = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        ttl = max(60, int((reset_at - now).total_seconds()))
+        await redis_client.sadd(seen_key, member)
+        await redis_client.expire(seen_key, ttl)
+        return True
+    except RedisError:
+        if _local_fallback_enabled():
+            _local_seen.setdefault(seen_key, set()).add(member)
+            return True
+        return False
+
 
 async def refund_daily(key: str) -> None:
     try:

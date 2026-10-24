@@ -8,6 +8,7 @@ from app.db.session import get_db
 from app.schemas.mutual_selection_admin import (
     MutualActivityCreate,
     MutualActivityItem,
+    MutualActivityOfflineRequest,
     MutualActivityPage,
     MutualActivityUpdate,
     MutualOption,
@@ -95,6 +96,17 @@ async def set_mutual_visible(
 ) -> MutualActivityItem:
     current.require("community.activity.manage")
     return await service.set_visible(db, activity_id, visible)
+
+
+@router.post("/{activity_id}/offline", response_model=MutualActivityItem, summary="下线互选活动（带原因审计）")
+async def offline_mutual_activity(
+    activity_id: int = Path(..., ge=1),
+    body: MutualActivityOfflineRequest = ...,
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MutualActivityItem:
+    current.require("community.activity.manage")
+    return await service.offline_activity(db, activity_id, body.reason, current.account.id)
 
 
 @router.patch("/{activity_id}", response_model=MutualActivityItem, summary="修改互选活动")

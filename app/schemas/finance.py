@@ -330,3 +330,106 @@ class CreditGrantResult(BaseModel):
     total_amount: int = Field(description="总发放积分数 = granted_count * amount")
     sample_ledger_ids: list[int] = Field(default_factory=list, description="前 10 条 ledger.id 样本")
     target_user_ids: list[int] = Field(default_factory=list, description="实际命中的 user_id 列表")
+
+
+# ============================================
+# A12-钱包：后台余额调整（发放/扣减）+ 按用户余额/流水视图
+# 不新建表，复用 account_ledger（account_type='user'）；不接真实支付。
+# ============================================
+
+
+class BalanceAdjustmentRequest(BaseModel):
+    """后台「用户余额-修改」入参：按 user_ids 批量发放(CREDIT)或扣减(DEBIT)。"""
+
+    user_ids: list[int] = Field(min_length=1, max_length=5000, description="目标用户 ID 列表，单次最多 5000")
+    direction: Literal["CREDIT", "DEBIT"] = Field(description="CREDIT 发放/充值，DEBIT 扣减/调整")
+    amount: Decimal = Field(gt=0, le=1_000_000, decimal_places=2, description="每人调整金额（元），正数，两位小数")
+    reason: str = Field(min_length=1, max_length=20, description="调整理由，不超过 20 字")
+
+    @model_validator(mode="after")
+    def validate_user_ids(self) -> "BalanceAdjustmentRequest":
+        cleaned = [int(uid) for uid in self.user_ids if int(uid) > 0]
+        if not cleaned:
+            raise ValueError("user_ids 必须为正整数")
+        self.user_ids = list(dict.fromkeys(cleaned))
+        return self
+
+
+class BalanceAdjustmentResult(BaseModel):
+    """余额调整结果汇总。"""
+
+    direction: str
+    adjusted_count: int = Field(description="实际写入账本的账户数")
+    total_amount: Decimal = Field(description="本次调整总金额 = adjusted_count * amount")
+    sample_ledger_ids: list[int] = Field(default_factory=list, description="前 10 条 ledger.id 样本")
+    target_user_ids: list[int] = Field(default_factory=list, description="实际命中的 user_id 列表")
+
+
+class UserWalletResponse(BaseModel):
+    """按用户聚合的钱包视图：可用/待用余额 + 最新流水。"""
+
+    account_type: str
+    account_id: int
+    pending_amount: Decimal
+    available_amount: Decimal
+    ledger: LedgerEntryPage
+
+
+# ------------------------- 积分明细列表 -------------------------
+# 积分明细页（/system-credit-history）此前只有「发放积分」写接口，没有查询接口。
+# 数据取自 account_ledger 中 account_type='user' 的积分流水（direction=CREDIT 为入账、
+# DEBIT 为消耗），与「发放积分」写入的 source_type='admin_grant' 同源。
+
+# 会员范围 -> SQL 附加条件（u 为 users 别名）。
+CREDIT_MEMBER_SCOPE_SQL: dict[str, str] = {
+    "verified": "u.is_real_name = 1",
+    "xiangqin": "COALESCE(pr.match_status, 1) IN (1, 2)",
+    "xiangqin_female": "COALESCE(pr.match_status, 1) IN (1, 2) AND u.gender = 2",
+    "xiangqin_male": "COALESCE(pr.match_status, 1) IN (1, 2) AND u.gender = 1",
+    "online_vip": (
+        "EXISTS (SELECT 1 FROM user_membership um WHERE um.user_id = u.id AND um.status = 1"
+        " AND (um.end_at IS NULL OR um.end_at > UTC_TIMESTAMP()))"
+    ),
+}
+
+# 积分类别 -> account_ledger.source_type。
+CREDIT_CATEGORY_SOURCES: dict[str, tuple[str, ...]] = {
+    "recharge": ("admin_grant",),
+    "gift_exchange": ("gift_exchange",),
+    "gift_received": ("gift_received",),
+    "gift_sent": ("gift_sent",),
+}
+
+
+class CreditRecordItem(BaseModel):
+    """积分明细单条流水。"""
+
+    id: int = Field(description="account_ledger.id")
+    user_id: int = Field(description="会员 users.id")
+    nickname: str | None = Field(default=None, description="会员昵称")
+    avatar: str | None = Field(default=None, description="会员头像")
+    phone: str | None = Field(default=None, description="会员手机号（按敏感等级脱敏后下发）")
+    direction: str = Field(description="CREDIT 入账 / DEBIT 消耗")
+    amount: Decimal = Field(description="变动积分数，正数")
+    state: str = Field(description="PENDING/AVAILABLE/REVERSED")
+    source_type: str = Field(description="流水来源类型，如 admin_grant")
+    action_source: str = Field(description="操作来源文案，管理员操作为『管理员操作』")
+    category: str | None = Field(default=None, description="积分类别编码；未归类时为 null")
+    operator_id: int | None = Field(default=None, description="操作人 users.id；非人工操作时为 null")
+    created_at: datetime = Field(description="流水发生时间")
+
+
+class CreditRecordPage(BaseModel):
+    items: list[CreditRecordItem]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
+
+
+class CreditRecordOptions(BaseModel):
+    """积分明细页筛选下拉。"""
+
+    member_scopes: list[dict[str, str]] = Field(default_factory=list, description="会员范围可选项")
+    categories: list[dict[str, str]] = Field(default_factory=list, description="积分类别可选项")
+    action_sources: list[dict[str, str]] = Field(default_factory=list, description="操作来源可选项")

@@ -34,6 +34,17 @@
 
 依赖文件：`app/api/dependencies.py:_matchmaker_admin_permission(request)` 按路径子串自动映射（`/promotion-orders` 已加入映射表）。
 
+### 1.2.1 数据范围（D-16 收口，2026-10-12 批次 B）
+
+本模块的**客源线索**与**推广管理**两块后台端点已接入 `get_current_matchmaker_admin` 的**四档数据范围**（`ALL / SELF / STORE / ORGANIZATION`）：
+
+| 子模块 | 归属锚点 | 谓词 |
+|---|---|---|
+| 客源线索 `/admin/customer-leads/*` | `customer_lead.matchmaker_id` / `customer_lead.organization_id`（表自带归属列） | `scope_clause`（JOIN 查询用 `cl.` 前缀） |
+| 推广管理 `/admin/promotion-orders/*` | `promotion_order.user_id` → `resource_assignment` | `scope_exists_clause` |
+
+作用域谓词**唯一定义**于 `app/api/dependencies.py::CurrentMatchmakerAdmin`，路由与服务层不得自行实现。越权读统一 **404**；越权写不落库；未绑定组织/红娘 → **fail-closed**（`1 = 0`）。完整口径见 `后台数据范围与敏感操作-2026-10-04.md` §1.3.1。
+
 ### 1.3 响应与异常
 
 - 成功响应**不包裹** `data` 字段
@@ -259,7 +270,33 @@
 - Service：`app/services/customer_lead_admin.py`（`list_leads`/`create_lead`/`update_lead`/`get_lead`/`assign_lead`/`convert_lead`/`add_follow_up`/`list_follow_ups`/`lead_statistics`/`abandon_lead`/`restore_lead`/`list_abandonments`/`batch_import_leads`/`_insert_leads`/`import_leads_file`/`build_import_template`/`parse_import_file`/`lead_options`/`_sync_tags`）
 - 回归：`tests/test_customer_lead_admin_convert.py`（StubDB 按 SQL 文本分派，覆盖归属校验、手机号撞库、状态门禁与四表写入内容）
 
----
+### 2.17 一键入库 `POST /api/v1/admin/customer-leads/{lead_id}/convert`
+
+**权限**：红娘后台 Token，权限点 `customer_lead.manage`。
+
+**请求体**：
+
+```json
+{"gender": 2, "remark": "高意向线索，已电话确认"}
+```
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---:|---|
+| `lead_id` | path integer | 是 | 客源线索 ID |
+| `gender` | body integer/null | 否 | `1` 男、`2` 女；用于创建会员基础资料 |
+| `remark` | body string/null | 否 | 后台备注，最多 500 字 |
+
+**成功响应**：`200`，返回 `lead`（状态为 `CONVERTED` 且包含 `converted_user_id`）、`user_id`、`review_status: "PENDING"`、`replayed`。不返回密码；生成的会员通过手机号验证码登录。
+
+**业务规则**：
+
+- 线索必须有手机号；`LOST`、`CLOSED`、已经入库但没有有效 `converted_user_id` 的线索返回 `409`。
+- 已经有 `converted_user_id` 的重复请求返回原会员，不重复创建用户，`replayed=true`。
+- 如果手机号已经属于其它会员，返回 `409`，不自动合并账号。
+- 转换在一个数据库事务中完成：创建用户、补普通用户角色、写公开资料待审记录、写资源归属、更新客源状态和写审计日志；失败时回滚。
+- 会员手机号被标记为已验证，但不生成或返回密码；用户应使用手机号验证码登录。
+
+**错误**：未登录 `401`；无权限 `403`；参数错误 `422`；线索不存在 `404`；状态、手机号或手机号重复 `409`；数据库失败 `500`。
 
 ## 三、会员服务·约见/约会（13 端点）
 
@@ -436,9 +473,21 @@
 
 ### 4.1 列表 `GET /api/v1/admin/matchmaker/match-records`
 
-**query**：`page`(1-1000) / `page_size`(1-100) / `search`(≤64，男方或女方昵称/手机 LIKE)。
+**query**：
+
+| 参数 | 类型 | 校验 | 含义 |
+| --- | --- | --- | --- |
+| `page` | int | 1-1000 | 页码 |
+| `page_size` | int | 1-100 | 每页条数 |
+| `search` | string | ≤64 | 男方或女方昵称/手机模糊匹配 |
+| `date_from` | string | ≤10，`YYYY-MM-DD` | 牵线时间起（含当日） |
+| `date_to` | string | ≤10，`YYYY-MM-DD` | 牵线时间止（含当日，内部补到次日 00:00 前） |
+| `matchmaker_id` | int | ≥1 | 按发起方会员归属的服务红娘筛选 |
 
 **返回** `MatchRecordPage`，item 字段：`id` `from_user_id` `to_user_id` `status` `created_at` `responded_at` `from_nickname` `to_nickname` `matchmaker_id`（数据源 `match_apply` + `users`×2，红娘由 `resource_assignment` 派生）。
+
+> 实现注意：`matchmaker_id` 的筛选条件引用派生表 `ra`，该 join 必须同时出现在列表与计数 SQL 中；
+> 早期只加在 SELECT 段，导致按红娘筛选时计数查询缺 join 直接报错。
 
 ### 4.2 新建 `POST /api/v1/admin/matchmaker/match-records`
 

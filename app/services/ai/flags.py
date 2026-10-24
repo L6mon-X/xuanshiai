@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from app.core.config import Settings
+from app.core.request_context import current_user_id_context
 from app.schemas.ai_common import AiErrorCode
 
 
@@ -92,6 +93,20 @@ def _production_approvals_ok(settings: Settings, feature: AiFeature) -> bool:
     return settings.ai_provider != "mock"
 
 
+def _require_ai_test_scope(settings: Settings, feature: AiFeature) -> None:
+    """Reject callers outside ``ai_test_only_user_ids`` when that scope is set.
+
+    Empty scope (the default) means "no restriction".  When set, a missing
+    caller context is rejected as well: a background worker must never push real
+    user data to a temporary third-party endpoint just because it has no user.
+    """
+    allowed = settings.ai_test_only_user_id_set
+    if not allowed:
+        return
+    if current_user_id_context.get() not in allowed:
+        raise AiFeatureDisabledError(feature)
+
+
 def require_ai_feature(feature: AiFeature, settings: Settings) -> None:
     """Raise :class:`AiFeatureDisabledError` when the feature gate is closed.
 
@@ -103,6 +118,7 @@ def require_ai_feature(feature: AiFeature, settings: Settings) -> None:
         raise AiFeatureDisabledError(feature)
     if not _production_approvals_ok(settings, feature):
         raise AiFeatureDisabledError(feature)
+    _require_ai_test_scope(settings, feature)
 
 
 # ----------------------------------------------------------------------

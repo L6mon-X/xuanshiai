@@ -85,6 +85,13 @@ def _item(row: Any) -> MutualActivityItem:
         success_mode=m.get("success_mode") or "show_wechat",
         notice_html=m.get("notice_html"),
         success_notice=m.get("success_notice"),
+        signup_start_time=m.get("signup_start_time"),
+        signup_end_time=m.get("signup_end_time"),
+        mutual_start_time=m.get("mutual_start_time"),
+        mutual_end_time=m.get("mutual_end_time"),
+        activity_fee=(_num(m["activity_fee"]) if m.get("activity_fee") is not None else None),
+        show_wechat_direct=_bool(m.get("show_wechat_direct") if m.get("show_wechat_direct") is not None else 1),
+        show_matchmaker_push=_bool(m.get("show_matchmaker_push") if m.get("show_matchmaker_push") is not None else 0),
         status=int(m.get("computed_status") or m.get("status") or 1),
         visible=_bool(m.get("visible") if m.get("visible") is not None else 1),
         sort=int(m.get("sort") or 0),
@@ -151,10 +158,24 @@ async def create_activity(db: AsyncSession, actor_id: int, body: MutualActivityC
 async def update_activity(
     db: AsyncSession, activity_id: int, body: MutualActivityUpdate
 ) -> MutualActivityItem:
-    await _get(db, activity_id)
+    current = await _get(db, activity_id)
     values = {k: (int(v) if isinstance(v, bool) else v) for k, v in body.model_dump(exclude_unset=True).items()}
-    if body.start_time is not None or body.end_time is not None:
-        pass
+    # 局部更新无法在 schema 层交叉校验时间窗（另一半可能未传），这里按「合并后的值」校验，
+    # 否则可把 signup_end_time 改到 signup_start_time 之前而绕过录入时的约束。
+    merged = {
+        "start_time": values.get("start_time", current.start_time),
+        "end_time": values.get("end_time", current.end_time),
+        "signup_start_time": values.get("signup_start_time", current.signup_start_time),
+        "signup_end_time": values.get("signup_end_time", current.signup_end_time),
+        "mutual_start_time": values.get("mutual_start_time", current.mutual_start_time),
+        "mutual_end_time": values.get("mutual_end_time", current.mutual_end_time),
+    }
+    if merged["end_time"] <= merged["start_time"]:
+        raise HTTPException(422, detail="end_time 必须晚于 start_time")
+    if merged["signup_start_time"] and merged["signup_end_time"] and merged["signup_end_time"] <= merged["signup_start_time"]:
+        raise HTTPException(422, detail="signup_end_time 必须晚于 signup_start_time")
+    if merged["mutual_start_time"] and merged["mutual_end_time"] and merged["mutual_end_time"] <= merged["mutual_start_time"]:
+        raise HTTPException(422, detail="mutual_end_time 必须晚于 mutual_start_time")
     updates = ", ".join(f"{k} = :{k}" for k in values)
     await db.execute(
         text(f"UPDATE mutual_selection_activity SET {updates}, updated_at = UTC_TIMESTAMP() WHERE id = :id"),
@@ -174,17 +195,22 @@ async def delete_activity(db: AsyncSession, activity_id: int) -> None:
 
 async def copy_activity(db: AsyncSession, actor_id: int, activity_id: int) -> MutualActivityItem:
     await _get(db, activity_id)
+    # B2 新增列必须同步进这份硬编码列清单，否则副本会丢报名/互选时间窗与收费配置。
     await db.execute(
         text(
             "INSERT INTO mutual_selection_activity "
             "(title, cover, start_time, end_time, pick_limit, virtual_signup, price_male, price_female, "
             " price_vip, reward_promoter, reward_service, require_realname, require_avatar, require_three_photo, "
             " intro, share_title, share_desc, share_icon, success_mode, notice_html, success_notice, "
+            " signup_start_time, signup_end_time, mutual_start_time, mutual_end_time, activity_fee, "
+            " show_wechat_direct, show_matchmaker_push, "
             " status, visible, sort, created_by) "
             "SELECT CONCAT(title, '(副本)'), cover, start_time, end_time, pick_limit, virtual_signup, "
             " price_male, price_female, price_vip, reward_promoter, reward_service, require_realname, "
             " require_avatar, require_three_photo, intro, share_title, share_desc, share_icon, success_mode, "
-            " notice_html, success_notice, 1, 0, sort, :actor "
+            " notice_html, success_notice, signup_start_time, signup_end_time, mutual_start_time, "
+            " mutual_end_time, activity_fee, show_wechat_direct, show_matchmaker_push, "
+            " 1, 0, sort, :actor "
             "FROM mutual_selection_activity WHERE id = :id"
         ),
         {"id": activity_id, "actor": actor_id},
@@ -199,6 +225,26 @@ async def set_visible(db: AsyncSession, activity_id: int, visible: bool) -> Mutu
     await db.execute(
         text("UPDATE mutual_selection_activity SET visible = :v, updated_at = UTC_TIMESTAMP() WHERE id = :id"),
         {"v": 1 if visible else 0, "id": activity_id},
+    )
+    await db.commit()
+    return await _get(db, activity_id)
+
+
+async def offline_activity(
+    db: AsyncSession, activity_id: int, reason: str | None, actor_id: int
+) -> MutualActivityItem:
+    """B2：页面「下线」动作。与 PATCH /visible 同语义，但带原因审计。"""
+    await _get(db, activity_id)
+    await db.execute(
+        text("UPDATE mutual_selection_activity SET visible = 0, updated_at = UTC_TIMESTAMP() WHERE id = :id"),
+        {"id": activity_id},
+    )
+    await db.execute(
+        text(
+            "INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id, reason) "
+            "VALUES (:actor, 'mutual_activity.offline', 'mutual_selection_activity', :id, :reason)"
+        ),
+        {"actor": actor_id, "id": activity_id, "reason": reason},
     )
     await db.commit()
     return await _get(db, activity_id)

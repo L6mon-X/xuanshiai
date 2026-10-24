@@ -13,8 +13,10 @@ from app.services.ai_provider import _mock_response
 
 
 def test_advisor_routes_are_registered() -> None:
-    paths = {route.path: route.methods for route in ai_advisor.router.routes}
-    assert paths["/ai/advisor/sessions"] == {"GET"}
+    paths: dict[str, set[str]] = {}
+    for route in ai_advisor.router.routes:
+        paths.setdefault(route.path, set()).update(route.methods or set())
+    assert paths["/ai/advisor/sessions"] == {"GET", "POST"}
     assert paths["/ai/advisor/sessions/{session_id}"] == {"DELETE"}
     assert paths["/ai/advisor/sessions/{session_id}/advice"] == {"POST"}
     assert paths["/ai/advisor/messages/{message_id}/feedback"] == {"POST"}
@@ -112,6 +114,23 @@ def test_advisor_database_contract_contains_idempotency_and_audit() -> None:
     assert "uk_ai_advisor_message_idempotency" in message_sql
     assert "quota_refunded" in audit_sql
     assert "error_detail" in audit_sql
+
+
+def test_advisor_create_session_requires_idempotency_header() -> None:
+    from app.main import app
+
+    operation = app.openapi()["paths"]["/api/v1/ai/advisor/sessions"]["post"]
+    header = next(
+        item for item in operation["parameters"] if item["name"] == "Idempotency-Key"
+    )
+    assert header["required"] is True
+    schema = next(
+        item
+        for item in header["schema"].get("anyOf", [header["schema"]])
+        if item.get("type") == "string"
+    )
+    assert schema["minLength"] == 8
+    assert schema["maxLength"] == 128
 
 
 def test_advisor_serializes_idempotent_requests_and_replays_insert_conflicts() -> None:

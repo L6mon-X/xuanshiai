@@ -10,6 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import decode_access_token
+from app.core.request_context import current_user_id_context
 from app.services.matchmaker_admin_auth import decode_matchmaker_admin_token, get_session_account
 from app.schemas.matchmaker_admin import MatchmakerAdminAccount
 from app.db.session import get_db
@@ -50,6 +51,8 @@ class CurrentUser:
     status: int
     realname_status: int
     face_verified: int | None = None
+    # A12-模拟登录：非空表示这是一个由该后台管理员发起的只读模拟会话（发起管理员 id）。
+    impersonated_by: int | None = None
 
 
 async def get_current_user(
@@ -88,7 +91,12 @@ async def get_current_user(
     await db.commit()
     values = dict(row)
     values.setdefault("face_verified", None)
-    return CurrentUser(**values, session_id=session_id)
+    # 供跨层守卫（如 AI 测试期用户隔离）读取当前调用者，避免把 user 逐层透传。
+    current_user_id_context.set(int(row["id"]))
+    # A12-模拟登录：从令牌 imp 声明中取发起管理员 id（无声明为 None，普通登录行为不变）。
+    impersonated_raw = payload.get("imp")
+    impersonated_by = int(impersonated_raw) if impersonated_raw is not None else None
+    return CurrentUser(**values, session_id=session_id, impersonated_by=impersonated_by)
 
 
 async def get_verified_user(current: CurrentUser = Depends(get_current_user)) -> CurrentUser:
@@ -117,6 +125,10 @@ async def get_face_verified_user(
     """Require realname plus face verification for publishing community posts.
 
     Fail-closed: a missing face record is treated as not verified.
+
+    D-14：`face_verified` 由「会员认证后台」实名审核（携带人脸照片/评分，审核即
+    人脸核验）写入；人脸供应商适配层见 `app/services/face/`，在真实供应商接入前
+    本门禁保持 fail-closed（`FACE_PROVIDER=disabled` 时无人脸自助入口）。
     """
     if current.realname_status != 2:
         raise HTTPException(status_code=403, detail="请先完成实名认证")
@@ -180,6 +192,17 @@ class CurrentMatchmakerAdmin:
             "merchant.read": {"merchant.read", "merchant.manage"},
             "video.read": {"video.read", "video.manage"},
             "matchmaker.system.read": {"matchmaker.system.read", "matchmaker.system.manage"},
+            # 后台运营第三方适配模块（A1–A10）：读码允许写码账号通过。
+            "platform.sms.read": {"platform.sms.read", "platform.sms.write"},
+            "platform.wechat.read": {"platform.wechat.read", "platform.wechat.write"},
+            "finance.contract.read": {"finance.contract.read", "finance.contract.write"},
+            "platform.material.read": {"platform.material.read", "platform.material.write"},
+            "platform.qrcode.read": {"platform.qrcode.read", "platform.qrcode.write"},
+            "platform.outbound.read": {"platform.outbound.read", "platform.outbound.write"},
+            "platform.sales.read": {"platform.sales.read", "platform.sales.write"},
+            "platform.lovecard.read": {"platform.lovecard.read", "platform.lovecard.write"},
+            "platform.interact.read": {"platform.interact.read", "platform.interact.write"},
+            "platform.alliance.read": {"platform.alliance.read", "platform.alliance.write"},
         }
         allowed = aliases.get(permission, {permission})
         if "*" not in self.permissions and not (allowed & self.permissions):
@@ -348,6 +371,10 @@ PERMISSION_ATTR = "__matchmaker_permission__"
 PERMISSION_EXEMPT_SUFFIXES: tuple[str, ...] = (
     "/admin/matchmaker/auth/me",
     "/admin/matchmaker/auth/logout",
+    # 改密同样是「只作用于当前登录态」的自助端点：它只按 token 里的 account.id 更新本人
+    # 密码，不涉及任何他人数据。此前不在白名单，又未命中 URL 关键词映射，被 fail-closed
+    # 分支整体拒绝（403 后台接口缺少权限声明），前端改密弹窗实际是死按钮。
+    "/admin/matchmaker/auth/change-password",
 )
 
 
@@ -397,11 +424,32 @@ def _declared_permission(request: Request) -> str | tuple[str, ...] | None:
     return tuple(str(item) for item in declared)
 
 
+# 这些后台前缀的权限由各路由的 ``@declare_permission`` 精确定义。
+# 必须先于下方关键词映射返回 None：否则 ``/admin/wechat/messages/send`` 会命中
+# ``/messages``（message.manage）、``/admin/alliance/activities`` 会命中
+# ``/activities``（community.activity.manage），让无关权限码也能调用这些接口。
+_DECLARED_PERMISSION_PREFIXES = (
+    "/admin/sms",
+    "/admin/wechat",
+    "/admin/e-contract",
+    "/admin/outbound-call",
+    "/admin/materials",
+    "/admin/qrcodes",
+    "/admin/sales-library",
+    "/admin/lovecard-templates",
+    "/admin/interact",
+    "/admin/alliance",
+)
+
+
 def _matchmaker_admin_permission(request: Request) -> str | None:
     path = request.url.path
     method = request.method.upper()
     if _is_permission_exempt(path):
         return None
+    for prefix in _DECLARED_PERMISSION_PREFIXES:
+        if path == f"/api/v1{prefix}" or path.startswith(f"/api/v1{prefix}/"):
+            return None
     if path == "/api/v1/admin/dashboard/stats":
         return "matchmaker.read"
     if path == "/api/v1/admin/matchmaker/statistics":

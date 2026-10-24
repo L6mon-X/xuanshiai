@@ -525,7 +525,7 @@ async def test_real_projection_entry_digest_and_structured_only_null(
             build_db, user_entries, ProjectionKind.PERSONAL_SEARCHABLE,
             revision_vector=None,
         )
-        projection_b = await build_feature_projection(
+        await build_feature_projection(
             build_db, user_plain, ProjectionKind.PERSONAL_SEARCHABLE,
             revision_vector=None,
         )

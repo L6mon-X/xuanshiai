@@ -72,6 +72,23 @@ def test_production_rejects_mock_providers() -> None:
             wechat_provider="mock",
         )
 
+    # A1/A6：运营短信群发与外呼平台的 Mock 实现同样禁止进生产。
+    # （默认值 disabled 不受影响，此处只断言 mock 被拦截。）
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            environment="production",
+            sms_template_provider="mock",
+        )
+
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            environment="production",
+            outbound_call_provider="mock",
+        )
+
+
 
 def test_normalize_user_agent_fits_login_log_device_column() -> None:
     user_agent = "wechat-devtools/" + ("x" * 400)

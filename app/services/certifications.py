@@ -40,7 +40,7 @@ def _sign_cert_material(material: str | None, viewer: int, kind: str) -> str | N
     )
 
 
-async def list_certification_reviews(db: AsyncSession, *, page: int, page_size: int, viewer: int, kind: str | None = None, status: int | None = None, search: str | None = None) -> CertificationReviewPage:
+async def list_certification_reviews(db: AsyncSession, *, page: int, page_size: int, viewer: int, kind: str | None = None, status: int | None = None, search: str | None = None, scope: str | None = None, scope_params: dict[str, object] | None = None) -> CertificationReviewPage:
     """认证审核列表：UNION ALL 单条 SQL 完成
     跨 kind 过滤 + 全局排序 + 分页（排序键与原 Python 实现逐项一致：
     submitted_at NULL 置后、submitted_at、user_id，kind 为跨 kind 平局决胜）；
@@ -54,12 +54,14 @@ async def list_certification_reviews(db: AsyncSession, *, page: int, page_size: 
     if any(value not in fields for value in kinds):
         raise HTTPException(422, detail="不支持的认证类型")
 
-    filter_params: dict[str, object] = {}
+    filter_params: dict[str, object] = dict(scope_params or {})
     branches: list[str] = []
     count_branches: list[str] = []
     for current_kind in kinds:
         status_field, material_field, submitted_field, reviewed_field, reason_field = fields[current_kind]
         where = f"ua.{material_field} IS NOT NULL"
+        if scope:
+            where += f" AND ({scope})"
         if status is not None:
             where += f" AND ua.{status_field} = :status"
         if search:
@@ -164,9 +166,21 @@ async def get_certifications(db: AsyncSession, user_id: int) -> CertificationsRe
 
 
 async def submit_education(db: AsyncSession, user_id: int, body: EducationCertificationRequest) -> CertificationsResponse:
-    await db.execute(text("""INSERT INTO user_auth (user_id, education, education_verified, education_submitted_at)
-        VALUES (:id,:education,1,UTC_TIMESTAMP()) ON DUPLICATE KEY UPDATE education=:education,
-        education_verified=1, education_fail_reason=NULL, education_submitted_at=UTC_TIMESTAMP(), updated_at=UTC_TIMESTAMP()"""), {"id": user_id, **body.model_dump()})
+    """Legacy JSON 入口：只保存学历字段，不推进审核状态。
+
+    学历认证的审核中状态必须由 ``PUT /users/me/certifications/education/material``
+    在有学校与证件材料的前提下推进。旧入口原先直接把 ``education_verified`` 置 1，
+    会产生「用户端显示审核中、后台却没有任何材料可审」的假状态（用户端因此报
+    「未提交审核材料，但点去认证显示审核中」）。
+    """
+    await db.execute(text("""INSERT INTO user_auth (user_id, education, education_verified)
+        VALUES (:id, :education, 0)
+        ON DUPLICATE KEY UPDATE education = :education,
+            education_verified = CASE
+                WHEN education_cert IS NULL OR education_cert = '' THEN 0
+                ELSE education_verified
+            END,
+            updated_at = UTC_TIMESTAMP()"""), {"id": user_id, "education": body.education})
     await db.commit()
     return await get_certifications(db, user_id)
 

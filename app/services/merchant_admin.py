@@ -31,6 +31,26 @@ from app.schemas.merchant_admin import (
 _BASE_URL = "https://www.xuanshi.com/subpages/hezuo"
 
 
+def _apply_scope(
+    where: list[str],
+    params: dict[str, Any],
+    scope: str | None,
+    scope_params: dict[str, Any] | None,
+) -> None:
+    """把四档数据范围谓词并入查询（D-16）。
+
+    `merchant` 无组织列，归属以其「管理账号（推广红娘 users.id）」``m.admin_user_id``
+    的 ``resource_assignment`` 判定；商品/订单跟随所属商家。谓词由路由层用
+    `CurrentMatchmakerAdmin.scope_exists_clause`（唯一实现）生成后下传。
+
+    `merchant_category` 为平台级全局配置表，不随数据范围收敛（仅受权限码约束）。
+    """
+    if not scope:
+        return
+    params.update(scope_params or {})
+    where.append(f"({scope})")
+
+
 def _num(value: Any) -> float:
     try:
         return float(value)
@@ -199,9 +219,17 @@ def _merchant_item(row: Any) -> MerchantItem:
     )
 
 
-async def _get_merchant(db: AsyncSession, merchant_id: int) -> MerchantItem:
+async def _get_merchant(
+    db: AsyncSession,
+    merchant_id: int,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> MerchantItem:
+    where = ["m.id = :id", "m.deleted_at IS NULL"]
+    params: dict[str, Any] = {"id": merchant_id}
+    _apply_scope(where, params, scope, scope_params)
     row = (
-        await db.execute(text(f"{_MERCHANT_SELECT} WHERE m.id = :id AND m.deleted_at IS NULL"), {"id": merchant_id})
+        await db.execute(text(f"{_MERCHANT_SELECT} WHERE {' AND '.join(where)}"), params)
     ).mappings().first()
     if not row:
         raise HTTPException(404, detail="商家不存在")
@@ -224,10 +252,19 @@ def _merchant_payload(body: MerchantCreate | MerchantUpdate, partial: bool) -> d
 
 
 async def list_merchants(
-    db: AsyncSession, page: int, page_size: int, category_id: int | None, keyword: str | None, visible: bool | None
+    db: AsyncSession,
+    page: int,
+    page_size: int,
+    category_id: int | None,
+    keyword: str | None,
+    visible: bool | None,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> MerchantPage:
     where = ["m.deleted_at IS NULL"]
     params: dict = {"limit": page_size, "offset": (page - 1) * page_size}
+    _apply_scope(where, params, scope, scope_params)
     if category_id:
         where.append("m.category_id = :category_id")
         params["category_id"] = category_id
@@ -255,18 +292,40 @@ async def list_merchants(
     )
 
 
-async def create_merchant(db: AsyncSession, body: MerchantCreate) -> MerchantItem:
+async def create_merchant(
+    db: AsyncSession,
+    body: MerchantCreate,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> MerchantItem:
     payload = _merchant_payload(body, partial=False)
     payload["link_url"] = None
     columns = ", ".join(payload.keys())
     placeholders = ", ".join(f":{k}" for k in payload)
     result = await db.execute(text(f"INSERT INTO merchant ({columns}) VALUES ({placeholders})"), payload)
+    # 新建行可能落在数据范围之外（如绑定了他人的管理账号）；未提交前先做可见性校验，
+    # 越权则整笔回滚，不落库（D-16）。
+    try:
+        item = await _get_merchant(db, int(result.lastrowid), scope, scope_params)
+    except HTTPException:
+        await db.rollback()
+        raise
     await db.commit()
-    return await _get_merchant(db, int(result.lastrowid))
+    return item
 
 
-async def update_merchant(db: AsyncSession, merchant_id: int, body: MerchantUpdate) -> MerchantItem:
-    await _get_merchant(db, merchant_id)
+async def update_merchant(
+    db: AsyncSession,
+    merchant_id: int,
+    body: MerchantUpdate,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> MerchantItem:
+    # 归属校验由 _get_merchant（带作用域）完成；UPDATE 按主键落改，不再重复拼谓词
+    # （EXISTS 谓词依赖 SELECT 里的 `m` 别名，UPDATE 语句中不存在该别名）。
+    await _get_merchant(db, merchant_id, scope, scope_params)
     values = _merchant_payload(body, partial=True)
     updates = ", ".join(f"{k} = :{k}" for k in values)
     await db.execute(
@@ -274,21 +333,34 @@ async def update_merchant(db: AsyncSession, merchant_id: int, body: MerchantUpda
         {**values, "id": merchant_id},
     )
     await db.commit()
-    return await _get_merchant(db, merchant_id)
+    return await _get_merchant(db, merchant_id, scope, scope_params)
 
 
-async def set_merchant_visible(db: AsyncSession, merchant_id: int, visible: bool) -> MerchantItem:
-    await _get_merchant(db, merchant_id)
+async def set_merchant_visible(
+    db: AsyncSession,
+    merchant_id: int,
+    visible: bool,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> MerchantItem:
+    await _get_merchant(db, merchant_id, scope, scope_params)
     await db.execute(
         text("UPDATE merchant SET visible = :v, updated_at = UTC_TIMESTAMP() WHERE id = :id"),
         {"v": 1 if visible else 0, "id": merchant_id},
     )
     await db.commit()
-    return await _get_merchant(db, merchant_id)
+    return await _get_merchant(db, merchant_id, scope, scope_params)
 
 
-async def delete_merchant(db: AsyncSession, merchant_id: int) -> None:
-    await _get_merchant(db, merchant_id)
+async def delete_merchant(
+    db: AsyncSession,
+    merchant_id: int,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> None:
+    await _get_merchant(db, merchant_id, scope, scope_params)
     await db.execute(
         text("UPDATE merchant SET deleted_at = UTC_TIMESTAMP() WHERE id = :id"), {"id": merchant_id}
     )
@@ -340,9 +412,17 @@ def _product_item(row: Any) -> MerchantProductItem:
     )
 
 
-async def _get_product(db: AsyncSession, product_id: int) -> MerchantProductItem:
+async def _get_product(
+    db: AsyncSession,
+    product_id: int,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> MerchantProductItem:
+    where = ["p.id = :id", "p.deleted_at IS NULL"]
+    params: dict[str, Any] = {"id": product_id}
+    _apply_scope(where, params, scope, scope_params)
     row = (
-        await db.execute(text(f"{_PRODUCT_SELECT} WHERE p.id = :id AND p.deleted_at IS NULL"), {"id": product_id})
+        await db.execute(text(f"{_PRODUCT_SELECT} WHERE {' AND '.join(where)}"), params)
     ).mappings().first()
     if not row:
         raise HTTPException(404, detail="商品不存在")
@@ -350,10 +430,19 @@ async def _get_product(db: AsyncSession, product_id: int) -> MerchantProductItem
 
 
 async def list_products(
-    db: AsyncSession, page: int, page_size: int, merchant_id: int | None, keyword: str | None, status: int | None
+    db: AsyncSession,
+    page: int,
+    page_size: int,
+    merchant_id: int | None,
+    keyword: str | None,
+    status: int | None,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> MerchantProductPage:
     where = ["p.deleted_at IS NULL"]
     params: dict = {"limit": page_size, "offset": (page - 1) * page_size}
+    _apply_scope(where, params, scope, scope_params)
     if merchant_id:
         where.append("p.merchant_id = :merchant_id")
         params["merchant_id"] = merchant_id
@@ -368,7 +457,7 @@ async def list_products(
         text(f"{_PRODUCT_SELECT} WHERE {clause} ORDER BY p.id DESC LIMIT :limit OFFSET :offset"), params
     )
     count = await db.execute(
-        text(f"SELECT COUNT(*) FROM merchant_product p WHERE {clause}"),
+        text(f"SELECT COUNT(*) FROM merchant_product p LEFT JOIN merchant m ON m.id = p.merchant_id WHERE {clause}"),
         {k: v for k, v in params.items() if k not in ("limit", "offset")},
     )
     total = int(count.scalar() or 0)
@@ -381,8 +470,14 @@ async def list_products(
     )
 
 
-async def create_product(db: AsyncSession, body: MerchantProductCreate) -> MerchantProductItem:
-    await _get_merchant(db, body.merchant_id)
+async def create_product(
+    db: AsyncSession,
+    body: MerchantProductCreate,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> MerchantProductItem:
+    await _get_merchant(db, body.merchant_id, scope, scope_params)
     payload = body.model_dump()
     columns = ", ".join(payload.keys())
     placeholders = ", ".join(f":{k}" for k in payload)
@@ -390,35 +485,55 @@ async def create_product(db: AsyncSession, body: MerchantProductCreate) -> Merch
         text(f"INSERT INTO merchant_product ({columns}) VALUES ({placeholders})"), payload
     )
     await db.commit()
-    return await _get_product(db, int(result.lastrowid))
+    return await _get_product(db, int(result.lastrowid), scope, scope_params)
 
 
-async def update_product(db: AsyncSession, product_id: int, body: MerchantProductUpdate) -> MerchantProductItem:
-    await _get_product(db, product_id)
+async def update_product(
+    db: AsyncSession,
+    product_id: int,
+    body: MerchantProductUpdate,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> MerchantProductItem:
+    await _get_product(db, product_id, scope, scope_params)
     values = body.model_dump(exclude_unset=True)
     if "merchant_id" in values:
-        await _get_merchant(db, values["merchant_id"])
+        await _get_merchant(db, values["merchant_id"], scope, scope_params)
     updates = ", ".join(f"{k} = :{k}" for k in values)
     await db.execute(
         text(f"UPDATE merchant_product SET {updates}, updated_at = UTC_TIMESTAMP() WHERE id = :id"),
         {**values, "id": product_id},
     )
     await db.commit()
-    return await _get_product(db, product_id)
+    return await _get_product(db, product_id, scope, scope_params)
 
 
-async def set_product_status(db: AsyncSession, product_id: int, status: int) -> MerchantProductItem:
-    await _get_product(db, product_id)
+async def set_product_status(
+    db: AsyncSession,
+    product_id: int,
+    status: int,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> MerchantProductItem:
+    await _get_product(db, product_id, scope, scope_params)
     await db.execute(
         text("UPDATE merchant_product SET status = :s, updated_at = UTC_TIMESTAMP() WHERE id = :id"),
         {"s": status, "id": product_id},
     )
     await db.commit()
-    return await _get_product(db, product_id)
+    return await _get_product(db, product_id, scope, scope_params)
 
 
-async def delete_product(db: AsyncSession, product_id: int) -> None:
-    await _get_product(db, product_id)
+async def delete_product(
+    db: AsyncSession,
+    product_id: int,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> None:
+    await _get_product(db, product_id, scope, scope_params)
     await db.execute(
         text("UPDATE merchant_product SET deleted_at = UTC_TIMESTAMP() WHERE id = :id"), {"id": product_id}
     )
@@ -465,6 +580,14 @@ LEFT JOIN users u ON u.id = o.buyer_user_id
 """
 
 
+# 搜索方式：按商品关键词 / 按买家手机。值为服务端白名单内的固定 SQL 片段，不拼接用户输入。
+_ORDER_SEARCH_TYPE_SQL: dict[str, str] = {
+    "product": "p.name LIKE CONCAT('%', :kw, '%')",
+    "phone": "u.phone LIKE CONCAT('%', :kw, '%')",
+}
+_ORDER_SEARCH_TYPE_DEFAULT = "product"
+
+
 async def list_orders(
     db: AsyncSession,
     page: int,
@@ -477,9 +600,14 @@ async def list_orders(
     buyer_keyword: str | None,
     verify_start: str | None,
     verify_end: str | None,
+    search_type: str | None = None,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> MerchantOrderPage:
     where = ["1=1"]
     params: dict = {"limit": page_size, "offset": (page - 1) * page_size}
+    _apply_scope(where, params, scope, scope_params)
     if merchant_id:
         where.append("o.merchant_id = :merchant_id")
         params["merchant_id"] = merchant_id
@@ -490,7 +618,7 @@ async def list_orders(
         where.append("o.verify_status = :verify_status")
         params["verify_status"] = verify_status
     if keyword:
-        where.append("p.name LIKE CONCAT('%', :kw, '%')")
+        where.append(_ORDER_SEARCH_TYPE_SQL.get(search_type or "", _ORDER_SEARCH_TYPE_SQL[_ORDER_SEARCH_TYPE_DEFAULT]))
         params["kw"] = keyword
     if order_no:
         where.append("o.order_no LIKE CONCAT('%', :order_no, '%')")
@@ -511,6 +639,7 @@ async def list_orders(
     count = await db.execute(
         text(f"SELECT COUNT(*) FROM merchant_order o "
              f"LEFT JOIN merchant_product p ON p.id = o.product_id "
+             f"LEFT JOIN merchant m ON m.id = o.merchant_id "
              f"LEFT JOIN users u ON u.id = o.buyer_user_id WHERE {clause}"),
         {k: v for k, v in params.items() if k not in ("limit", "offset")},
     )
@@ -525,9 +654,23 @@ async def list_orders(
 
 
 async def update_order_status(
-    db: AsyncSession, order_id: int, body: MerchantOrderStatusUpdate
+    db: AsyncSession,
+    order_id: int,
+    body: MerchantOrderStatusUpdate,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> MerchantOrderItem:
-    row = (await db.execute(text("SELECT * FROM merchant_order WHERE id = :id"), {"id": order_id})).mappings().first()
+    where = ["o.id = :id"]
+    params: dict[str, Any] = {"id": order_id}
+    _apply_scope(where, params, scope, scope_params)
+    row = (
+        await db.execute(
+            text(f"SELECT o.* FROM merchant_order o LEFT JOIN merchant m ON m.id = o.merchant_id "
+                 f"WHERE {' AND '.join(where)}"),
+            params,
+        )
+    ).mappings().first()
     if not row:
         raise HTTPException(404, detail="订单不存在")
     current = str(row["status"])
@@ -548,12 +691,20 @@ def new_order_no() -> str:
     return f"MO{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:6].upper()}"
 
 
-async def build_order_export(db: AsyncSession, **filters: Any) -> bytes:
+async def build_order_export(
+    db: AsyncSession,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+    **filters: Any,
+) -> bytes:
     from io import BytesIO
 
     from openpyxl import Workbook
 
-    result = await list_orders(db, page=1, page_size=10000, **filters)
+    result = await list_orders(
+        db, page=1, page_size=10000, scope=scope, scope_params=scope_params, **filters
+    )
     status_label = {"pending": "未支付", "paid": "已支付", "used": "已消费", "cancelled": "已取消"}
     wb = Workbook()
     ws = wb.active

@@ -165,9 +165,16 @@ async def _page(db: AsyncSession, query: str, count_query: str, member_id: int, 
         return {"items": [], "page": page, "page_size": page_size, "total": 0, "has_more": False}
 
 
-async def _ensure_member(db: AsyncSession, member_id: int) -> None:
+async def _ensure_member(db: AsyncSession, member_id: int, current: CurrentMatchmakerAdmin) -> None:
+    """校验会员存在且落在当前账号的四档数据范围内（D-16）。
+
+    越权访问按 404 处理（不泄露存在性），与 D-4 其它后台模块口径一致；
+    未绑定组织 / 未绑定红娘的账号按 fail-closed 返回 0 行，不会退化为全平台可见。
+    """
     from fastapi import HTTPException
-    if not await db.scalar(text("SELECT 1 FROM users WHERE id = :id"), {"id": member_id}):
+    params: dict[str, object] = {"id": member_id}
+    scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = users.id")
+    if not await db.scalar(text(f"SELECT 1 FROM users WHERE id = :id AND ({scope})"), params):
         raise HTTPException(404, detail="会员不存在")
 
 
@@ -177,7 +184,7 @@ def _paging():
 
 @router.get("/{member_id}/match-records", response_model=MemberMatchRecordPage, summary="查询会员牵线记录")
 async def match_records(member_id: int = Path(..., ge=1), page: int = _paging()[0], page_size: int = _paging()[1], current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> MemberMatchRecordPage:
-    await _ensure_member(db, member_id)
+    await _ensure_member(db, member_id, current)
     result = await _page(db, """SELECT a.id, a.from_user_id, a.to_user_id, u.nickname AS target_nickname, a.message, a.status, a.responded_at, a.created_at
         FROM match_apply a LEFT JOIN users u ON u.id = CASE WHEN a.from_user_id = :id THEN a.to_user_id ELSE a.from_user_id END
         WHERE a.from_user_id = :id OR a.to_user_id = :id ORDER BY a.created_at DESC, a.id DESC LIMIT :limit OFFSET :offset""",
@@ -192,12 +199,41 @@ async def match_quota(
     db: AsyncSession = Depends(get_db),
 ) -> MemberMatchQuotaResponse:
     """查询会员牵线次数账户；没有账户记录时按零次数返回。"""
-    await _ensure_member(db, member_id)
+    await _ensure_member(db, member_id, current)
     row = (await db.execute(text("""SELECT user_id, available_count, used_count, refunded_count, updated_at
         FROM matchmaker_service_quota WHERE user_id = :id"""), {"id": member_id})).mappings().first()
     if not row:
         return MemberMatchQuotaResponse(user_id=member_id, available_count=0, used_count=0, refunded_count=0)
     return MemberMatchQuotaResponse(**dict(row))
+
+
+@router.get("/{member_id}/match-quota/history", summary="会员牵线次数的变更历史")
+async def match_quota_history(
+    member_id: int = Path(..., ge=1, description="会员 ID"),
+    page: int = _paging()[0],
+    page_size: int = _paging()[1],
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """读取该会员牵线次数的后台调整记录。
+
+    数据源是写次数时留下的审计 ``member.match_quota.update``；此前界面上「历史明细」
+    没有任何可查接口，属于死按钮。
+    """
+    current.require("matchmaker.member.read")
+    await _ensure_member(db, member_id, current)
+    return await _page(
+        db,
+        """SELECT id, actor_user_id, action, reason, before_json, after_json, created_at
+        FROM business_audit_log
+        WHERE resource_type = 'matchmaker_service_quota' AND resource_id = :id
+          AND action = 'member.match_quota.update'
+        ORDER BY id DESC LIMIT :limit OFFSET :offset""",
+        """SELECT COUNT(*) FROM business_audit_log
+        WHERE resource_type = 'matchmaker_service_quota' AND resource_id = :id
+          AND action = 'member.match_quota.update'""",
+        member_id, page, page_size,
+    )
 
 
 @router.patch("/{member_id}/match-quota", response_model=MemberMatchQuotaResponse, summary="修改会员剩余牵线次数")
@@ -209,7 +245,7 @@ async def update_match_quota(
 ) -> MemberMatchQuotaResponse:
     """直接设置剩余次数，使用行锁并记录后台审计。"""
     current.require("matchmaker.member.manage")
-    await _ensure_member(db, member_id)
+    await _ensure_member(db, member_id, current)
     row = (await db.execute(text("""SELECT id, available_count, used_count, refunded_count
         FROM matchmaker_service_quota WHERE user_id = :id FOR UPDATE"""), {"id": member_id})).mappings().first()
     before = dict(row) if row else {"available_count": 0, "used_count": 0, "refunded_count": 0}
@@ -248,6 +284,7 @@ async def update_member_profile(
 ) -> MemberProfileUpdateResponse:
     """统一修改截图对应的会员基础、认证和隐私字段。"""
     current.require("matchmaker.member.manage")
+    await _ensure_member(db, member_id, current)
     values = body.model_dump(exclude_unset=True)
     reason = values.pop("reason")
     if not values:
@@ -261,7 +298,11 @@ async def update_member_profile(
     privacy_fields = {key: values[key] for key in ("match_status", "only_vip_can_see_detail", "show_profile") if key in values}
     if user_fields:
         assignments = ", ".join(f"{key} = :{key}" for key in user_fields)
-        await db.execute(text(f"UPDATE users SET {assignments}, updated_at = UTC_TIMESTAMP() WHERE id = :user_id"), {**user_fields, "user_id": member_id})
+        scope_params: dict[str, object] = {"user_id": member_id}
+        scope = current.scope_exists_clause(scope_params, correlation="scope_assignment.user_id = users.id")
+        result = await db.execute(text(f"UPDATE users SET {assignments}, updated_at = UTC_TIMESTAMP() WHERE id = :user_id AND ({scope})"), {**user_fields, **scope_params})
+        if result.rowcount != 1:
+            raise HTTPException(404, detail="会员不存在")
     if auth_fields:
         columns = ", ".join(["user_id", *auth_fields])
         placeholders = ", ".join([":user_id", *(f":{key}" for key in auth_fields)])
@@ -287,7 +328,7 @@ async def recommendations(member_id: int = Path(..., ge=1, description="接收�
     """已推荐名单（历史推荐记录）。路径由 ``/recommendations`` 改为 ``/recommend-history``：
     原路径与 ``member_media_admin`` 的「按条件筛选推荐候选人」完全同形，且本文件在 router.py
     中注册更早，会遮蔽后者导致筛选参数被静默忽略。"""
-    await _ensure_member(db, member_id)
+    await _ensure_member(db, member_id, current)
     return await _page(db, """SELECT r.id, r.recommend_date, r.match_score, r.match_reason, r.recommend_source,
         r.is_viewed, r.is_liked, r.is_passed, r.created_at, u.id AS target_user_id,
         u.nickname AS target_nickname, u.avatar AS target_avatar
@@ -304,7 +345,7 @@ async def create_recommendation(
     db: AsyncSession = Depends(get_db),
 ) -> MemberRecommendationResponse:
     """从会员 CRM 中选择一名会员，手工加入指定会员的推荐名单。"""
-    await _ensure_member(db, member_id)
+    await _ensure_member(db, member_id, current)
     if body.recommend_user_id == member_id:
         raise HTTPException(422, detail="不能把会员推荐给自己")
     if not await db.scalar(text("SELECT 1 FROM users WHERE id = :id"), {"id": body.recommend_user_id}):
@@ -345,7 +386,7 @@ async def dating_records(
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> MemberDatingRecordPage:
-    await _ensure_member(db, member_id)
+    await _ensure_member(db, member_id, current)
     filters = ["(q.user_id = :id OR q.target_user_id = :id)"]
     if status:
         filters.append("r.status = :status")
@@ -378,7 +419,7 @@ async def meeting_requests(
     status: str | None = Query(None, pattern="^(SUBMITTED|CONTACTED|ACCEPTED|DECLINED|CLOSED)$"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db),
 ) -> MemberMeetingRequestPage:
-    await _ensure_member(db, member_id)
+    await _ensure_member(db, member_id, current)
     status_clause = " AND q.status = :status" if status else ""
     params = {"id": member_id, "limit": page_size, "offset": (page - 1) * page_size}
     if status:
@@ -401,7 +442,7 @@ async def meeting_requests(
 async def media(member_id: int = Path(..., ge=1), page: int = _paging()[0], page_size: int = _paging()[1], current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> dict:
     """会员媒体原始记录（含审核中的行）。路径由 ``/media`` 改为 ``/media-records``：
     原路径与 ``member_media_admin`` 的媒体审核列表同形且注册更早，会遮蔽后者。"""
-    await _ensure_member(db, member_id)
+    await _ensure_member(db, member_id, current)
     return await _page(db, """SELECT id, media_type, file_url, thumbnail_url, mime_type, duration_seconds, sort_order, is_primary, review_status, created_at
         FROM user_media WHERE user_id = :id AND deleted_at IS NULL ORDER BY sort_order ASC, id DESC LIMIT :limit OFFSET :offset""",
         "SELECT COUNT(*) FROM user_media WHERE user_id = :id AND deleted_at IS NULL", member_id, page, page_size)
@@ -409,7 +450,7 @@ async def media(member_id: int = Path(..., ge=1), page: int = _paging()[0], page
 
 @router.get("/{member_id}/activity-signups")
 async def activity_signups(member_id: int = Path(..., ge=1), page: int = _paging()[0], page_size: int = _paging()[1], current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> dict:
-    await _ensure_member(db, member_id)
+    await _ensure_member(db, member_id, current)
     return await _page(db, """SELECT s.id, s.activity_id, a.title AS activity_title, a.start_time, a.end_time,
         s.real_name, s.phone, s.remark, s.status, s.cancel_reason, s.created_at, s.updated_at
         FROM activity_signup s LEFT JOIN offline_activity a ON a.id = s.activity_id
@@ -421,7 +462,7 @@ async def activity_signups(member_id: int = Path(..., ge=1), page: int = _paging
 async def private_info(member_id: int = Path(..., ge=1), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> dict:
     """会员基础隐私摘要（手机/实名/家庭背景等）。路径由 ``/private-info`` 改为
     ``/private-info-records``：原路径与 ``member_media_admin`` 的私密资料接口同形且注册更早。"""
-    await _ensure_member(db, member_id)
+    await _ensure_member(db, member_id, current)
     row = (await db.execute(text("""SELECT u.id, u.phone, ua.real_name, ua.id_card, ua.company,
         p.family_background, p.single_reason, p.online_status, p.last_active_at
         FROM users u LEFT JOIN user_auth ua ON ua.user_id = u.id LEFT JOIN user_profile p ON p.user_id = u.id
@@ -431,7 +472,7 @@ async def private_info(member_id: int = Path(..., ge=1), current: CurrentMatchma
 
 @router.get("/{member_id}/super-info")
 async def super_info(member_id: int = Path(..., ge=1), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> dict:
-    await _ensure_member(db, member_id)
+    await _ensure_member(db, member_id, current)
     row = (await db.execute(text("""SELECT u.id, u.status, u.created_at, u.updated_at,
         CASE WHEN v.user_id IS NOT NULL AND (v.end_at IS NULL OR v.end_at > UTC_TIMESTAMP()) THEN 1 ELSE 0 END AS is_vip,
         v.end_at AS vip_end_at, a.matchmaker_id, a.organization_id
@@ -443,7 +484,7 @@ async def super_info(member_id: int = Path(..., ge=1), current: CurrentMatchmake
 
 @router.get("/{member_id}/call-records")
 async def call_records(member_id: int = Path(..., ge=1), page: int = _paging()[0], page_size: int = _paging()[1], current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> dict:
-    await _ensure_member(db, member_id)
+    await _ensure_member(db, member_id, current)
     return await _page(db, """SELECT id, user_id, direction, status, duration_seconds, remark, created_by, created_at
         FROM member_call_record WHERE user_id = :id ORDER BY created_at DESC, id DESC LIMIT :limit OFFSET :offset""",
         "SELECT COUNT(*) FROM member_call_record WHERE user_id = :id", member_id, page, page_size)
@@ -451,7 +492,7 @@ async def call_records(member_id: int = Path(..., ge=1), page: int = _paging()[0
 
 @router.post("/{member_id}/call-records", status_code=201)
 async def create_call_record(member_id: int = Path(..., ge=1), body: MemberCallRecordCreate = ..., current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> dict:
-    await _ensure_member(db, member_id)
+    await _ensure_member(db, member_id, current)
     result = await db.execute(text("""INSERT INTO member_call_record
         (user_id, direction, status, duration_seconds, remark, created_by)
         VALUES (:user_id, :direction, :status, :duration_seconds, :remark, :created_by)"""), {
@@ -466,7 +507,7 @@ async def create_call_record(member_id: int = Path(..., ge=1), body: MemberCallR
 
 @router.get("/{member_id}/source-records")
 async def source_records(member_id: int = Path(..., ge=1), page: int = _paging()[0], page_size: int = _paging()[1], current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> dict:
-    await _ensure_member(db, member_id)
+    await _ensure_member(db, member_id, current)
     # There is no dedicated provenance table yet; expose known attribution history.
     try:
         return await _page(db, """SELECT 'assignment' AS source_type, id AS source_id, source, status, effective_at AS occurred_at

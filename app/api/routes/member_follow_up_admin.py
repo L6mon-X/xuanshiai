@@ -11,6 +11,7 @@ from app.db.session import get_db
 from app.schemas.member_follow_up_admin import (
     MemberBehaviorItem,
     MemberBehaviorPage,
+    MemberCallRecordListPage,
     MemberFollowUp,
     MemberFollowUpCreate,
     MemberFollowUpImportResult,
@@ -25,6 +26,18 @@ router = APIRouter(prefix="/admin/members")
 # 「历史跟进」导入模板 MIME
 _XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
+# 会员/跟进记录均无组织列，归属只存在于 resource_assignment，统一用 EXISTS 包装（D-16）。
+_MEMBER_CORRELATION = "scope_assignment.user_id = users.id"
+_FOLLOW_UP_CORRELATION = "scope_assignment.user_id = f.user_id"
+_CALL_CORRELATION = "scope_assignment.user_id = c.user_id"
+_BEHAVIOR_CORRELATION = "scope_assignment.user_id = u.id"
+
+
+def _scope(current: CurrentMatchmakerAdmin, correlation: str) -> tuple[str, dict[str, object]]:
+    """生成四档数据范围谓词；唯一判定在 `CurrentMatchmakerAdmin.scope_clause`（D-16）。"""
+    params: dict[str, object] = {}
+    return current.scope_exists_clause(params, correlation=correlation), params
+
 
 @router.get("/follow-ups", response_model=MemberFollowUpListPage, summary="跟进全览")
 async def all_follow_ups(
@@ -32,14 +45,17 @@ async def all_follow_ups(
     page_size: int = Query(20, ge=1, le=100),
     keyword: str | None = Query(None, max_length=64, description="会员昵称/姓名/手机号/会员编号"),
     intention_level: int | None = Query(None, ge=1, le=3, description="客户意向 1低 2中 3高"),
+    wechat_added: int | None = Query(None, ge=0, le=2, description="加微信结果 0未添加 1已加上 2没加上"),
     start_date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="跟进时间起（含）"),
     end_date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="跟进时间止（含）"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> MemberFollowUpListPage:
     current.require("matchmaker.member.read")
+    scope, scope_params = _scope(current, _FOLLOW_UP_CORRELATION)
     return await service.list_follow_ups(
-        db, page, page_size, keyword, intention_level, start_date, end_date
+        db, page, page_size, keyword, intention_level, wechat_added, start_date, end_date,
+        scope=scope, scope_params=scope_params,
     )
 
 
@@ -49,7 +65,26 @@ async def follow_up_summary(
     db: AsyncSession = Depends(get_db),
 ) -> MemberFollowUpSummary:
     current.require("matchmaker.member.read")
-    return await service.follow_up_summary(db)
+    scope, scope_params = _scope(current, _FOLLOW_UP_CORRELATION)
+    return await service.follow_up_summary(db, scope=scope, scope_params=scope_params)
+
+
+@router.get("/call-records", response_model=MemberCallRecordListPage, summary="通话记录全览")
+async def all_call_records(
+    page: int = Query(1, ge=1, le=1000),
+    page_size: int = Query(20, ge=1, le=100),
+    keyword: str | None = Query(None, max_length=64, description="会员昵称/姓名/手机号/会员编号"),
+    start_date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="通话时间起（含）"),
+    end_date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="通话时间止（含）"),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MemberCallRecordListPage:
+    current.require("matchmaker.member.read")
+    scope, scope_params = _scope(current, _CALL_CORRELATION)
+    return await service.list_call_records(
+        db, page, page_size, keyword, start_date, end_date,
+        scope=scope, scope_params=scope_params,
+    )
 
 
 @router.get("/follow-ups/import-template", summary="下载历史跟进导入模板")
@@ -71,24 +106,41 @@ async def follow_up_import(
     db: AsyncSession = Depends(get_db),
 ) -> MemberFollowUpImportResult:
     current.require("matchmaker.member.manage")
-    return await service.import_follow_ups(db, current.account.id, await file.read(), file.filename or "")
+    scope, scope_params = _scope(current, _MEMBER_CORRELATION)
+    return await service.import_follow_ups(
+        db, current.account.id, await file.read(), file.filename or "",
+        scope=scope, scope_params=scope_params,
+    )
 
 
-async def _ensure_member(db: AsyncSession, user_id: int) -> None:
-    if not await db.scalar(text("SELECT 1 FROM users WHERE id = :id"), {"id": user_id}):
+async def _ensure_member(
+    db: AsyncSession,
+    user_id: int,
+    scope: str | None = None,
+    scope_params: dict[str, object] | None = None,
+) -> None:
+    """会员可见性校验：不在当前账号数据范围内一律 404（D-16）。"""
+    where = ["id = :id"]
+    params: dict[str, object] = {"id": user_id}
+    if scope:
+        params.update(scope_params or {})
+        where.append(f"({scope})")
+    if not await db.scalar(text(f"SELECT 1 FROM users WHERE {' AND '.join(where)}"), params):
         raise HTTPException(404, detail="会员不存在")
 
 
 @router.get("/{member_id}/follow-ups", response_model=MemberFollowUpPage, summary="查询会员跟进记录")
 async def list_follow_ups(member_id: int = Path(..., ge=1), page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=100), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> MemberFollowUpPage:
     current.require("matchmaker.member.read")
-    return await service.get_member_follow_ups(db, member_id, page, page_size, viewer=current.account.id)
+    scope, scope_params = _scope(current, _MEMBER_CORRELATION)
+    return await service.get_member_follow_ups(db, member_id, page, page_size, viewer=current.account.id, scope=scope, scope_params=scope_params)
 
 
 @router.post("/{member_id}/follow-ups", response_model=MemberFollowUp, status_code=201, summary="新增会员跟进记录")
 async def create_follow_up(member_id: int = Path(..., ge=1), body: MemberFollowUpCreate = ..., current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> MemberFollowUp:
     current.require("matchmaker.member.manage")
-    await _ensure_member(db, member_id)
+    scope, scope_params = _scope(current, _MEMBER_CORRELATION)
+    await _ensure_member(db, member_id, scope, scope_params)
     result = await db.execute(text("INSERT INTO member_follow_up (user_id, method, content, next_follow_at, created_by) VALUES (:user_id, :method, :content, :next_follow_at, :created_by)"), {**body.model_dump(), "user_id": member_id, "created_by": current.account.id})
     follow_id = int(result.lastrowid)
     await db.execute(text("INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id) VALUES (:actor, 'member.follow_up.create', 'member_follow_up', :id)"), {"actor": current.account.id, "id": follow_id})
@@ -122,6 +174,7 @@ async def create_follow_up_with_media(
             parsed_next = datetime.fromisoformat(next_follow_at)
         except ValueError:
             raise HTTPException(422, detail="下次跟进时间格式不正确，应为 ISO 日期时间")
+    scope, scope_params = _scope(current, _MEMBER_CORRELATION)
     return await service.create_follow_up_with_media(
         db,
         member_id,
@@ -133,12 +186,16 @@ async def create_follow_up_with_media(
         voice,
         voice_duration_sec,
         current.account.id,
+        scope=scope,
+        scope_params=scope_params,
     )
 
 
 @router.get("/{member_id}/behavior", response_model=MemberBehaviorPage, summary="查询会员行为流水")
 async def behavior(member_id: int = Path(..., ge=1), page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=100), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> MemberBehaviorPage:
-    await _ensure_member(db, member_id)
+    current.require("matchmaker.member.read")
+    scope, scope_params = _scope(current, _MEMBER_CORRELATION)
+    await _ensure_member(db, member_id, scope, scope_params)
     offset = (page - 1) * page_size
     query = text("""SELECT event_type, event_id, target_user_id, target_nickname, detail, occurred_at FROM (
         SELECT 'login' event_type, l.id event_id, NULL target_user_id, NULL target_nickname, IF(l.login_status = 1, '登录成功', CONCAT('登录失败：', COALESCE(l.failure_reason, '未知原因'))) detail, l.created_at occurred_at FROM user_login_log l WHERE l.user_id = :id
@@ -163,11 +220,18 @@ async def all_behavior(
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    current.require("matchmaker.member.read")
     params: dict[str, object] = {"limit": page_size, "offset": (page - 1) * page_size}
+    # 行为流水按「触发行为的会员」收敛到数据范围（D-16）；四档判定仍由
+    # `CurrentMatchmakerAdmin.scope_clause` 唯一实现，这里只把谓词拼进各分支 WHERE。
+    scope, scope_params = _scope(current, _BEHAVIOR_CORRELATION)
+    scope_filter = f" AND ({scope})" if scope else ""
+    if scope:
+        params.update(scope_params)
     if search:
         params["search"] = search
     if category == "browse":
-        where = "1=1"
+        where = f"1=1{scope_filter}"
         if search:
             where += " AND (u.nickname LIKE CONCAT('%', :search, '%') OR u.phone LIKE CONCAT('%', :search, '%'))"
         having = ""
@@ -181,19 +245,19 @@ async def all_behavior(
             COUNT(*) AS browse_times, MAX(h.created_at) AS occurred_at {base}
             ORDER BY occurred_at DESC, event_id DESC LIMIT :limit OFFSET :offset"""
     elif category == "favorite":
-        where = "f.type = 2"
+        where = f"f.type = 2{scope_filter}"
         if search:
             where += " AND (u.nickname LIKE CONCAT('%', :search, '%') OR u.phone LIKE CONCAT('%', :search, '%'))"
         base = f"FROM user_favorite f JOIN users u ON u.id = f.user_id LEFT JOIN users t ON t.id = f.target_user_id WHERE {where}"
         data_sql = f"SELECT f.id AS event_id, f.user_id, u.nickname, f.target_user_id, t.nickname AS target_nickname, f.created_at AS occurred_at {base} ORDER BY occurred_at DESC, event_id DESC LIMIT :limit OFFSET :offset"
     elif category == "superlike":
-        where = "1=1"
+        where = f"1=1{scope_filter}"
         if search:
             where += " AND (u.nickname LIKE CONCAT('%', :search, '%') OR u.phone LIKE CONCAT('%', :search, '%'))"
         base = f"FROM user_boost b JOIN users u ON u.id = b.user_id LEFT JOIN users t ON t.id = b.target_user_id WHERE {where}"
         data_sql = f"SELECT b.id AS event_id, b.user_id, u.nickname, b.target_user_id, t.nickname AS target_nickname, b.created_at AS occurred_at {base} ORDER BY occurred_at DESC, event_id DESC LIMIT :limit OFFSET :offset"
     elif category == "report":
-        where = "1=1"
+        where = f"1=1{scope_filter}"
         if search:
             where += " AND (u.nickname LIKE CONCAT('%', :search, '%') OR u.phone LIKE CONCAT('%', :search, '%'))"
         if status is not None:

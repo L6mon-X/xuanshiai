@@ -56,13 +56,18 @@ async def accounts(
     page_size: int = Query(20, ge=1, le=100),
     username: str | None = Query(None, max_length=64),
     display_name: str | None = Query(None, max_length=128),
-    status: int | None = Query(None, ge=1, le=3),
+    keyword: str | None = Query(None, max_length=128, description="账号或姓名关键词"),
+    status: int | None = Query(None, ge=1, le=3, description="账号状态：与注销状态是两套维度，不要混用"),
     matchmaker_user_id: int | None = Query(None, ge=1),
+    cancellation_status: str | None = Query(None, pattern="^(pending|cancelled|approved)$",
+        description="注销状态（独立于 status）：pending 待处理 / cancelled 已取消 / approved 已注销"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> MatchmakerAdminAccountPage:
     current.require("matchmaker.account.manage")
-    return await list_accounts(db, page, page_size, username, display_name, status, matchmaker_user_id)
+    return await list_accounts(
+        db, page, page_size, username, display_name, status, matchmaker_user_id, cancellation_status, keyword
+    )
 
 
 @router.post("/accounts", response_model=MatchmakerAdminAccountItem, status_code=201)

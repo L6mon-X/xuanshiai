@@ -276,6 +276,33 @@ def _ensure_role(cursor: Any, user_id: int, role_code: str, now: datetime) -> No
         cursor.execute("INSERT INTO user_role (user_id, role_code, status, granted_at) VALUES (%s,%s,1,%s)", (user_id, role_code, now))
 
 
+def _ensure_matchmaker_apply(cursor: Any, user_id: int, real_name: str, phone: str, now: datetime) -> None:
+    """授予服务红娘身份档案。
+
+    只写 user_role 是不够的：线索分派（admin/customer-leads/options 的 matchmakers、
+    _validate_owner）要求 ``user_matchmaker_apply`` 有 status=1 的已审核记录，且与
+    user_role 同时命中才算有效服务红娘。缺这条记录时后台「分派跟进」下拉是空的。
+    """
+    cursor.execute(
+        "SELECT id FROM user_matchmaker_apply WHERE user_id=%s AND application_type='service_matchmaker' ORDER BY id DESC LIMIT 1",
+        (user_id,),
+    )
+    row = cursor.fetchone()
+    if row:
+        cursor.execute(
+            """UPDATE user_matchmaker_apply SET real_name=%s, phone=%s, status=1, fail_reason=NULL,
+            suspended_at=NULL, suspension_reason=NULL, updated_at=%s WHERE id=%s""",
+            (real_name, phone, now, _row_id(row)),
+        )
+    else:
+        cursor.execute(
+            """INSERT INTO user_matchmaker_apply
+            (user_id, application_type, real_name, phone, status, reviewed_at, created_at)
+            VALUES (%s,'service_matchmaker',%s,%s,1,%s,%s)""",
+            (user_id, real_name, phone, now, now),
+        )
+
+
 def _active_role_ids(cursor: Any, role_code: str) -> list[int]:
     """Return local role holders without reading or changing their profile data."""
     cursor.execute("SELECT DISTINCT user_id FROM user_role WHERE role_code=%s AND status=1", (role_code,))
@@ -469,6 +496,7 @@ def seed_matchmaker_workspace_demo(
         actor_id = _ensure_actor(cursor, current_time)
         for role in ("user", "service_matchmaker", "partner", "promoter"):
             _ensure_role(cursor, actor_id, role, current_time)
+        _ensure_matchmaker_apply(cursor, actor_id, ACTOR_NAME, ACTOR_PHONE, current_time)
         cursor.execute(
             """INSERT INTO matchmaker_workspace_profile (user_id, display_name, level, organization_id, status)
             VALUES (%s,%s,'NORMAL',NULL,1)

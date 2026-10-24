@@ -2,9 +2,11 @@ import inspect
 from datetime import datetime
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from app.core.redis import daily_quota_key
 from app.main import app
 from app.schemas.discovery import (
     ApplicationCreateRequest,
@@ -13,6 +15,7 @@ from app.schemas.discovery import (
     DiscoverySearch,
 )
 from app.services import discovery as discovery_service
+from app.services import quotas as quotas_service
 from app.services.candidate_query import (
     SORT_VERSION,
     CandidateCursor,
@@ -32,15 +35,47 @@ discovery = discovery_service
 client = TestClient(app)
 
 
+class _BrowseSession:
+    """假会话：``_record_quota_usage`` 只需要 ``execute`` 返回 None。"""
+
+    def __init__(self) -> None:
+        self.inserts: list[str] = []
+
+    async def execute(self, statement, params=None):  # noqa: ANN001, ANN201
+        self.inserts.append(str(statement))
+        return None
+
+
+async def _browse_quota(
+    session: _BrowseSession,
+    user_id: int,
+    target_user_id: int,
+    *,
+    match_score: float = 50,
+    is_vip: bool = False,
+) -> int:
+    return await _consume_browse(
+        session,
+        user_id=user_id,
+        match_score=match_score,
+        is_vip=is_vip,
+        target_user_id=target_user_id,
+    )
+
+
+def _fixed_browse_limit(limit: int):
+    async def quota_limit(*_args, **_kwargs) -> int:
+        return limit
+
+    return quota_limit
+
+
 @pytest.mark.asyncio
 async def test_profile_browse_quota_uses_redis_fallback_reader(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def quota_limit(*_args, **_kwargs) -> int:
-        return 8
-
-    async def consume(*_args, **_kwargs) -> bool:
-        return True
+    async def consume(*_args, **_kwargs) -> int:
+        return -1
 
     async def daily_used(*_args, **_kwargs) -> int:
         return 1
@@ -48,8 +83,8 @@ async def test_profile_browse_quota_uses_redis_fallback_reader(
     async def record(*_args, **_kwargs) -> None:
         return None
 
-    monkeypatch.setattr(discovery_service, "_quota_limit", quota_limit)
-    monkeypatch.setattr(discovery_service, "consume_daily", consume)
+    monkeypatch.setattr(discovery_service, "_quota_limit", _fixed_browse_limit(8))
+    monkeypatch.setattr(discovery_service, "consume_daily_unique", consume)
     monkeypatch.setattr(discovery_service, "get_daily_used", daily_used)
     monkeypatch.setattr(discovery_service, "_record_quota_usage", record)
 
@@ -58,6 +93,182 @@ async def test_profile_browse_quota_uses_redis_fallback_reader(
     )
 
     assert remaining == 7
+
+
+@pytest.mark.asyncio
+async def test_repeat_view_of_same_target_consumes_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一用户看多次只消耗一次机会、只写一条台账。"""
+    monkeypatch.setattr(discovery_service, "_quota_limit", _fixed_browse_limit(8))
+    session = _BrowseSession()
+
+    remaining = [await _browse_quota(session, 910001, 11) for _ in range(3)]
+
+    assert remaining == [7, 7, 7]
+    assert len(session.inserts) == 1
+
+
+@pytest.mark.asyncio
+async def test_ninth_distinct_target_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def no_extra(*_args, **_kwargs) -> bool:
+        return False
+
+    monkeypatch.setattr(discovery_service, "_quota_limit", _fixed_browse_limit(8))
+    monkeypatch.setattr(discovery_service, "consume_extra", no_extra)
+    session = _BrowseSession()
+
+    remaining = [await _browse_quota(session, 910002, 100 + index) for index in range(8)]
+    assert remaining == [7, 6, 5, 4, 3, 2, 1, 0]
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _browse_quota(session, 910002, 109)
+    assert excinfo.value.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_high_match_bonus_serves_extra_distinct_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(discovery_service, "_quota_limit", _fixed_browse_limit(8))
+    session = _BrowseSession()
+
+    for index in range(8):
+        await _browse_quota(session, 910003, 200 + index)
+
+    assert await _browse_quota(session, 910003, 209, match_score=90) == 4
+
+
+@pytest.mark.asyncio
+async def test_bonus_pool_exhausted_then_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def no_extra(*_args, **_kwargs) -> bool:
+        return False
+
+    monkeypatch.setattr(discovery_service, "_quota_limit", _fixed_browse_limit(8))
+    monkeypatch.setattr(discovery_service, "consume_extra", no_extra)
+    session = _BrowseSession()
+
+    for index in range(13):
+        await _browse_quota(session, 910004, 300 + index, match_score=90)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _browse_quota(session, 910004, 399, match_score=90)
+    assert excinfo.value.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_exhausted_quota_still_opens_already_viewed_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def no_extra(*_args, **_kwargs) -> bool:
+        return False
+
+    monkeypatch.setattr(discovery_service, "_quota_limit", _fixed_browse_limit(8))
+    monkeypatch.setattr(discovery_service, "consume_extra", no_extra)
+    session = _BrowseSession()
+
+    for index in range(8):
+        await _browse_quota(session, 910005, 400 + index)
+
+    with pytest.raises(HTTPException):
+        await _browse_quota(session, 910005, 499)
+
+    assert await _browse_quota(session, 910005, 400) == 0
+
+
+@pytest.mark.asyncio
+async def test_points_pool_marks_target_to_avoid_double_charge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"n": 0}
+
+    async def extra(*_args, **_kwargs) -> bool:
+        calls["n"] += 1
+        return True
+
+    monkeypatch.setattr(discovery_service, "_quota_limit", _fixed_browse_limit(8))
+    monkeypatch.setattr(discovery_service, "consume_extra", extra)
+    session = _BrowseSession()
+
+    for index in range(8):
+        await _browse_quota(session, 910006, 500 + index)
+
+    assert await _browse_quota(session, 910006, 599) == 0
+    assert calls["n"] == 1
+
+    assert await _browse_quota(session, 910006, 599) == 0
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_browse_quota_keys_use_utc_daily_key() -> None:
+    counter_key = await discovery_service._quota_key("browse", 7)
+    seen_key = await discovery_service._quota_key("browse_seen", 7)
+
+    assert counter_key == daily_quota_key("discovery:browse", 7)
+    assert seen_key == daily_quota_key("discovery:browse_seen", 7)
+    assert seen_key != counter_key
+
+
+@pytest.mark.asyncio
+async def test_resolve_browse_limit_reads_snapshot_for_non_vip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def runtime(*_args, **_kwargs) -> int:
+        return 8
+
+    async def membership(*_args, **_kwargs):
+        return False, {}
+
+    monkeypatch.setattr(quotas_service, "_membership_rights", membership)
+    monkeypatch.setattr(quotas_service, "get_runtime_value", runtime)
+
+    assert await quotas_service.resolve_browse_limit(object(), user_id=1) == 8
+
+
+@pytest.mark.asyncio
+async def test_resolve_browse_limit_reads_package_rights_for_vip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def membership(*_args, **_kwargs):
+        return True, {"browse_daily_limit": 20}
+
+    monkeypatch.setattr(quotas_service, "_membership_rights", membership)
+
+    assert await quotas_service.resolve_browse_limit(object(), user_id=1) == 20
+
+
+@pytest.mark.asyncio
+async def test_quota_summary_uses_same_browse_limit_as_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def runtime(*_args, **_kwargs) -> int:
+        return 8
+
+    async def used(*_args, **_kwargs) -> int:
+        return 3
+
+    async def no_extra(*_args, **_kwargs) -> int:
+        return 0
+
+    async def membership(*_args, **_kwargs):
+        return False, {}
+
+    monkeypatch.setattr(quotas_service, "_membership_rights", membership)
+    monkeypatch.setattr(quotas_service, "get_runtime_value", runtime)
+    monkeypatch.setattr(quotas_service, "get_daily_used", used)
+    monkeypatch.setattr(quotas_service, "_extra_remaining", no_extra)
+
+    result = await quotas_service.summary(object(), 1)
+    browse = next(item for item in result.items if item.quota_code == "browse")
+
+    assert browse.daily_limit == 8
+    assert browse.daily_remaining == 5
+    assert await discovery_service._quota_limit(object(), 1, False) == 8
 
 
 def test_discovery_filters_validate_ranges_and_page_size() -> None:
@@ -903,15 +1114,17 @@ async def test_browse_quota_uses_redis_fallback_for_remaining_count(monkeypatch:
         async def execute(self, *_args: object, **_kwargs: object) -> None:
             return None
 
-    async def consume_from_fallback(*_args: object, **_kwargs: object) -> bool:
-        return True
+    async def consume_from_fallback(*_args: object, **_kwargs: object) -> int:
+        return 1
 
     async def fallback_used(*_args: object, **_kwargs: object) -> int:
         return 1
 
-    monkeypatch.setattr(discovery, "consume_daily", consume_from_fallback)
+    limit = discovery.settings.browse_daily_limit
+    monkeypatch.setattr(discovery, "_quota_limit", _fixed_browse_limit(limit))
+    monkeypatch.setattr(discovery, "consume_daily_unique", consume_from_fallback)
     monkeypatch.setattr(discovery, "get_daily_used", fallback_used)
 
     remaining = await _consume_browse(Session(), user_id=1, match_score=50, is_vip=False, target_user_id=2)
 
-    assert remaining == discovery.settings.browse_daily_limit - 1
+    assert remaining == limit - 1

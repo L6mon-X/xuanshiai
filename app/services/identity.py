@@ -1,6 +1,7 @@
 """注册意图与红娘申请业务。"""
 
 import json
+import re
 from datetime import datetime
 from typing import Any
 
@@ -23,6 +24,10 @@ APPLICATION_OPTIONS = {
     "partner": "合伙人招募",
     "service_matchmaker": "服务红娘",
 }
+
+# 中文姓名：2~20 位汉字（含少数民族姓名分隔点「·」）。
+# 仅做格式与实名一致性校验，不做生僻字/字符集之外的推断。
+_REAL_NAME_PATTERN = re.compile(r"[\u4e00-\u9fa5·]{2,20}")
 
 
 async def update_registration_intent(
@@ -111,6 +116,26 @@ async def create_matchmaker_application(
 ) -> dict[str, Any]:
     if not current.phone or current.realname_status != 2:
         raise HTTPException(403, detail="申请红娘或合伙人前必须绑定手机号并完成实名认证")
+    # 申请表单里的姓名此前不做任何校验，填「111」也能通过。这里做两层校验：
+    # ① 与实名认证姓名一致（实名库是权威源，一致即放行，不会误伤外籍/生僻姓名）；
+    # ② 实名库无姓名记录时（兜底）才退回格式校验，避免脏值直接入库。
+    submitted_name = (request.real_name or "").strip()
+    if not submitted_name:
+        raise HTTPException(422, detail="请填写真实姓名")
+    verified_name = (
+        await db.execute(
+            text(
+                "SELECT real_name FROM user_auth WHERE user_id = :user_id AND realname_status = 2"
+            ),
+            {"user_id": current.id},
+        )
+    ).scalar()
+    normalized_verified = str(verified_name).strip() if verified_name else ""
+    if normalized_verified:
+        if normalized_verified != submitted_name:
+            raise HTTPException(422, detail="填写的姓名与实名认证信息不一致")
+    elif not _REAL_NAME_PATTERN.fullmatch(submitted_name):
+        raise HTTPException(422, detail="真实姓名需为 2 至 20 位中文")
     result = await db.execute(
         text("SELECT id, status FROM user_matchmaker_apply WHERE user_id = :user_id AND application_type = :application_type"),
         {"user_id": current.id, "application_type": request.application_type},
@@ -194,9 +219,14 @@ async def admin_list_matchmaker_applications(
     application_type: str | None = None,
     status: int | None = None,
     search: str | None = None,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     where = ["1 = 1"]
-    params: dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size}
+    params: dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size, **(scope_params or {})}
+    if scope:
+        # D-10：按后台账号的四档数据范围收口（申请人须在账号作用域内的资源归属中）。
+        where.append(f"({scope})")
     if application_type:
         where.append("application_type = :application_type")
         params["application_type"] = application_type
@@ -222,10 +252,19 @@ async def admin_list_matchmaker_applications(
     }
 
 
-async def admin_get_matchmaker_application(db: AsyncSession, application_id: int) -> dict[str, Any]:
-    row = (await db.execute(text("""SELECT id, application_type, status, real_name, phone, intro,
+async def admin_get_matchmaker_application(
+    db: AsyncSession,
+    application_id: int,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    clause = f" AND ({scope})" if scope else ""
+    row = (await db.execute(text(f"""SELECT id, application_type, status, real_name, phone, intro,
         cert_images, application_details, fail_reason, created_at, reviewed_at
-        FROM user_matchmaker_apply WHERE id = :id"""), {"id": application_id})).mappings().first()
+        FROM user_matchmaker_apply WHERE id = :id{clause}"""),
+        {**(scope_params or {}), "id": application_id})).mappings().first()
     if not row:
+        # 越权访问按「不存在」处理（404），避免通过状态码差异枚举他组织申请。
         raise HTTPException(404, detail="申请不存在")
     return application_response(row)

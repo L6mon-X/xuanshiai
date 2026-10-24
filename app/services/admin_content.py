@@ -37,6 +37,7 @@ ALLOWED_DOMAINS: frozenset[str] = frozenset(
         "video_homepage",
         "video_tip",
         "free_pay_order",
+        "free_pay_item",
         "sales_library",
         "single_page",
         "landing_page",
@@ -44,8 +45,12 @@ ALLOWED_DOMAINS: frozenset[str] = frozenset(
         "lovecard_batch",
         "fan_qrcode",
         "gift",
+        "point_gift",
         "gift_record",
         "gift_exchange",
+        "point_exchange",
+        "econtract_record",
+        "econtract_template",
         "branch_site",
         "branch_matchmaker",
         "branch_report",
@@ -65,6 +70,11 @@ ALLOWED_DOMAINS: frozenset[str] = frozenset(
         "tweet_task",
         "sms_broadcast",
         "sms_send_record",
+        "ad_slot",
+        # A11-CMS：系统更新公告 / 使用帮助文档，复用通用内容表（无新表）。
+        # 标题=title，正文/分类等放 extra_json（body / category）。
+        "update_report",
+        "help_doc",
     }
 )
 
@@ -98,8 +108,14 @@ def _row_to_item(row: Any) -> ContentItem:
 
 
 def _item_to_row(item: ContentItem) -> dict[str, Any]:
-    """拍平：extra 字段提升到行顶层，供管理端表格列直接读取。"""
-    row: dict[str, Any] = {
+    """列表行：保持 extra 嵌套结构，业务字段不拍平到顶层。
+
+    早期实现把 extra 的键提升到行顶层，会覆盖同名行级列（如 good_news 的
+    extra.status 是中文状态文案，会把整型 status 列覆盖成字符串），且与
+    docs/api/m8-operational-tools.md 约定的响应结构不符。管理端各页面均按
+    item.extra 读取业务字段。
+    """
+    return {
         "id": item.id,
         "domain": item.domain,
         "title": item.title,
@@ -108,11 +124,44 @@ def _item_to_row(item: ContentItem) -> dict[str, Any]:
         "amount": item.amount,
         "status": item.status,
         "sort": item.sort,
+        "extra": item.extra,
         "created_at": item.created_at.isoformat() if item.created_at else None,
         "updated_at": item.updated_at.isoformat() if item.updated_at else None,
     }
-    row.update(item.extra)
-    return row
+
+
+# 域特有筛选项（落地页 type、内容单页 qrcode_type、落地页/自由表单 xiangqin_status）。
+# 这些字段按 admin_content_item 的设计存放在 extra_json，因此筛选走 JSON_EXTRACT；
+# 键名与接口参数同名，前端写入 extra 时需要用相同的键。
+EXTRA_FILTER_KEYS: frozenset[str] = frozenset(
+    {
+        "type",
+        "qrcode_type",
+        "xiangqin_status",
+        "good_news_status",
+        "matchmaker_id",
+        "group_id",
+        "pay",
+        "nick",
+        # A11-CMS：更新公告按分类筛选（category 存于 extra_json）。
+        "category",
+    }
+)
+
+# 搜索方式（search_type）：仅在域内定义过的键才会生效，未定义时退回 title/subtitle/extra_json
+# 全字段模糊匹配（历史行为）。键名取自各域 extra 的写入约定。
+SEARCH_TYPE_EXTRA_KEYS: dict[str, dict[str, str]] = {
+    "free_pay_order": {
+        "nickname": "member_nickname",
+        "phone": "member_phone",
+        "order_no": "order_no",
+    },
+    "gift_exchange": {
+        "nickname": "member_nickname",
+        "phone": "member_phone",
+        "order_no": "order_no",
+    },
+}
 
 
 async def list_items(
@@ -122,16 +171,34 @@ async def list_items(
     page_size: int = 20,
     keyword: str | None = None,
     status: int | None = None,
+    extra_filters: dict[str, str] | None = None,
+    search_type: str | None = None,
 ) -> ContentItemPage:
     _ensure_domain(domain)
     conditions = ["tenant_id = 1", "domain = :domain"]
     params: dict[str, Any] = {"domain": domain}
     if keyword:
-        conditions.append("(title LIKE :kw OR subtitle LIKE :kw OR extra_json LIKE :kw)")
+        search_column = SEARCH_TYPE_EXTRA_KEYS.get(domain, {}).get(search_type or "")
+        if search_column:
+            # 键名来自服务端白名单，不拼接用户输入；取值走绑定参数。
+            conditions.append(f"JSON_UNQUOTE(JSON_EXTRACT(extra_json, '$.{search_column}')) LIKE :kw")
+        else:
+            conditions.append("(title LIKE :kw OR subtitle LIKE :kw OR extra_json LIKE :kw)")
         params["kw"] = f"%{keyword}%"
     if status in (1, 2):
         conditions.append("status = :status")
         params["status"] = status
+    for key, value in (extra_filters or {}).items():
+        # 键名来自服务端白名单，不拼接用户输入；取值走绑定参数。
+        if key in EXTRA_FILTER_KEYS and value:
+            if key in {"good_news_status", "matchmaker_id"} and domain != "good_news":
+                continue
+            if key in {"group_id", "pay", "nick"} and domain != "group_signup":
+                continue
+            json_key = "status" if key == "good_news_status" else key
+            operator = "LIKE" if key == "nick" else "="
+            conditions.append(f"JSON_UNQUOTE(JSON_EXTRACT(extra_json, '$.{json_key}')) {operator} :extra_{key}")
+            params[f"extra_{key}"] = f"%{value}%" if key == "nick" else value
     where = " AND ".join(conditions)
 
     total = int(
@@ -236,6 +303,20 @@ async def update_item(db: AsyncSession, domain: str, item_id: int, body: Content
         await db.execute(text("SELECT * FROM admin_content_item WHERE id = :id"), {"id": item_id})
     ).mappings().first()
     return _row_to_item(fresh)
+
+
+async def get_item(db: AsyncSession, domain: str, item_id: int) -> ContentItem:
+    """A11-CMS：按域 + ID 取单条内容详情（正文在 extra.body）。不存在返回 404。"""
+    _ensure_domain(domain)
+    row = (
+        await db.execute(
+            text("SELECT * FROM admin_content_item WHERE id = :id AND domain = :domain"),
+            {"id": item_id, "domain": domain},
+        )
+    ).mappings().first()
+    if row is None:
+        raise HTTPException(404, detail="内容项不存在")
+    return _row_to_item(row)
 
 
 async def delete_item(db: AsyncSession, domain: str, item_id: int) -> None:

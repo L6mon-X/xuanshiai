@@ -32,6 +32,17 @@ relation_router = APIRouter(prefix="/admin/partner-relations")
 
 _DATE_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
 
+# 合伙人体系各表均无组织列，归属只存在于 resource_assignment，统一用 EXISTS 包装（D-16）。
+_TEAM_CORRELATION = "scope_assignment.user_id = t.owner_user_id"
+_ENTRY_CORRELATION = "scope_assignment.user_id = ce.beneficiary_id"
+_USER_CORRELATION = "scope_assignment.user_id = users.id"
+
+
+def _scope(current: CurrentMatchmakerAdmin, correlation: str) -> tuple[str, dict[str, object]]:
+    """生成四档数据范围谓词；唯一判定在 `CurrentMatchmakerAdmin.scope_clause`（D-16）。"""
+    params: dict[str, object] = {}
+    return current.scope_exists_clause(params, correlation=correlation), params
+
 
 # ─── 合伙人管理 ────────────────────────────────────────────────
 # 注意：静态段（statistics / user-candidates / commission-entries）必须声明在
@@ -50,7 +61,8 @@ async def list_partners(
     db: AsyncSession = Depends(get_db),
 ) -> PartnerStaffPage:
     current.require("matchmaker.read")
-    return await service.list_partners(db, page, page_size, keyword, level_id, status, sort)
+    scope, scope_params = _scope(current, _TEAM_CORRELATION)
+    return await service.list_partners(db, page, page_size, keyword, level_id, status, sort, scope=scope, scope_params=scope_params)
 
 
 @router.post("", response_model=PartnerStaffDetail, status_code=201, summary="添加合伙人（绑定用户建团队）")
@@ -60,7 +72,8 @@ async def create_partner(
     db: AsyncSession = Depends(get_db),
 ) -> PartnerStaffDetail:
     current.require("matchmaker.manage")
-    return await service.create_partner(db, current.account.id, body)
+    scope, scope_params = _scope(current, _USER_CORRELATION)
+    return await service.create_partner(db, current.account.id, body, scope=scope, scope_params=scope_params)
 
 
 @router.get("/statistics", response_model=PartnerStatistics, summary="合伙人统计卡")
@@ -69,7 +82,8 @@ async def partner_statistics(
     db: AsyncSession = Depends(get_db),
 ) -> PartnerStatistics:
     current.require("matchmaker.read")
-    return await service.partner_statistics(db)
+    scope, scope_params = _scope(current, _TEAM_CORRELATION)
+    return await service.partner_statistics(db, scope=scope, scope_params=scope_params)
 
 
 @router.get("/user-candidates", response_model=list[PartnerUserCandidate], summary="搜索可绑定为合伙人的用户")
@@ -89,7 +103,8 @@ async def partner_team_options(
     db: AsyncSession = Depends(get_db),
 ) -> list[PartnerTeamOption]:
     current.require("matchmaker.read")
-    return await service.list_team_options(db)
+    scope, scope_params = _scope(current, _TEAM_CORRELATION)
+    return await service.list_team_options(db, scope=scope, scope_params=scope_params)
 
 
 @router.get(
@@ -108,7 +123,8 @@ async def partner_commission_entries(
     db: AsyncSession = Depends(get_db),
 ) -> PartnerCommissionEntryPage:
     current.require("matchmaker.read")
-    return await service.list_commission_entries(db, page, page_size, partner_id, rule_id, start_date, end_date)
+    scope, scope_params = _scope(current, _ENTRY_CORRELATION)
+    return await service.list_commission_entries(db, page, page_size, partner_id, rule_id, start_date, end_date, scope=scope, scope_params=scope_params)
 
 
 @router.get(
@@ -121,7 +137,8 @@ async def partner_commission_entry_options(
     db: AsyncSession = Depends(get_db),
 ) -> PartnerCommissionEntryOptions:
     current.require("matchmaker.read")
-    return await service.commission_entry_options(db)
+    scope, scope_params = _scope(current, _TEAM_CORRELATION)
+    return await service.commission_entry_options(db, scope=scope, scope_params=scope_params)
 
 
 @router.post(
@@ -136,7 +153,8 @@ async def create_partner_commission_entry(
     db: AsyncSession = Depends(get_db),
 ) -> PartnerCommissionEntryCreateResult:
     current.require("matchmaker.manage")
-    return await service.create_commission_entry(db, current.account.id, body)
+    scope, scope_params = _scope(current, _TEAM_CORRELATION)
+    return await service.create_commission_entry(db, current.account.id, body, scope=scope, scope_params=scope_params)
 
 
 @router.get("/{team_id}", response_model=PartnerStaffDetail, summary="查询合伙人详情")
@@ -146,7 +164,8 @@ async def partner_detail(
     db: AsyncSession = Depends(get_db),
 ) -> PartnerStaffDetail:
     current.require("matchmaker.read")
-    return await service.get_partner(db, team_id)
+    scope, scope_params = _scope(current, _TEAM_CORRELATION)
+    return await service.get_partner(db, team_id, scope=scope, scope_params=scope_params)
 
 
 @router.put("/{team_id}", response_model=PartnerStaffDetail, summary="编辑合伙人")
@@ -157,7 +176,8 @@ async def partner_update(
     db: AsyncSession = Depends(get_db),
 ) -> PartnerStaffDetail:
     current.require("matchmaker.manage")
-    return await service.update_partner(db, team_id, body, current.account.id)
+    scope, scope_params = _scope(current, _TEAM_CORRELATION)
+    return await service.update_partner(db, team_id, body, current.account.id, scope=scope, scope_params=scope_params)
 
 
 @router.delete("/{team_id}", summary="关闭合伙人（移出团队成员并撤销角色）")
@@ -167,7 +187,8 @@ async def partner_delete(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     current.require("matchmaker.manage")
-    return await service.delete_partner(db, team_id, current.account.id)
+    scope, scope_params = _scope(current, _TEAM_CORRELATION)
+    return await service.delete_partner(db, team_id, current.account.id, scope=scope, scope_params=scope_params)
 
 
 # ─── 团队关系 ──────────────────────────────────────────────────
@@ -184,7 +205,8 @@ async def list_relations(
     db: AsyncSession = Depends(get_db),
 ) -> PartnerRelationPage:
     current.require("matchmaker.read")
-    return await service.list_relations(db, page, page_size, team_id, keyword, status)
+    scope, scope_params = _scope(current, _TEAM_CORRELATION)
+    return await service.list_relations(db, page, page_size, team_id, keyword, status, scope=scope, scope_params=scope_params)
 
 
 @relation_router.post("", response_model=PartnerRelationResult, status_code=201, summary="人工绑定团队关系")
@@ -194,7 +216,8 @@ async def bind_relation(
     db: AsyncSession = Depends(get_db),
 ) -> PartnerRelationResult:
     current.require("matchmaker.manage")
-    return await service.bind_relation(db, body, current.account.id)
+    scope, scope_params = _scope(current, _TEAM_CORRELATION)
+    return await service.bind_relation(db, body, current.account.id, scope=scope, scope_params=scope_params)
 
 
 @relation_router.post("/{relation_id}/remove", response_model=PartnerRelationResult, summary="移出团队")
@@ -205,4 +228,5 @@ async def remove_relation(
     db: AsyncSession = Depends(get_db),
 ) -> PartnerRelationResult:
     current.require("matchmaker.manage")
-    return await service.remove_relation(db, relation_id, body, current.account.id)
+    scope, scope_params = _scope(current, _TEAM_CORRELATION)
+    return await service.remove_relation(db, relation_id, body, current.account.id, scope=scope, scope_params=scope_params)

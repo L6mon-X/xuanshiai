@@ -1,6 +1,7 @@
 """Token and sensitive-value helpers used by authentication services."""
 
 import hashlib
+import hmac
 import secrets
 import base64
 from datetime import UTC, datetime, timedelta
@@ -18,15 +19,26 @@ def hash_token(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def create_token(user_id: int, session_id: int, token_type: str, expires_delta: timedelta) -> str:
+def create_token(
+    user_id: int,
+    session_id: int,
+    token_type: str,
+    expires_delta: timedelta,
+    *,
+    extra: dict[str, object] | None = None,
+) -> str:
     now = datetime.now(UTC)
-    payload = {
+    payload: dict[str, object] = {
         "sub": str(user_id),
         "sid": str(session_id),
         "typ": token_type,
         "iat": now,
         "exp": now + expires_delta,
     }
+    # A12-模拟登录：携带额外声明（如 imp=发起管理员 id）标记只读会话；
+    # 普通登录不传 extra，行为与原来完全一致。
+    if extra:
+        payload.update(extra)
     return jwt.encode(payload, settings.secret_key, algorithm=settings.jwt_algorithm)
 
 
@@ -38,6 +50,25 @@ def decode_access_token(token: str) -> dict[str, str]:
     if payload.get("typ") != "access" or not payload.get("sub") or not payload.get("sid"):
         raise ValueError("无效的访问令牌")
     return payload
+
+
+def impersonation_admin_id(token: str) -> int | None:
+    """Return the admin id behind a read-only impersonation access token, else None.
+
+    只读守卫专用：无效/过期令牌视为 None（交由各路由的鉴权依赖拒绝），
+    普通 access token（无 imp 声明）也返回 None。
+    """
+    try:
+        payload = jwt.decode(token, settings.secret_key, algorithms=[settings.jwt_algorithm])
+    except JWTError:
+        return None
+    if payload.get("typ") != "access":
+        return None
+    raw = payload.get("imp")
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def create_live_ws_ticket(
@@ -144,3 +175,17 @@ def encrypt_sensitive(value: str) -> str:
 
 def mask_id_card(value: str) -> str:
     return f"{value[:4]}{'*' * max(0, len(value) - 8)}{value[-4:]}"
+
+
+def payment_callback_signature(order_no: str, transaction_id: str, amount: float | None, secret: str) -> str:
+    """Build the HMAC-SHA256 signature for a payment callback payload (D-21).
+
+    The canonical payload is ``order_no|transaction_id|amount`` where amount uses
+    two decimals (empty string when absent).  WeChat Pay v3 signs the raw
+    notification body; this helper is the local stand-in so both ``mock`` and
+    ``real`` modes share one verification pipeline and only the key source
+    differs.
+    """
+    amount_part = "" if amount is None else f"{float(amount):.2f}"
+    payload = f"{order_no}|{transaction_id}|{amount_part}"
+    return hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()

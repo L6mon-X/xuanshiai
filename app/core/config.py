@@ -43,6 +43,14 @@ class Settings(BaseSettings):
     wechat_app_secret: str | None = None
     wechat_provider: str = "wechat"
     wechat_payment_mode: Literal["mock", "real"] = "mock"
+    # D-21：支付回调验签密钥。real 模式必须显式配置；mock 模式使用
+    # wechat_payment_mock_secret（仅开发/测试，生产禁止 mock）。
+    wechat_payment_sign_key: SecretStr | None = None
+    wechat_payment_mock_secret: str = "mock-payment-secret"
+    # D-14：人脸认证供应商。disabled 时门禁 fail-closed（不可发帖），
+    # mock 仅允许 development/testing。
+    face_provider: str = "disabled"
+    face_mock_pass: bool = True
     wechat_mock_openid_prefix: str = "mock-openid-"
     sms_provider: str = "disabled"
     agreement_versions_raw: str = (
@@ -88,6 +96,31 @@ class Settings(BaseSettings):
     tencent_live_cloud_recording_enabled: bool = False
     tencent_live_mix_stream_enabled: bool = False
     tencent_live_css_enabled: bool = False
+
+    # ── 后台运营第三方服务商适配层（密钥仅走环境变量，管理端接口不回显明文）──
+    # 短信模板群发（A1）：厂商未定前保持 disabled，管理端接口 503 明确报错。
+    sms_template_provider: str = "disabled"
+    sms_access_key: str | None = None
+    sms_access_secret: SecretStr | None = None
+    # 微信公众号平台（A2）：凭据通过环境变量注入，库内 wechat_mp 配置只存非敏感项。
+    wechat_mp_app_id: str | None = None
+    wechat_mp_app_secret: SecretStr | None = None
+    wechat_mp_token: SecretStr | None = None
+    wechat_mp_aes_key: str | None = None
+    # 腾讯电子签（A3）：无凭证时合同创建/签署/作废接口 503。
+    tencent_esign_secret_id: str | None = None
+    tencent_esign_secret_key: SecretStr | None = None
+    tencent_esign_operator_open_id: str | None = None
+    # 电话外呼平台（A6）：捷讯 API 未定前保持 disabled。
+    outbound_call_provider: str = "disabled"
+    outbound_call_base_url: str | None = None
+    outbound_call_account: str | None = None
+    outbound_call_secret: SecretStr | None = None
+    outbound_call_timeout_seconds: float = Field(default=10, gt=0, le=60)
+    # 核验额度在线充值（A17）：厂商未定前保持 disabled，下单接口 503；
+    # mock 仅用于开发/联调（生成待付订单 + 模拟支付链接），生产禁止。
+    # 套餐目录只读展示不受该开关影响。
+    verification_recharge_provider: Literal["disabled", "mock", "real"] = "disabled"
 
     # AI avatar calls an OpenAI-compatible chat-completions service from the
     # backend only. API keys must never be exposed to the mini-program.
@@ -179,6 +212,11 @@ class Settings(BaseSettings):
     ai_provider_approved: bool = False
     ai_retention_policy_version: str | None = None
 
+    # 测试期 AI 用户隔离：为空表示不限制；非空（逗号分隔的 user_id）时，
+    # 只有这些用户允许调用 AI 功能，其余用户按"功能未开放"拒绝。
+    # 用途：临时接入第三方免费端点做联调时，确保真实用户的数据不会被发出去。
+    ai_test_only_user_ids: str = ""
+
     # DeepSeek provider 配置（OpenAI 兼容 API）。真实 api_key 仅存于被忽略的
     # .env；.env.example 只放占位符 YOUR_DEEPSEEK_API_KEY。生产启用需先走
     # Provider 审批门禁（ai_policy_approved 等）。deepseek-chat 已弃用，
@@ -186,7 +224,10 @@ class Settings(BaseSettings):
     ai_deepseek_api_key: SecretStr | None = None
     ai_deepseek_base_url: str = "https://api.deepseek.com"
     ai_deepseek_model: str = "deepseek-v4-flash"
-    ai_deepseek_max_tokens: int = Field(default=2048, gt=0, le=8192)
+    # 2048 装不下用心度评审这类长 JSON 输出（summary 500 字 + 最多 4 条
+    # advice 各 300 字 ≈ 1700 汉字，中文按 1.5~2 token/字折算超 2500 token），
+    # 输出被截断会让 parse_json 收到不完整 JSON 而 503。默认给到 4096。
+    ai_deepseek_max_tokens: int = Field(default=4096, gt=0, le=8192)
 
     # Dots provider 配置（小红书 hi lab dots.llm，OpenAI 兼容 API）。真实
     # api_key 仅存于被忽略的 .env；.env.example 只放占位符。dots3-note-prev
@@ -342,7 +383,6 @@ class Settings(BaseSettings):
     ai_daily_search_limit: int = Field(default=10, ge=1, le=100)
     ai_daily_match_limit: int = Field(default=10, ge=1, le=100)
     ai_daily_advisor_limit: int = Field(default=20, ge=1, le=1000)
-    ai_daily_avatar_limit: int = Field(default=20, ge=1, le=1000)
     ai_daily_thoughtfulness_limit: int = Field(default=10, ge=1, le=100)
     ai_advisor_max_context_messages: int = Field(default=80, ge=10, le=200)
     ai_advisor_prompt_version: str = "relationship-v1"
@@ -357,6 +397,26 @@ class Settings(BaseSettings):
     def ai_provider_name(self) -> str:
         """当前生效的 provider 名称，用于 AITaskContext 审计元数据。"""
         return self.ai_provider
+
+    @property
+    def ai_test_only_user_id_set(self) -> frozenset[int]:
+        """解析 ``ai_test_only_user_ids``；空集合表示不做用户隔离。
+
+        容忍逗号、分号、全角逗号和空白分隔，非数字片段直接忽略（不抛错），
+        避免一个手误的字符让服务启动失败。
+        """
+        raw = (
+            (self.ai_test_only_user_ids or "")
+            .replace("，", ",")
+            .replace("；", ",")
+            .replace(";", ",")
+        )
+        allowed: set[int] = set()
+        for part in raw.replace(" ", ",").split(","):
+            part = part.strip()
+            if part.isdigit():
+                allowed.add(int(part))
+        return frozenset(allowed)
 
     @property
     def ai_model_name(self) -> str:
@@ -411,6 +471,8 @@ class Settings(BaseSettings):
             raise ValueError("staging/production 环境必须关闭 AUTO_INIT_DB")
         if self.environment in {"staging", "production"} and self.live_provider == "mock":
             raise ValueError("staging/production 环境禁止使用直播 Mock Provider")
+        if self.environment in {"staging", "production"} and self.verification_recharge_provider == "mock":
+            raise ValueError("staging/production 环境禁止使用核验充值 Mock Provider")
         if self.live_enabled and self.live_provider == "tencent":
             sdk_secret = (
                 self.tencent_live_sdk_secret_key.get_secret_value().strip()
@@ -445,6 +507,12 @@ class Settings(BaseSettings):
             len(self.sms_mock_code) != 6 or not self.sms_mock_code.isdigit()
         ):
             raise ValueError("SMS_MOCK_CODE 必须是6位数字")
+        # A1/A6：运营群发与外呼通道的 Mock 实现只允许开发/测试环境使用。
+        if not self.is_test_mode and "mock" in {
+            self.sms_template_provider.lower(),
+            self.outbound_call_provider.lower(),
+        }:
+            raise ValueError("生产环境禁止启用短信群发或外呼平台的 Mock 服务")
         if (
             self.environment == "production"
             and self.aliyun_content_moderation_enabled

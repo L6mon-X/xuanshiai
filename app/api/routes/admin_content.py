@@ -19,11 +19,30 @@ async def content_list(
     page_size: int = Query(20, ge=1, le=100),
     keyword: str | None = Query(None, max_length=64),
     status: int | None = Query(None, ge=1, le=2),
+    type: str | None = Query(None, max_length=32, description="内容类型，取自 extra.type：page 单页 / landing 引导页 / form 自由表单"),
+    qrcode_type: str | None = Query(None, max_length=32, description="二维码类型，取自 extra.qrcode_type：h5 普通H5二维码 / follow 引导关注公众号"),
+    xiangqin_status: str | None = Query(None, max_length=16, description="相亲状态，取自 extra.xiangqin_status：1公开相亲 2委托红娘 3完全私密 4停止相亲 5已经脱单"),
+    good_news_status: str | None = Query(None, max_length=32, description="喜讯状态，取自 extra.status"),
+    matchmaker_id: str | None = Query(None, max_length=20, description="服务红娘 ID，取自 extra.matchmaker_id"),
+    group_id: str | None = Query(None, max_length=20, description="社群报名所属社群 ID，取自 extra.group_id"),
+    pay: str | None = Query(None, max_length=16, description="社群报名支付状态，取自 extra.pay"),
+    nick: str | None = Query(None, max_length=64, description="社群报名昵称，按 extra.nick 精确/模糊筛选"),
+    search_type: str | None = Query(None, max_length=32, description="keyword 的匹配目标（按域生效）：free_pay_order/gift_exchange 支持 nickname 会员昵称 / phone 手机号 / order_no 订单号；未定义时按标题等全字段模糊匹配"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> ContentItemPage:
     current.require("platform.config.read")
-    return await list_items(db, domain, page, page_size, keyword, status)
+    extra_filters = {
+        "type": type,
+        "qrcode_type": qrcode_type,
+        "xiangqin_status": xiangqin_status,
+        "good_news_status": good_news_status,
+        "matchmaker_id": matchmaker_id,
+        "group_id": group_id,
+        "pay": pay,
+        "nick": nick,
+    }
+    return await list_items(db, domain, page, page_size, keyword, status, extra_filters, search_type)
 
 
 @declare_permission("platform.config.write")

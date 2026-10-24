@@ -67,19 +67,39 @@ async def create_store(db: AsyncSession, admin: CurrentUser, request: StoreCreat
     return await get_store(db, store_id)
 
 
-async def get_store(db: AsyncSession, store_id: int) -> StoreResponse:
-    result = await db.execute(text("""SELECT id, code, name, display_name, region_code, status,
-        auto_redirect, created_at FROM organization WHERE id = :id AND org_type = 'store'"""), {"id": store_id})
+async def get_store(
+    db: AsyncSession,
+    store_id: int,
+    *,
+    scope: str | None = None,
+    params: dict[str, object] | None = None,
+) -> StoreResponse:
+    """读取门店。
+
+    ``scope`` / ``params`` 由调用方（后台路由）从 ``CurrentMatchmakerAdmin`` 的四档
+    作用域谓词取得（D-10）。越权访问统一按 404「门店不存在」返回，不区分状态码。
+    """
+    clause = f" AND ({scope})" if scope else ""
+    result = await db.execute(text(f"""SELECT id, code, name, display_name, region_code, status,
+        auto_redirect, created_at FROM organization WHERE id = :id AND org_type = 'store'{clause}"""),
+        {**(params or {}), "id": store_id})
     row = result.mappings().first()
     if not row:
         raise HTTPException(404, detail="门店不存在")
     return StoreResponse(**{**dict(row), "auto_redirect": bool(row["auto_redirect"])})
 
 
-async def list_stores(db: AsyncSession) -> list[StoreResponse]:
-    result = await db.execute(text("""SELECT id, code, name, display_name, region_code, status,
-        auto_redirect, created_at FROM organization WHERE org_type = 'store'
-        ORDER BY id DESC"""))
+async def list_stores(
+    db: AsyncSession,
+    *,
+    scope: str | None = None,
+    params: dict[str, object] | None = None,
+) -> list[StoreResponse]:
+    """列出门店。传入 ``scope`` 时按四档数据范围过滤（D-10）。"""
+    clause = f" AND ({scope})" if scope else ""
+    result = await db.execute(text(f"""SELECT id, code, name, display_name, region_code, status,
+        auto_redirect, created_at FROM organization WHERE org_type = 'store'{clause}
+        ORDER BY id DESC"""), params or {})
     return [StoreResponse(**{**dict(row), "auto_redirect": bool(row["auto_redirect"])}) for row in result.mappings().all()]
 
 

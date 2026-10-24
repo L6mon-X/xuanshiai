@@ -15,7 +15,6 @@ import pytest
 
 from tests.test_ai_memory_consumers import (
     FakeCache,
-    PersonaProjectionSession,
     _allow_decide,
     _grant_build_persona,
     _persona_store,
