@@ -150,7 +150,14 @@ async def get_lead(
         where.append("deleted_at IS NULL")
     select_sql = LEAD_SELECT
     if "gender" in columns:
-        select_sql = select_sql.replace("FROM customer_lead", ", CAST(gender AS SIGNED) AS gender FROM customer_lead")
+        # 只给主查询补 gender 列。tags_raw 子查询里的 customer_lead_tag_relation 含
+        # "FROM customer_lead" 子串，无边界 str.replace 会把它一并替换成返回 2 列，
+        # MySQL 报 1241 "Operand should contain 1 column(s)"（客源列表/详情 500）。
+        select_sql = re.sub(
+            r"FROM customer_lead(?![a-zA-Z0-9_])",
+            ", CAST(gender AS SIGNED) AS gender FROM customer_lead",
+            select_sql,
+        )
     row = (await db.execute(text(f"{select_sql} WHERE {' AND '.join(where)}"), params)).mappings().first()
     if not row:
         raise HTTPException(404, detail="客源线索不存在")
@@ -424,7 +431,14 @@ async def list_leads(
     order_sql = _LEAD_ORDER_SQL.get(order or "latest", _LEAD_ORDER_SQL["latest"])
     select_sql = LEAD_SELECT
     if "gender" in columns:
-        select_sql = select_sql.replace("FROM customer_lead", ", CAST(gender AS SIGNED) AS gender FROM customer_lead")
+        # 只给主查询补 gender 列。tags_raw 子查询里的 customer_lead_tag_relation 含
+        # "FROM customer_lead" 子串，无边界 str.replace 会把它一并替换成返回 2 列，
+        # MySQL 报 1241 "Operand should contain 1 column(s)"（客源列表/详情 500）。
+        select_sql = re.sub(
+            r"FROM customer_lead(?![a-zA-Z0-9_])",
+            ", CAST(gender AS SIGNED) AS gender FROM customer_lead",
+            select_sql,
+        )
     rows = await db.execute(text(f"{select_sql} WHERE {clause} ORDER BY {order_sql} LIMIT :limit OFFSET :offset"), params)
     count = await db.execute(text(f"SELECT COUNT(*) FROM customer_lead WHERE {clause}"), {k: v for k, v in params.items() if k not in ("limit", "offset")})
     total = int(count.scalar() or 0)

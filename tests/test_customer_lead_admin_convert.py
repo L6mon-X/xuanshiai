@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 
 import pytest
@@ -236,3 +237,21 @@ def test_lead_select_provides_every_required_customer_lead_field() -> None:
     required = {name for name, field in CustomerLead.model_fields.items() if field.is_required()}
     assert required, "CustomerLead 应有必填字段"
     assert {name for name in required if name not in LEAD_SELECT} == set()
+
+
+def test_gender_injection_never_touches_the_tags_subquery() -> None:
+    """gender 列注入必须带表名边界。
+
+    tags_raw 子查询里的 customer_lead_tag_relation 含 "FROM customer_lead" 子串，
+    无边界 replace 会把子查询改成返回 2 列，MySQL 报 1241（客源列表/详情 500）。
+    StubDB 按 SQL 文本分派、不校验语法，这类错误单测抓不到，只能静态钉住。
+    """
+    injected = re.sub(
+        r"FROM customer_lead(?![a-zA-Z0-9_])",
+        ", CAST(gender AS SIGNED) AS gender FROM customer_lead",
+        LEAD_SELECT,
+    )
+    assert injected.count("CAST(gender AS SIGNED) AS gender") == 1
+    assert "gender FROM customer_lead_tag_relation" not in injected
+    sub = injected[injected.index("(SELECT GROUP_CONCAT"):injected.index("AS tags_raw")]
+    assert "CAST(gender AS SIGNED) AS gender" not in sub
