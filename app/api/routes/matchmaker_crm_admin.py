@@ -1023,6 +1023,61 @@ async def member_detail(member_id: int = Path(..., ge=1), current: CurrentMatchm
     return MemberDetail(**data)
 
 
+class MemberContactReveal(BaseModel):
+    member_id: int
+    field: str
+    value: str | None
+
+
+@router.get("/members/{member_id}/contact", response_model=MemberContactReveal, summary="查看会员完整联系方式（权限门控 + 逐次审计）")
+async def member_contact_reveal(
+    member_id: int = Path(..., ge=1),
+    field: str = Query("wechat", pattern="^(wechat|phone)$", description="要查看的联系方式字段：wechat 微信号 / phone 手机号"),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MemberContactReveal:
+    """A19：详情接口对微信号做服务端掩码（隐私纵深），前端「查看微信 / 查看手机」调本接口按权限取完整值。
+
+    与掩码出参不同：本接口是唯一返回原值的出口，必须 `matchmaker.member.manage` 权限 + D-16 数据范围校验
+    + 逐次审计；越权/不存在按 404（不区分两种情形，避免枚举会员 ID）。微信号列缺失时 503。
+    """
+    current.require("matchmaker.member.manage")
+    available = await _available_columns(db)
+    params: dict[str, object] = {"member_id": member_id}
+    scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = u.id")
+    deleted_guard = " AND u.deleted_at IS NULL" if ("users", "deleted_at") in available else ""
+    if field == "phone":
+        expr = "u.phone"
+    else:
+        if ("user_profile", "wechat") not in available:
+            raise HTTPException(503, detail="微信号列未就绪，无法查看完整微信号")
+        expr = "p.wechat"
+    row = (
+        await db.execute(
+            text(
+                f"SELECT {expr} AS value FROM users u "
+                "LEFT JOIN user_profile p ON p.user_id = u.id "
+                f"WHERE u.id = :member_id AND ({scope}){deleted_guard}"
+            ),
+            params,
+        )
+    ).mappings().first()
+    if row is None:
+        raise HTTPException(404, detail="会员不存在或无权限")
+    raw = row["value"]
+    await db.execute(
+        text(
+            "INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id, reason)"
+            " VALUES (:actor, 'member.contact_reveal', 'users', :id, :reason)"
+        ),
+        {"actor": current.account.id, "id": member_id, "reason": f"查看完整{field}"[:255]},
+    )
+    await db.commit()
+    return MemberContactReveal(
+        member_id=member_id, field=field, value=(str(raw) if raw is not None and str(raw).strip() != "" else None)
+    )
+
+
 @router.patch("/members/{member_id}/assignment", response_model=MemberAssignmentResponse, summary="修改会员服务红娘（幂等 + 二次确认）")
 async def member_assignment(
     member_id: int = Path(..., ge=1),

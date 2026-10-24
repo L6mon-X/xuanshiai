@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import datetime
 
 import pytest
+from fastapi import HTTPException
 
 from app.api.routes import matchmaker_crm_admin as crm
 from app.core.sensitive_fields import (
@@ -274,3 +275,113 @@ async def test_member_update_writes_real_new_wechat() -> None:
     profile_stmt = next((s, p) for s, p in db.statements if "INSERT INTO user_profile" in s)
     assert profile_stmt[1]["wechat"] == "brand_new_id_77"
     assert db.committed is True
+
+
+# --------------------------------------------------------------------------- #
+# A19 联系方式解密接口：权限门控 + 逐次审计 + 唯一返原值出口
+# --------------------------------------------------------------------------- #
+class _RevealAdmin:
+    """member_contact_reveal 依赖三件套：require / account.id / scope_exists_clause。
+
+    直接复用生产 require 的判定口径：无 ``matchmaker.member.manage`` 且无 ``*`` → 403。
+    """
+
+    def __init__(self, permissions: set[str] | None) -> None:
+        from types import SimpleNamespace
+
+        self.permissions = set(permissions or set())
+        self.account = SimpleNamespace(id=5)
+
+    def require(self, permission: str) -> None:
+        if "*" not in self.permissions and permission not in self.permissions:
+            raise HTTPException(status_code=403, detail=f"缺少权限：{permission}")
+
+    def scope_exists_clause(self, params, correlation=None):  # noqa: ANN001 - 测试桩
+        return "1 = 1"
+
+
+def _reveal_db(value: object, columns: list[tuple[str, str]] | None = None) -> StubDB:
+    """列探测 → 主查询 mappings().first() → 审计 INSERT 三段式结果队列。"""
+    return StubDB([
+        StubResult(rows=columns if columns is not None else _CRM_COLUMNS),
+        StubResult(first={"value": value}),
+        StubResult(),
+    ])
+
+
+@pytest.mark.asyncio
+async def test_contact_reveal_manage_returns_full_value_and_audits() -> None:
+    db = _reveal_db(WECHAT)
+    res = await crm.member_contact_reveal(
+        member_id=9, field="wechat", current=_RevealAdmin({"matchmaker.member.manage"}), db=db,
+    )
+    # 唯一返原值出口：不做任何掩码
+    assert res.value == WECHAT
+    assert res.member_id == 9 and res.field == "wechat"
+    assert db.committed is True
+    # 主查询取原始列（SELECT p.wechat AS value），不经 mask_contact
+    assert "p.wechat AS value" in db.statements[1][0]
+    # 逐次审计：business_audit_log + member.contact_reveal + actor 归属
+    audit_sql, audit_params = db.statements[-1]
+    assert "business_audit_log" in audit_sql and "member.contact_reveal" in audit_sql
+    assert audit_params["actor"] == 5 and audit_params["id"] == 9
+
+
+@pytest.mark.asyncio
+async def test_contact_reveal_requires_manage_permission() -> None:
+    # read 权限不足以解密：require 在探测列之前抛出，不触碰 db
+    db = StubDB([StubResult(rows=_CRM_COLUMNS)])
+    with pytest.raises(HTTPException) as exc:
+        await crm.member_contact_reveal(
+            member_id=9, field="wechat", current=_RevealAdmin({"matchmaker.member.read"}), db=db,
+        )
+    assert exc.value.status_code == 403
+    assert db.committed is False
+
+
+@pytest.mark.asyncio
+async def test_contact_reveal_star_permission_passes() -> None:
+    db = _reveal_db(PHONE)
+    res = await crm.member_contact_reveal(
+        member_id=9, field="phone", current=_RevealAdmin({"*"}), db=db,
+    )
+    assert res.value == PHONE
+    # phone 走 users.phone，不依赖 user_profile.wechat 列
+    assert "u.phone AS value" in db.statements[1][0]
+
+
+@pytest.mark.asyncio
+async def test_contact_reveal_missing_row_is_404_and_no_commit() -> None:
+    db = StubDB([
+        StubResult(rows=_CRM_COLUMNS),
+        StubResult(first=None),  # 作用域内查不到（越权/不存在统一 404，不泄露区别）
+    ])
+    with pytest.raises(HTTPException) as exc:
+        await crm.member_contact_reveal(
+            member_id=99, field="wechat", current=_RevealAdmin({"matchmaker.member.manage"}), db=db,
+        )
+    assert exc.value.status_code == 404
+    assert db.committed is False
+
+
+@pytest.mark.asyncio
+async def test_contact_reveal_wechat_column_absent_is_503() -> None:
+    # 迁移未落库：user_profile 无 wechat 列 → 503，而非拼 NULL 误导前端
+    db = StubDB([StubResult(rows=[("user_auth", "education")])])
+    with pytest.raises(HTTPException) as exc:
+        await crm.member_contact_reveal(
+            member_id=9, field="wechat", current=_RevealAdmin({"matchmaker.member.manage"}), db=db,
+        )
+    assert exc.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_contact_reveal_blank_value_returns_none_but_still_audits() -> None:
+    # 库中为空串/仅空格：返回 None（前端据此显示「未填写」），仍留审计痕迹
+    db = _reveal_db("   ")
+    res = await crm.member_contact_reveal(
+        member_id=9, field="wechat", current=_RevealAdmin({"matchmaker.member.manage"}), db=db,
+    )
+    assert res.value is None
+    assert db.committed is True
+
