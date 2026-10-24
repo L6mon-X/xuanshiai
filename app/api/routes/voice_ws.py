@@ -51,6 +51,7 @@ from typing import Any
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
 from app.core.config import settings
+from app.core.request_context import current_user_id_context
 from app.services.voice.auth import VoiceTicketDenied, VoiceTicketUnavailable, authenticate_voice_ticket
 from app.db.session import session_factory as _db_session_factory
 from app.services.ai.flags import AiFeature, require_ai_feature
@@ -208,6 +209,13 @@ async def voice_conversation(
         await ws.close(code=WS_CLOSE_INTERNAL_ERROR, reason="凭证服务暂时不可用")
         return
     request_id = uuid.uuid4().hex
+
+    # WebSocket 连接不经过 ``get_current_user``，此处补写请求级用户上下文，
+    # 使依赖该上下文的 AI 守卫（如测试期用户白名单）能识别调用者。
+    try:
+        current_user_id_context.set(int(user_id))
+    except (TypeError, ValueError):
+        current_user_id_context.set(None)
 
     # 3. 接受连接。
     await ws.accept()
