@@ -10,6 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import decode_access_token
+from app.core.request_context import current_user_id_context
 from app.services.matchmaker_admin_auth import decode_matchmaker_admin_token, get_session_account
 from app.schemas.matchmaker_admin import MatchmakerAdminAccount
 from app.db.session import get_db
@@ -90,6 +91,8 @@ async def get_current_user(
     await db.commit()
     values = dict(row)
     values.setdefault("face_verified", None)
+    # 供跨层守卫（如 AI 测试期用户隔离）读取当前调用者，避免把 user 逐层透传。
+    current_user_id_context.set(int(row["id"]))
     # A12-模拟登录：从令牌 imp 声明中取发起管理员 id（无声明为 None，普通登录行为不变）。
     impersonated_raw = payload.get("imp")
     impersonated_by = int(impersonated_raw) if impersonated_raw is not None else None

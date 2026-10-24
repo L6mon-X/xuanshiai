@@ -208,6 +208,11 @@ class Settings(BaseSettings):
     ai_provider_approved: bool = False
     ai_retention_policy_version: str | None = None
 
+    # 测试期 AI 用户隔离：为空表示不限制；非空（逗号分隔的 user_id）时，
+    # 只有这些用户允许调用 AI 功能，其余用户按"功能未开放"拒绝。
+    # 用途：临时接入第三方免费端点做联调时，确保真实用户的数据不会被发出去。
+    ai_test_only_user_ids: str = ""
+
     # DeepSeek provider 配置（OpenAI 兼容 API）。真实 api_key 仅存于被忽略的
     # .env；.env.example 只放占位符 YOUR_DEEPSEEK_API_KEY。生产启用需先走
     # Provider 审批门禁（ai_policy_approved 等）。deepseek-chat 已弃用，
@@ -385,6 +390,26 @@ class Settings(BaseSettings):
     def ai_provider_name(self) -> str:
         """当前生效的 provider 名称，用于 AITaskContext 审计元数据。"""
         return self.ai_provider
+
+    @property
+    def ai_test_only_user_id_set(self) -> frozenset[int]:
+        """解析 ``ai_test_only_user_ids``；空集合表示不做用户隔离。
+
+        容忍逗号、分号、全角逗号和空白分隔，非数字片段直接忽略（不抛错），
+        避免一个手误的字符让服务启动失败。
+        """
+        raw = (
+            (self.ai_test_only_user_ids or "")
+            .replace("，", ",")
+            .replace("；", ",")
+            .replace(";", ",")
+        )
+        allowed: set[int] = set()
+        for part in raw.replace(" ", ",").split(","):
+            part = part.strip()
+            if part.isdigit():
+                allowed.add(int(part))
+        return frozenset(allowed)
 
     @property
     def ai_model_name(self) -> str:
