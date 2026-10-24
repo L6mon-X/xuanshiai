@@ -275,3 +275,18 @@ Python 3.12.7（项目自带 venv `.venv/`），未连接共享开发或生产 M
 | `test_resolve_browse_limit_reads_snapshot_for_non_vip` | 普通用户上限来自快照 |
 | `test_resolve_browse_limit_reads_package_rights_for_vip` | VIP 上限来自套餐 rights |
 | `test_quota_summary_uses_same_browse_limit_as_discovery` | `/users/me/quotas` 与扣费上限同源 |
+
+## 2026-10-23 AI 测试期用户隔离（`AI_TEST_ONLY_USER_IDS`）
+
+> 触发：临时接入第三方免费端点联调前，需要从技术上保证只有白名单用户能触发 AI，避免真实用户数据外传。改动：`app/core/request_context.py`（新增）、`app/core/config.py`、`app/api/dependencies.py`、`app/services/ai/flags.py`、`tests/test_ai_test_scope_guard.py`（新增）、`docs/api/AI能力.md`。**默认空值，对既有部署零行为变化。**
+
+| 检查 | 命令 | 结果 |
+| --- | --- | --- |
+| 隔离专项 | `pytest tests/test_ai_test_scope_guard.py -q` | `11 passed` |
+| 鉴权/额度/权限回归 | `pytest tests/test_admin_permission_coverage.py tests/test_vip_authorization_consistency.py tests/test_discovery_features.py tests/test_ai_test_scope_guard.py -q` | `82 passed` |
+| 后端全量无集成测试 | `pytest --ignore=tests/integration -q` | `8 failed, 2761 passed, 15 skipped in 427.63s` |
+| 全仓 Ruff | `ruff check app tests scripts` | `All checks passed!` |
+
+失败 8 项构成与 2026-10-22 基线相同：7 项环境缺失（缺 `PRODUCT.md` ×3、缺架构文档 ×3、缺同级前端仓 ×1）+ `test_ai_profile_sessions::test_extraction_accumulates_fields_on_latest_draft`（该用例 10-22 两次全量一次过一次败，**受执行顺序/库内状态影响，非本次改动引入**）。`passed` 2751 → 2761 的增量来自本次新增 11 条用例。
+
+**实现要点**：`get_current_user` 在鉴权成功后写入 `current_user_id_context`（一处写入覆盖全部 AI 路由）；`require_ai_feature` 末尾调用 `_require_ai_test_scope()`（一处拦截覆盖 16 个 AI 门禁调用点）；白名单为空放行，非空时列表外用户**及无请求上下文的调用**均 fail closed（`503 AI_FEATURE_DISABLED`）。
