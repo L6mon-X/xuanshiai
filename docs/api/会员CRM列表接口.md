@@ -35,7 +35,7 @@
 | `nickname` | string/null | 1-64 字符 | 会员昵称 |
 | `gender` | integer/null | `1` 男、`2` 女 | 性别 |
 | `birthday` | string/null | `YYYY-MM-DD` | 生日 |
-| `height` / `weight` | integer/null | 身高 80-250、体重 40-120 | 身高厘米、体重千克 |
+| `height` / `weight` | integer/null | 身高 80-250、体重 30-150 | 身高厘米、体重千克 |
 | `constellation` / `zodiac` | string/null | 最多 16 字符 | 星座、属相 |
 | `hometown` / `residence` / `household` | string/null | 最多 128 字符 | 家乡、现居、户籍展示名称 |
 | 区域代码字段 | string/null | 最多 32 字符 | 家乡、现居、户籍的省/市/区代码：`*_province_code`、`*_city_code`、`*_district_code` |
@@ -89,6 +89,7 @@ Content-Type: application/json
 
 ## 变更记录
 
+- 2026-10-18：`weight` 校验范围由 40-120 放宽为 30-150（会员详情编辑 `PATCH /admin/matchmaker/members/{member_id}` 与红娘工作台会员录入同口径）；`height` 范围不变。向后兼容，旧客户端无需改动，仅此前被拒的 30-39 与 121-150 现可保存。
 - 2026-10-04（D-4 数据范围下沉）：会员列表、统计、详情、改派、改状态、批量改状态、会员实名列表与牵线记录全部叠加后台数据范围（`ALL/SELF/STORE/ORGANIZATION` 四档，未绑定组织 fail-closed 返回 0 条）。越权访问按 `404 会员不存在` 返回；越权写操作不落库。四档定义见 [`docs/api/后台数据范围与敏感操作-2026-10-04.md`](后台数据范围与敏感操作-2026-10-04.md)。
 - 2026-10-04（附带修复）：会员列表原以非聚合子查询关联 `resource_assignment`，一人多单会产生重复行并虚增 `total`，已改为按 `user_id` 聚合；会员统计的 VIP 子查询原统计全平台 VIP，已同口径收口。
 - 2026-09-16：`PATCH /admin/matchmaker/members/{member_id}` 扩展会员基本资料更新字段，新增星座、饮酒、宗教、结婚计划、学校、单位和 `match_status`；`GET /admin/matchmaker/members/{member_id}` 及会员列表同步返回这些字段。向后兼容，旧客户端无需改动。

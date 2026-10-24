@@ -22,6 +22,7 @@ from app.services.candidate_query import (
 )
 from app.services.candidate_visibility import (
     CandidateVisibilityService,
+    CompletionWaiver,
     ViewerContext,
     VisibilityScene,
 )
@@ -178,9 +179,17 @@ def test_filter_options_is_public() -> None:
 def test_filter_options_education_direction_matches_storage_domain() -> None:
     """education_levels 必须与 user_profile.education_level 存储域同向：
     1=高中及以下 … 5=博士（SQL 语义为 education_level >= :education_min）。"""
+    from app.services.profile import EDUCATION_LEVEL_LABELS, education_level_from_label
+
     response = client.get("/api/v1/discovery/filter-options")
     levels = {item["value"]: item["label"] for item in response.json()["education_levels"]}
     assert levels == {1: "高中及以下", 2: "大专", 3: "本科", 4: "硕士", 5: "博士"}
+    # 后端各处读同一列必须用同一套字典：待审卡片、录入档位翻译都取这份，
+    # 混用 AI 画像的 1-6（1=初中及以下…6=博士）会把本科和硕士整体错开一档。
+    assert EDUCATION_LEVEL_LABELS == levels
+    assert education_level_from_label("本科") == 3
+    assert education_level_from_label("高中及以下") == 1
+    assert education_level_from_label("初中及以下") is None
 
 
 def test_my_overview_is_registered_and_requires_authentication() -> None:
@@ -337,6 +346,94 @@ async def test_target_rows_uses_the_realname_visibility_predicate(
 
 
 @pytest.mark.asyncio
+async def test_target_rows_forwards_the_serving_matchmaker_waiver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class EmptyRows:
+        def mappings(self) -> "EmptyRows":
+            return self
+
+        def all(self) -> list[dict[str, object]]:
+            return []
+
+    class RecordingDb:
+        def __init__(self) -> None:
+            self.statement: object | None = None
+            self.params: dict[str, object] | None = None
+
+        async def execute(self, statement: object, params: dict[str, object]) -> EmptyRows:
+            self.statement = statement
+            self.params = params
+            return EmptyRows()
+
+    async def viewer_context(_: object, __: int) -> dict[str, object]:
+        return {"realname_status": 2}
+
+    async def is_vip(_: object, __: int) -> bool:
+        return False
+
+    monkeypatch.setattr(discovery, "_viewer_context", viewer_context)
+    monkeypatch.setattr(discovery, "_is_vip", is_vip)
+    db = RecordingDb()
+
+    assert await discovery._target_rows(
+        db, 7, [2], completion_waiver=CompletionWaiver(matchmaker_id=7)
+    ) == {}
+
+    assert db.params is not None
+    assert db.params["visibility_waiver_matchmaker_id"] == 7
+    assert "resource_assignment waiver_ra" in str(db.statement)
+
+
+@pytest.mark.asyncio
+async def test_serving_matchmaker_waiver_scope_follows_workspace_level() -> None:
+    """豁免范围只跟服务红娘身份和工作台级别走，普通会员拿不到豁免。"""
+
+    class Result:
+        def __init__(self, row: dict[str, object] | None) -> None:
+            self._row = row
+
+        def mappings(self) -> "Result":
+            return self
+
+        def first(self) -> dict[str, object] | None:
+            return self._row
+
+    class Session:
+        def __init__(self, row: dict[str, object] | None) -> None:
+            self.row = row
+            self.statement = ""
+
+        async def execute(self, statement: object, _params: object = None) -> Result:
+            self.statement = str(statement)
+            return Result(self.row)
+
+    assert await discovery._serving_matchmaker_waiver(Session(None), 5) is None
+
+    normal_db = Session({"level": "NORMAL", "organization_id": 1})
+    normal = await discovery._serving_matchmaker_waiver(normal_db, 5)
+    assert normal is not None
+    assert normal.matchmaker_id == 5
+    assert normal.organization_id is None
+    assert "service_matchmaker" in normal_db.statement
+
+    senior = await discovery._serving_matchmaker_waiver(
+        Session({"level": "SUPER", "organization_id": 1}), 5
+    )
+    assert senior is not None
+    assert senior.organization_id == 1
+
+
+def test_completion_waiver_is_limited_to_the_profile_view() -> None:
+    """豁免只作用于代管人查看主页，推荐池与其他场景仍按完整度收口。"""
+    assert "completion_waiver" not in inspect.getsource(discovery._scene_visibility)
+    assert "completion_waiver" not in inspect.getsource(discovery._candidate_snapshot)
+    view_source = inspect.getsource(discovery.view_profile)
+    assert "completion_waiver=waiver" in view_source
+    assert "role_code = 'service_matchmaker'" not in view_source
+
+
+@pytest.mark.asyncio
 async def test_application_list_keeps_ids_alongside_nested_users(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -481,8 +578,9 @@ async def test_application_lists_filter_the_counterpart_through_visibility(
     assert seen == [
         ("VisibilityScene.INTERACTION", candidate_alias, privacy_alias, completion_alias)
     ]
+    # 只认列表查询（别名 a）：超时清扫也读 match_apply，但不该带可见性策略。
     application_queries = [
-        statement for statement in db.statements if "FROM match_apply" in statement
+        statement for statement in db.statements if "FROM match_apply a" in statement
     ]
     expected_policy = (
         f"COALESCE({privacy_alias}.who_can_see_me, 1) IN (1, 2, 3)"
@@ -598,7 +696,14 @@ async def test_respond_application_rechecks_the_applicant_visibility(
             }
 
     class EmptyRows:
-        pass
+        def mappings(self) -> "EmptyRows":
+            return self
+
+        def all(self) -> list[dict[str, object]]:
+            return []
+
+        def scalar(self) -> None:
+            return None
 
     class RecordingDb:
         statements: list[str]

@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     community_city_cooldown_days: int = Field(default=7, ge=0)
     # 红娘服务只能通过现金订单获得，不为新用户自动发放免费次数。
     matchmaker_service_default_quota: int = 0
+    # 会员自己填完基础信息（性别/生日/现居/家乡/婚姻/学历/职业/收入/身高/体重）就自动分派进
+    # member_auto_assign_organization_id 那家门店并进入资料待审；门店 id 不配置时不自动分派，
+    # 自然注册的会员只能等在后台手工分派。
+    member_auto_assign_organization_id: int | None = Field(default=None, ge=1)
     superlike_daily_free_limit: int = 1
     superlike_daily_vip_limit: int = 3
     paper_plane_daily_limit: int = 3

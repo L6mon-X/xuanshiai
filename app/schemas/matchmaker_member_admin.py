@@ -40,7 +40,7 @@ class MatchmakerMemberUpdate(BaseModel):
     avatar: str | None = Field(default=None, max_length=255)
     income: float | None = Field(default=None, ge=0, le=1_000_000)
     height: int | None = Field(default=None, ge=80, le=250)
-    weight: int | None = Field(default=None, ge=40, le=120)
+    weight: int | None = Field(default=None, ge=30, le=150)
     constellation: str | None = Field(default=None, max_length=16)
     zodiac: str | None = Field(default=None, max_length=16)
     household: str | None = Field(default=None, max_length=128)

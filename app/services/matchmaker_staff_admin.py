@@ -356,6 +356,20 @@ async def update_staff(
                 text(f"UPDATE matchmaker_profile SET {target}=:value WHERE user_id=:id"),
                 {"value": value, "id": matchmaker_id},
             )
+    homepage_map = {"description": "intro", "slogan": "slogan"}
+    homepage_values = {
+        column: values[source] for source, column in homepage_map.items() if source in values
+    }
+    if homepage_values:
+        # 公开主页与红娘本人编辑都读入驻申请表，后台改介绍/签名必须同步落到这里。
+        assignments = ", ".join(f"{column} = :{column}" for column in homepage_values)
+        await db.execute(
+            text(
+                f"UPDATE user_matchmaker_apply SET {assignments} "
+                "WHERE user_id = :id AND application_type = 'service_matchmaker'"
+            ),
+            {**homepage_values, "id": matchmaker_id},
+        )
     if "password" in values:
         await db.execute(
             text(

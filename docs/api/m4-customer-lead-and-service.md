@@ -1,7 +1,7 @@
 # 客源线索 & 会员服务 接口契约（M4）
 
-> 覆盖 5 个后端模块（共 **38 端点**）：
-> 1. **客源线索**：`app/api/routes/customer_leads_admin.py`（16 端点）
+> 覆盖 5 个后端模块（共 **39 端点**）：
+> 1. **客源线索**：`app/api/routes/customer_leads_admin.py`（17 端点）
 > 2. **会员服务·约见/约会**：`app/api/routes/meeting.py` 内 `admin_router`（13 端点）
 > 3. **会员服务·红娘牵线**：`app/api/routes/matchmaker_crm_admin.py` 内 `match_records`（2 端点）
 > 4. **会员服务·服务申请**：`app/api/routes/matchmaker.py` 内 `admin_router` 内 `service-requests`（2 端点）
@@ -68,7 +68,7 @@
 
 ---
 
-## 二、客源线索（16 端点）
+## 二、客源线索（17 端点）
 
 ### 2.1 列表 `GET /api/v1/admin/customer-leads`
 
@@ -84,15 +84,17 @@
 | `search` | string \| null | — | ≤64 | 关键字（姓名/手机/微信，LIKE） |
 
 **返回** `CustomerLeadPage {items,page,page_size,total,has_more}`，item 字段：
-`id` `name` `phone` `wechat` `source` `intention_level(1低/2中/3高)` `status` `audit_status(active有效/pending待核)` `matchmaker_id` `organization_id` `promoter_id（推广红娘）` `tags: string[]（标签名数组）` `next_follow_at` `converted_user_id` `remark` `created_by` `created_at` `updated_at`。
+`id` `name` `real_name（真实姓名，仅后台可见）` `phone` `wechat` `source` `photo（头像图片 URL，可空）` `gender(1男/2女，可空)` `birthday（出生日期，可空）` `intention_level(1低/2中/3高)` `status` `audit_status(active有效/pending待核)` `matchmaker_id` `organization_id` `promoter_id（推广红娘）` `tags: string[]（标签名数组）` `next_follow_at` `converted_user_id` `remark` `created_by` `created_at` `updated_at`。
 
 ### 2.2 录入 `POST /api/v1/admin/customer-leads`
 
-**body** `CustomerLeadCreate`：必填 `name(1-128)` + `source(1-64)`，`phone`/`wechat` **至少提供一个**；可选 `intention_level(1/2/3,默认1)` `remark(≤2000)` `promoter_id` `audit_status(默认 active)` `tags(string[] 或逗号分隔字符串)`。
+**body** `CustomerLeadCreate`：必填 `name(1-128)` + `source(1-64)` + **`phone`（11 位大陆手机号，正则 `^1[3-9]\d{9}$`）**；可选 `wechat(≤128)` `intention_level(1/2/3,默认1)` `remark(≤2000)` `promoter_id` `audit_status(默认 active)` `tags(string[] 或逗号分隔字符串)`。
+
+**业务口径**：线索必须能联系到人，而微信号只是文本备注（微信号没有任何路径能通向账号，`openid` 才是微信身份），因此只有手机号能一键入库成会员 → 手机号必填。
 
 **返回**：201 `CustomerLead`。
 
-**非法示例**：`{"name":"张三","source":"抖音"}` → 422 `"phone 或 wechat 至少提供一个"`。
+**非法示例**：`{"name":"张三","source":"抖音"}` → 422 `"必须登记 11 位手机号"`；`{"name":"张三","source":"抖音","phone":"139****0101"}` → 422 `String should match pattern '^1[3-9]\d{9}$'`。
 
 ### 2.3 统计 `GET /api/v1/admin/customer-leads/statistics`
 
@@ -116,7 +118,7 @@
 
 **body** `CustomerLeadUpdate`：全可选（`name/phone/wechat/intention_level/status/remark/next_follow_at/promoter_id/audit_status`），至少一项；**不支持**改 tags（走录入或后续标签端点）。
 
-**业务规则**：目标状态为有效线索时，联系方式不得与其它有效线索重复（`uk_customer_lead_active_phone/active_wechat`）；置为 `LOST/CLOSED` 后生成列自动置空。
+**业务规则**：目标状态为有效线索时，联系方式不得与其它有效线索重复（`uk_customer_lead_active_phone/active_wechat`）；置为 `LOST/CLOSED` 后生成列自动置空。`phone` 要么不传，要么必须是有效的 11 位手机号：传 `null`/空串 → 422 `"手机号不能清空，只能改成有效的 11 位手机号"`。**旧值豁免**：后台表单预填的是脱敏展示值（如 `139****0101`），带 `*` 的 `phone` 在请求模型阶段整键丢弃，等同「没有改手机号」，历史掩码数据因此仍可正常编辑其它字段，真实号码也不会被掩码串覆盖。
 
 ### 2.8 跟进记录 `GET /admin/customer-leads/{lead_id}/follow-ups`
 
@@ -129,7 +131,9 @@
 **返回**：`CustomerLeadBatchImportResult {created, skipped, failed, errors[]}`。
 
 **业务规则**：
-- `phone` 与 `wechat` 都为空 → 该行 `failed`
+- `phone` 缺失 → 该行 `failed`，`errors` 回传 `第 {Excel 行号} 行：缺少手机号`
+- `phone` 不是有效的 11 位手机号（含掩码串、带分隔符等）→ 该行 `failed`，`errors` 回传 `第 {Excel 行号} 行：手机号「原值」不是有效的 11 位号码`
+- `wechat` 只是备注，不能替代手机号；校验只拦截当前行，不阻断整批
 - `dup_mode=skip`：联系方式命中的有效线索（`status NOT IN ('LOST','CLOSED')`）→ `skipped`
 - 单行异常不阻断整批，`errors` 最多回传 50 条
 - 行号从 **2** 开始（Excel 首行为表头）
@@ -158,17 +162,18 @@
 
 **body** `{reason: string(1-500)}`。
 
-**业务规则**：不在弃海池 → 409；恢复前校验联系方式未被其它有效线索占用（否则 409）；恢复后 `status='NEW'`。
+**业务规则**：不在弃海池 → 409；恢复前校验联系方式未被其它有效线索占用（占用判定排除本条线索自身，否则每次恢复必然 409），比对使用库里的原始微信号而非脱敏展示值；否则 409；恢复后 `status='NEW'`。编辑（PATCH）走同一套校验。
 
 ### 2.14 下拉字典 `GET /admin/customer-leads/options` ✅ M4 收尾新增
 
-无参数。返回 `CustomerLeadOptions {sources[], matchmakers[], promoters[], tags[]}`，每项 `{value,label}`：
+无参数。返回 `CustomerLeadOptions {sources[], matchmakers[], promoters[], stores[], tags[]}`，每项 `{value,label}`：
 
 | 字典 | 数据源 |
 |---|---|
 | `sources` | `customer_lead.source` DISTINCT |
 | `matchmakers` | `user_matchmaker_apply(application_type='service_matchmaker', status=1)` JOIN `user_role(role_code='service_matchmaker', status=1)` |
 | `promoters` | `user_matchmaker_apply(application_type='promoter', status=1)` |
+| `stores` | `organization(org_type='store', status=1)`，label 取 `display_name`，空则回落 `name`（2026-10-19 新增，入库弹窗选门店用） |
 | `tags` | `customer_lead_tag(enabled=1)` 按 `sort,id` |
 
 ### 2.15 下载导入模板 `GET /admin/customer-leads/import-template` ✅ M4 收尾新增
@@ -203,13 +208,56 @@
 | 400 | 存在姓名空行 | 存在姓名为空的数据行，请补齐后再导入 |
 | 400 | 无有效数据行 | 文件中没有可导入的数据行 |
 
-**解析规则**：表头按关键字包含匹配（`姓名/昵称/name`、`手机/电话/phone`、`微信/wechat`、`来源/source`、`意向/intention`、`备注/remark`），列顺序可变；意向程度接受 `低/中/高` 与 `1/2/3`，无法识别按 `1`（低）；整行空白跳过。
+**解析规则**：表头按关键字包含匹配（`姓名/昵称/name`、`手机/电话/phone`、`微信/wechat`、`来源/source`、`意向/intention`、`备注/remark`），列顺序可变；意向程度接受 `低/中/高` 与 `1/2/3`，无法识别按 `1`（低）；整行空白跳过。解析阶段不校验联系方式，手机号必填与 11 位格式校验在写入阶段（`_insert_leads`，与 2.9 同一套）逐行执行，不合规行按 `failed` 回传行号。
 
-### 2.17 后端代码位置
+### 2.17 一键入库 `POST /admin/customer-leads/{lead_id}/convert` ✅ 2026-10-19 新增
 
-- 路由：`app/api/routes/customer_leads_admin.py`（16 端点；`/import-template`、`/options`、`/import` 均声明在 `/{lead_id}` **之前**）
+后台「一键入库」按钮此前调的是这个路径，但路由只存在于红娘工作台（`/matchmaker/workbench/leads/{id}/convert`），所以后台点了必然 404。现补后台侧路由，权限点 `customer_lead.manage`。
+
+**body**（`CustomerLeadConvertRequest`，可全部省略）：
+
+| 字段 | 类型 | 必填 | 校验 | 含义 |
+|---|---|---|---|---|
+| `matchmaker_id` | int \| null | — | ≥1 | 会员归属红娘；省略时沿用 `customer_lead.matchmaker_id` |
+| `organization_id` | int \| null | — | ≥1 | 会员归属门店；省略时沿用 `customer_lead.organization_id` |
+| `gender` | `1\|2` \| null | — | — | 新账号性别；省略时沿用线索性别 |
+
+**返回** `CustomerLeadConvertResult {lead, user_id, review_status}`，`review_status` 恒为 `PENDING`（`lead` 按敏感等级脱敏）。
+
+**写入 4 张表**（同一嵌套事务，成功才 commit）：
+
+| 表 | 内容 |
+|---|---|
+| `users` | `openid='lead-convert-{lead_id}'`、`phone=线索手机号`（`phone_verified_at` 置为当前 UTC，验证码即可登录）、`nickname=称呼`、`gender`、`status=1`、`data_complete_rate=0`、`register_ip='127.0.0.1'` |
+| `matchmaker_member_review` | `(user_id, 'PENDING', reviewed_by=NULL)`，公开资料待审 |
+| `resource_assignment` | `(user_id, organization_id, matchmaker_id, source='lead_convert', status=1, assigned_by=后台账号ID)` |
+| `customer_lead` | `status='CONVERTED'`、`converted_user_id=新账号ID`，并把本次选择的归属写回 `matchmaker_id/organization_id` |
+
+外加一条 `business_audit_log`（`action='customer_lead.convert'`，`reason='一键入库生成会员 {user_id}'`）。
+
+**错误**：
+
+| HTTP | 触发 | detail |
+|---|---|---|
+| 404 | 线索不存在 | 客源线索不存在 |
+| 409 | 已入库（`converted_user_id` 或 `status='CONVERTED'`） | 该客源已入库，请到会员CRM查看，不能重复入库 |
+| 409 | `CLOSED` / `LOST` | 当前状态的客源不能入库 |
+| 409 | 无手机号（历史脏数据） | 线索未登记手机号，无法生成账号，请先补充电话 |
+| 422 | 手机号不是有效 11 位大陆号码（微信-only、占位号、位数不对，2026-10-19 新增） | 手机号「{phone}」不是有效的 11 位号码，请先修正线索电话后再入库 |
+| 422 | 请求与线索都没有归属 | 请先选择归属红娘或门店 |
+| 422 | 红娘不是有效服务红娘 | 只能分配给有效服务红娘 |
+| 422 | 门店不存在/已停用 | 门店不存在或已停用 |
+| 409 | 手机号已被会员占用（`users.phone` 唯一） | 手机号 {phone} 已是会员（ID {id}），请到会员CRM维护，不要重复入库 |
+| 409 | 撞库检查后仍被并发请求抢先写入（连点两次入库） | 该线索或手机号已被其他入库请求占用，请刷新列表后确认会员是否已生成 |
+
+**与工作台入库的差异**：工作台的归属取红娘自己的 workspace 上下文，后台必须由操作人显式选择；工作台对已入库线索会「重提交待审」，后台一律 409，避免把已通过的会员审核悄悄退回待审。
+
+### 2.18 后端代码位置
+
+- 路由：`app/api/routes/customer_leads_admin.py`（17 端点；`/import-template`、`/options`、`/import` 均声明在 `/{lead_id}` **之前**）
 - Schema：`app/schemas/customer_lead_admin.py`
-- Service：`app/services/customer_lead_admin.py`（`list_leads`/`create_lead`/`update_lead`/`get_lead`/`assign_lead`/`add_follow_up`/`list_follow_ups`/`lead_statistics`/`abandon_lead`/`restore_lead`/`list_abandonments`/`batch_import_leads`/`_insert_leads`/`import_leads_file`/`build_import_template`/`parse_import_file`/`lead_options`/`_sync_tags`）
+- Service：`app/services/customer_lead_admin.py`（`list_leads`/`create_lead`/`update_lead`/`get_lead`/`assign_lead`/`convert_lead`/`add_follow_up`/`list_follow_ups`/`lead_statistics`/`abandon_lead`/`restore_lead`/`list_abandonments`/`batch_import_leads`/`_insert_leads`/`import_leads_file`/`build_import_template`/`parse_import_file`/`lead_options`/`_sync_tags`）
+- 回归：`tests/test_customer_lead_admin_convert.py`（StubDB 按 SQL 文本分派，覆盖归属校验、手机号撞库、状态门禁与四表写入内容）
 
 ---
 
@@ -513,7 +561,7 @@
 
 | 页面 | 路由 | 调用的端点 |
 |---|---|---|
-| 线索管理 | `/love-customer-list` | 2.1/2.2/2.6/2.7/2.8/2.10/2.11/2.12/2.13 |
+| 线索管理 | `/love-customer-list` | 2.1/2.2/2.6/2.7/2.8/2.10/2.11/2.12/2.13/2.14/2.17 |
 | 数据报表 | `/love-customer-statistics` | 2.1/2.3 |
 | 跟进全览 | `/customer-follow-up` | 跟进全览（见 M3 文档） |
 | 客源批量导入 | `/love-customer-batch-import` | 2.14/2.15/2.16 |
@@ -533,3 +581,8 @@
 | 2026-09-11 | v1 | 新建：客源线索 13 + 约见/约会 7 + 红娘牵线 1 + 服务申请 2 = 共 23 端点 | M4 后端首版契约 |
 | 2026-09-12 | v1.1 | 约见/约会新增 3 端点（GET /options / DELETE /requests/{id} / DELETE /{id}） | 补齐管理后台 CRUD 能力 |
 | 2026-09-12 | **v1.2** | **M4 收尾**：客服线索 +3（options / import-template / import）、约见约会 +2（statistics / POST 直接建约会）、新增推广管理 5 端点；`customer_lead` 补 `promoter_id`/`audit_status`，`meeting_record` 补 `member_visible`/`sms_remind`，新表 `promotion_order`；约见申请加 `status_group`、约会列表加 `search`/`organizer_id`/`met`/日期范围；修正 `/meetings/options` 被 `/{meeting_id}` 吞掉的路由顺序 bug | 全量 **28 → 38 端点**；M4 前端 12 页全部接线 |
+| 2026-10-19 | **v1.3** | 修正「恢复客源」必然 409：`find_conflicting_lead_id` 的「排除自身」被拼进联系方式 OR 组（现为 `AND (... OR ...)`），恢复比对的微信号改用库中原始值而非脱敏展示值 | 弃海恢复 / 编辑线索不再误报「该联系方式已存在有效客源线索」；回归见 `tests/test_customer_lead_contact_guard.py` |
+| 2026-10-19 | **v1.4** | **录入线索手机号必填 + 11 位格式校验**（`CustomerLeadCreate`/`CustomerLeadUpdate`、红娘工作台 `WorkspaceLeadCreate/Update`、推广 `PromoterLeadCreate`、批量导入与文件导入逐行校验）；PATCH 的脱敏手机号回显按旧值豁免整键丢弃，禁止清空手机号 | 422 文案：`必须登记 11 位手机号` / `手机号不能清空，只能改成有效的 11 位手机号`；微信不再能替代手机号；回归见 `tests/test_customer_lead_import_phone.py`、`tests/test_matchmaker_workspace_contracts.py`、`tests/test_wechat_field_redaction.py` |
+| 2026-10-19 | **v1.5** | **新增后台一键入库 `POST /admin/customer-leads/{lead_id}/convert`**（2.17）：归属红娘/门店由操作人选择，可省略则沿用线索已有分派；`/options` 字典补 `stores` | 后台客源列表此前调该路径必然 404，现已接通；手机号撞 `users.phone` 唯一键改为 409 可读提示；归属同时写回 `customer_lead`；全量 **38 → 39 端点**；回归见 `tests/test_customer_lead_admin_convert.py` |
+| 2026-10-19 | **v1.6** | **一键入库前校验线索手机号格式**（2.17）：`lead.phone` 不匹配 `^1[3-9]\d{9}$` 时返回 422，不再创建账号 | 拦截批量导入之前落库的微信-only/占位/位数不对的历史线索，避免生成验证码登不进来的会员号；空手机号仍走原 409；回归见 `tests/test_customer_lead_admin_convert.py` |
+| 2026-10-19 | **v1.7** | **修复客源后台整模块 500**：`LEAD_SELECT` 从未 `SELECT photo, gender, birthday`，而响应模型 `CustomerLead` 这三列是必填（无默认值），Pydantic 直接抛 `Field required` | 列表 `GET /admin/customer-leads`、详情、编辑、分配、一键入库全部 500（红娘工作台 `_LEAD_SELECT` 一直有这三列，所以只有后台侧坏）；SELECT 补齐后恢复 200，字段文档 2.1 同步；回归见 `tests/test_customer_lead_admin_convert.py::test_lead_select_provides_every_required_customer_lead_field` |

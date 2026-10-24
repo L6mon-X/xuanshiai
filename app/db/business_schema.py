@@ -100,6 +100,7 @@ BUSINESS_TABLES = {
         CREATE TABLE IF NOT EXISTS `customer_lead` (
             `id` bigint unsigned NOT NULL AUTO_INCREMENT,
             `name` varchar(128) NOT NULL,
+            `real_name` varchar(64) DEFAULT NULL COMMENT '客源真实姓名（选填）',
             `phone` varchar(32) DEFAULT NULL,
             `wechat` varchar(128) DEFAULT NULL,
             `source` varchar(64) NOT NULL,

@@ -127,9 +127,11 @@ class ProfileUpdateRequest(BaseModel):
 
     gender: Literal[1, 2] | None = None
     birthday: date | None = None
-    is_married: Literal[1, 2, 3, 4, 5, 6, 7] | None = None
+    # 写入域只有 1/2/3，与会员端「我的-资料编辑」的婚况选项同一套；库里 4~7 是旧的离异细分档，
+    # 只读展示继续按原文案渲染，但不再允许新写入。
+    is_married: Literal[1, 2, 3] | None = None
     height: int | None = Field(default=None, ge=140, le=220)
-    weight: int | None = Field(default=None, ge=40, le=120)
+    weight: int | None = Field(default=None, ge=30, le=150)
     occupation: str | None = Field(default=None, max_length=128)
     industry: str | None = Field(default=None, max_length=128)
     education_level: int | None = Field(default=None, ge=1, le=8)

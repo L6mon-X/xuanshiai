@@ -125,6 +125,25 @@ def get_logger(name):
 logger = get_logger(__name__)
 
 
+def _column_collation(column: object) -> str:
+    """读取 SHOW FULL COLUMNS 行里的 Collation。
+
+    初始化脚本使用 DictCursor，行是 dict；但 pymysql 的 DictCursor 会**丢弃
+    重复列名**，而 SHOW FULL COLUMNS 同时含 `Field` 和 `Type`（恰好都是 'Type'
+    时会冲突），因此按名字取可能取不到。这里同时兼容 dict 与 tuple 两种游标。
+    """
+    if isinstance(column, dict):
+        for key in ("Collation", "collation"):
+            if key in column:
+                value = column[key]
+                return "" if value is None else str(value)
+        return ""
+    if isinstance(column, (list, tuple)) and len(column) > 2:
+        value = column[2]
+        return "" if value is None else str(value)
+    return ""
+
+
 class DatabaseManager:
     def __init__(self):
         self._ensure_database_exists()
@@ -3375,7 +3394,7 @@ class DatabaseManager:
                 "varchar(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL "
                 "COMMENT '客户端消息幂等键' AFTER `media_url`"
             )
-        elif column["Collation"] != "utf8mb4_bin":
+        elif _column_collation(column) != "utf8mb4_bin":
             cursor.execute(
                 "ALTER TABLE `chat_message` MODIFY COLUMN `client_message_id` "
                 "varchar(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL "

@@ -16,6 +16,8 @@ from app.schemas.auth import (
     ProfileUpdateRequest,
 )
 from app.schemas.matchmaker_workspace import (
+    MatchmakerHomepage,
+    MatchmakerHomepageUpdate,
     MatchmakerWorkspaceAccess,
     MatchmakerWorkspaceDashboard,
     MatchmakerWorkspaceProfile,
@@ -82,6 +84,7 @@ from app.services.matchmaker_workspace import (
     get_promoter_center,
     get_workspace_member_note,
     get_workspace_profile,
+    get_workspace_homepage,
     list_match_candidates,
     list_match_history,
     list_member_matchmakers,
@@ -108,6 +111,7 @@ from app.services.matchmaker_workspace import (
     update_partner_team,
     update_workspace_lead,
     update_workspace_member_note,
+    update_workspace_homepage,
     update_workspace_profile,
     upload_lead_photo,
     workspace_access,
@@ -158,6 +162,22 @@ async def update_workbench_profile(
     db: AsyncSession = Depends(get_db),
 ) -> MatchmakerWorkspaceProfile:
     return await update_workspace_profile(db, await require_workspace(db, current), body)
+
+
+@router.get("/workbench/homepage", response_model=MatchmakerHomepage, summary="查询红娘可编辑的主页资料")
+async def workbench_homepage(
+    current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+) -> MatchmakerHomepage:
+    return await get_workspace_homepage(db, await require_workspace(db, current))
+
+
+@router.patch("/workbench/homepage", response_model=MatchmakerHomepage, summary="保存红娘主页资料")
+async def update_workbench_homepage(
+    body: MatchmakerHomepageUpdate,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> MatchmakerHomepage:
+    return await update_workspace_homepage(db, await require_workspace(db, current), body)
 
 
 @router.get("/workbench/leads", response_model=WorkspaceLeadPage, summary="查询工作范围内客源线索")

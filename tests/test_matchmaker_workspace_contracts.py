@@ -38,24 +38,36 @@ def test_workspace_routes_are_registered_and_require_normal_user_authentication(
 def test_workspace_schemas_enforce_non_payment_and_review_boundaries() -> None:
     assert MatchmakerWorkspaceProfileUpdate(display_name="林老师").display_name == "林老师"
     assert WorkspaceLeadCreate(name="王女士", phone="13800000000", source="线下活动").intention_level == 1
-    assert PromoterLeadCreate(name="李先生", wechat="wxid_123", source="朋友介绍").name == "李先生"
+    assert PromoterLeadCreate(name="李先生", phone="13800000000", wechat="wxid_123", source="朋友介绍").name == "李先生"
     assert WorkspaceMemberReviewUpdate(status="PASSED").reason is None
     with pytest.raises(ValidationError):
         WorkspaceLeadCreate(name="王女士", source="线下活动")
     with pytest.raises(ValidationError):
+        PromoterLeadCreate(name="李先生", wechat="wxid_123", source="朋友介绍")
+    with pytest.raises(ValidationError):
         WorkspaceMemberReviewUpdate(status="REJECTED")
 
 
-def test_lead_contact_schemas_normalize_and_still_require_a_contact() -> None:
-    """联系方式唯一性口径：首尾空白归一化，空串视为未提供。"""
+def test_lead_contact_schemas_normalize_and_require_a_valid_phone() -> None:
+    """录入线索口径：手机号必填且必须是 11 位有效号码；首尾空白归一化，空串视为未提供。"""
     assert WorkspaceLeadCreate(name="王女士", phone=" 13800000000 ", wechat="", source="线下活动").phone == "13800000000"
-    assert WorkspaceLeadCreate(name="王女士", phone="", wechat=" wx_a ", source="线下活动").phone is None
     assert WorkspaceLeadUpdate(phone=" 13800000000 ").phone == "13800000000"
-    assert PromoterLeadCreate(name="李先生", wechat=" wxid_123 ", source="朋友介绍").wechat == "wxid_123"
+    assert PromoterLeadCreate(name="李先生", phone="13800000000", wechat=" wxid_123 ", source="朋友介绍").wechat == "wxid_123"
     assert CustomerLeadCreate(name="王女士", phone=" 13800000000 ", source="线下活动").phone == "13800000000"
     assert CustomerLeadUpdate(name="王女士", wechat="  ").wechat is None
+    # 后台表单预填的脱敏手机号（139****0101）视同「未修改」，整键丢弃而不是 422。
+    assert CustomerLeadUpdate(name="王女士", phone="139****0101").model_dump(exclude_unset=True) == {"name": "王女士"}
+    with pytest.raises(ValidationError):
+        WorkspaceLeadCreate(name="王女士", phone="", wechat=" wx_a ", source="线下活动")
+    with pytest.raises(ValidationError):
+        WorkspaceLeadCreate(name="王女士", phone=" 138-0000-0000 ", source="线下活动")
     with pytest.raises(ValidationError):
         WorkspaceLeadCreate(name="王女士", phone="   ", wechat=None, source="线下活动")
+    with pytest.raises(ValidationError):
+        # 手机号只能改成有效号码，不能清空。
+        WorkspaceLeadUpdate(phone="")
+    with pytest.raises(ValidationError):
+        CustomerLeadUpdate(phone=None)
     with pytest.raises(ValidationError):
         # 仅提交空白联系方式等价于没有任何修改项。
         CustomerLeadUpdate(wechat="  ")

@@ -47,13 +47,14 @@ async def find_conflicting_lead_id(
     if not conditions:
         return None
     if exclude_lead_id is not None:
-        conditions.append("id != :conflict_exclude_id")
         params["conflict_exclude_id"] = exclude_lead_id
     exclusion = ", ".join(f"'{status}'" for status in LEAD_INACTIVE_STATUSES)
-    query = (
-        f"SELECT id FROM customer_lead WHERE status NOT IN ({exclusion}) "
-        f"AND ({' OR '.join(conditions)}) ORDER BY id LIMIT 1"
-    )
+    # 联系方式条件之间是 OR，但「排除自己」必须和它们 AND：
+    # 拼进 OR 里会让任意 id≠自身的行都命中，恢复/编辑必然误报 409。
+    clauses = [f"status NOT IN ({exclusion})", f"({' OR '.join(conditions)})"]
+    if exclude_lead_id is not None:
+        clauses.append("id != :conflict_exclude_id")
+    query = f"SELECT id FROM customer_lead WHERE {' AND '.join(clauses)} ORDER BY id LIMIT 1"
     return await db.scalar(text(query), params)
 
 
