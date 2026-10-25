@@ -402,7 +402,14 @@ async def update_profile(
         result = await db.execute(text("SELECT gender FROM users WHERE id = :id FOR UPDATE"), {"id": user_id})
         old_gender = result.scalar()
         if old_gender is not None and old_gender != values["gender"]:
-            raise HTTPException(409, detail="性别提交后不可自行修改")
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "GENDER_IMMUTABLE",
+                    "message": "性别提交后不可自行修改",
+                    "retryable": False,
+                },
+            )
 
     user_fields = {key: values.pop(key) for key in ("gender", "birthday", "is_married") if key in values}
     if user_fields:
