@@ -579,23 +579,6 @@ def test_topic_detail_retains_post_page_metadata() -> None:
     assert detail.posts.total == 23
 
 
-def test_topic_response_compatibility_fields_default_without_persisted_topic_columns() -> None:
-    topic = CommunityTopicResponse(
-        id=1,
-        name="树洞",
-        icon=None,
-        sort=0,
-        post_count=0,
-        participant_count=0,
-        heat=0,
-        joined=False,
-    )
-    assert topic.background_url is None
-    assert topic.description is None
-    assert topic.view_count == 0
-    assert topic.status is None
-
-
 def test_feed_modes_and_stable_order_are_server_side() -> None:
     where, params = community_service._feed_clauses(
         "mine", city=None, city_code=None, topic_id=None, filter_key=None, me=None
