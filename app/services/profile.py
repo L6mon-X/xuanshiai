@@ -467,7 +467,14 @@ async def update_profile(
         result = await db.execute(text("SELECT gender FROM users WHERE id = :id FOR UPDATE"), {"id": user_id})
         old_gender = result.scalar()
         if old_gender is not None and old_gender != values["gender"]:
-            raise HTTPException(409, detail="性别提交后不可自行修改")
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "GENDER_IMMUTABLE",
+                    "message": "性别提交后不可自行修改",
+                    "retryable": False,
+                },
+            )
 
     user_fields = {key: values.pop(key) for key in ("gender", "birthday", "is_married") if key in values}
     if user_fields:
@@ -716,8 +723,10 @@ async def get_profile_overview(db: AsyncSession, user_id: int) -> ProfileOvervie
         (SELECT COUNT(DISTINCT bh.user_id) FROM user_browse_history bh WHERE bh.target_user_id = u.id) AS visitor_count,
         (SELECT COUNT(*) FROM user_favorite f WHERE f.user_id = u.id AND f.type = 2) AS favorite_count,
         (SELECT COUNT(*) FROM user_favorite f WHERE f.target_user_id = u.id AND f.type = 2) AS favorite_received_count,
-        (SELECT COUNT(*) FROM user_boost b WHERE b.user_id = u.id) AS superlike_sent_count,
-        (SELECT COUNT(*) FROM user_boost b WHERE b.target_user_id = u.id) AS superlike_received_count
+        -- user_boost 复用承载「置顶助推」（user_id = target_user_id = 自己），
+        -- 爆灯统计必须排除自指记录，否则自己买的置顶会被算成一次爆灯。
+        (SELECT COUNT(*) FROM user_boost b WHERE b.user_id = u.id AND b.user_id <> b.target_user_id) AS superlike_sent_count,
+        (SELECT COUNT(*) FROM user_boost b WHERE b.target_user_id = u.id AND b.user_id <> b.target_user_id) AS superlike_received_count
         FROM users u LEFT JOIN user_auth ua ON ua.user_id = u.id WHERE u.id = :user_id"""), {"user_id": user_id})
     row = result.mappings().first()
     if not row:

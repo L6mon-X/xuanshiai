@@ -332,6 +332,39 @@ class CreditGrantResult(BaseModel):
     target_user_ids: list[int] = Field(default_factory=list, description="实际命中的 user_id 列表")
 
 
+class CreditDeductRequest(BaseModel):
+    """后台「积分明细-扣减积分」弹窗入参（与发放积分对称，写 account_ledger DEBIT）。
+
+    口径：与「发放积分」`credit-grants` 同一账本（`account_ledger` account_type='user'），
+    保证积分明细页发放/扣减同页可见；不直改 C 端 `user_points`（遵设计文档「积分不支持前端直接修改」）。
+    """
+
+    target_type: Literal["all", "member", "verified", "matchmaker_team"] = Field(
+        description="all=全部注册用户；member=指定会员；verified=已实名认证会员；matchmaker_team=红娘团队"
+    )
+    user_ids: list[int] | None = Field(default=None, description="target_type=member 时必填")
+    amount: int = Field(gt=0, le=1_000_000, description="每人扣减积分数，正整数")
+    reason: str = Field(min_length=1, max_length=20, description="扣减理由，不超过 20 字")
+
+    @model_validator(mode="after")
+    def validate_member_targets(self) -> "CreditDeductRequest":
+        if self.target_type == "member":
+            if not self.user_ids:
+                raise ValueError("指定会员扣减必须传入 user_ids")
+            if len(self.user_ids) > 5000:
+                raise ValueError("单次扣减最多 5000 名会员")
+        return self
+
+
+class CreditDeductResult(BaseModel):
+    """扣减积分结果汇总。"""
+
+    deducted_count: int = Field(description="实际扣减的账户数（去重后）")
+    total_amount: int = Field(description="总扣减积分数 = deducted_count * amount")
+    sample_ledger_ids: list[int] = Field(default_factory=list, description="前 10 条 ledger.id 样本")
+    target_user_ids: list[int] = Field(default_factory=list, description="实际命中的 user_id 列表")
+
+
 # ============================================
 # A12-钱包：后台余额调整（发放/扣减）+ 按用户余额/流水视图
 # 不新建表，复用 account_ledger（account_type='user'）；不接真实支付。

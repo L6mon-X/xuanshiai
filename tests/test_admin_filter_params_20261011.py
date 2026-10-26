@@ -621,13 +621,15 @@ def test_lead_route_exposes_new_filter_params() -> None:
                  "promoter_id", "xiangqin_status", "bind_mode", "wechat_added", "tags",
                  "age_min", "age_max", "height_min", "height_max", "marriage", "education",
                  "occupation", "residence", "hometown", "hide_followed_today",
-                 "hide_called_today", "has_phone", "has_wechat", "order"):
+                 "hide_called_today", "has_phone", "has_wechat", "order",
+                 # B11③（2026-10-24）：待分派 / 审核状态 / 入库情况三个死筛选下沉为真参数。
+                 "assigned", "audit_status", "stored"):
         assert name in names, name
 
 
 def test_other_routes_expose_new_params() -> None:
     assert {"service_status", "sort_by"} <= _query_params(vip_routes.list_offline_vips)
-    assert {"type", "qrcode_type", "xiangqin_status", "search_type"} <= _query_params(admin_content_routes.content_list)
+    assert {"type", "qrcode_type", "xiangqin_status", "search_type", "gender", "landing_id", "source"} <= _query_params(admin_content_routes.content_list)
     assert "search_type" in _query_params(merchant_routes.order_list)
     assert "search_type" in _query_params(merchant_routes.order_export)
     assert "search_type" in _query_params(video_routes.comment_list)
@@ -681,4 +683,70 @@ def test_member_options_route_is_registered_before_member_id() -> None:
     assert paths.index("/admin/matchmaker/members/options") < paths.index(
         "/admin/matchmaker/members/{member_id}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# 7. B11（2026-10-24）：客源缺失筛选 + free_form extra 筛选下沉为正式参数
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_lead_assigned_audit_stored_filters_bind_params() -> None:
+    """assigned=False→待分派(matchmaker_id IS NULL)；audit_status/stored 走绑定参数。"""
+    db = StubDB([
+        StubResult(rows=[("audit_status",)]),
+        StubResult(rows=[]),
+        StubResult(scalar=0),
+    ])
+    await leads.list_leads(
+        db, 1, 20, None, None, None, None,
+        assigned=False, audit_status="pending", stored=True,
+    )
+    clause = db.clauses()
+    assert "matchmaker_id IS NULL" in clause
+    assert "audit_status = :audit_status" in clause
+    assert "converted_user_id IS NOT NULL" in clause
+    # 取值只进绑定参数，不拼接入 SQL。
+    assert db.statements[1][1]["audit_status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_lead_assigned_true_filters_assigned_only() -> None:
+    db = StubDB([
+        StubResult(rows=[("audit_status",)]),
+        StubResult(rows=[]),
+        StubResult(scalar=0),
+    ])
+    await leads.list_leads(db, 1, 20, None, None, None, None, assigned=True, stored=False)
+    clause = db.clauses()
+    assert "matchmaker_id IS NOT NULL" in clause
+    assert "converted_user_id IS NULL" in clause
+
+
+@pytest.mark.asyncio
+async def test_free_form_gender_landing_source_use_json_extract() -> None:
+    db = StubDB([StubResult(scalar=0), StubResult(rows=[])])
+    await admin_content.list_items(
+        db, "free_form", 1, 20, None, None,
+        {"gender": "1", "landing_id": "88", "source": "抖音"},
+    )
+    clause = db.clauses()
+    assert "JSON_UNQUOTE(JSON_EXTRACT(extra_json, '$.gender')) = :extra_gender" in clause
+    assert "JSON_UNQUOTE(JSON_EXTRACT(extra_json, '$.landing_id')) = :extra_landing_id" in clause
+    assert "JSON_UNQUOTE(JSON_EXTRACT(extra_json, '$.source')) = :extra_source" in clause
+    assert db.statements[0][1]["extra_source"] == "抖音"
+    assert db.statements[0][1]["extra_landing_id"] == "88"
+
+
+@pytest.mark.asyncio
+async def test_free_form_extra_filters_ignored_on_other_domains() -> None:
+    """gender/landing_id/source 只对 free_form 域生效，其他域忽略（防跨域误筛）。"""
+    db = StubDB([StubResult(scalar=0), StubResult(rows=[])])
+    await admin_content.list_items(
+        db, "activity", 1, 20, None, None,
+        {"gender": "1", "landing_id": "88", "source": "抖音"},
+    )
+    sql = db.sql()
+    for token in ("extra_gender", "extra_landing_id", "extra_source"):
+        assert token not in sql
 

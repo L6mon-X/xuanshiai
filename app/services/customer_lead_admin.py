@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.sensitive_fields import REDACTION_LEVEL_STANDARD, is_masked_value, mask_contact
+from app.core.security import lead_convert_password_fields
 # 复用登录注册链路的默认角色发放实现，避免入库账号缺少默认 user_role。
 from app.services.auth import ensure_default_user_role
 
@@ -31,12 +32,26 @@ from app.services.customer_lead_contact import (
     ensure_contact_available, normalize_contact, raise_duplicate_contact,
 )
 
-LEAD_SELECT = """SELECT id, name, real_name, phone, wechat, source, photo, gender, birthday, intention_level, status, audit_status, matchmaker_id,
+LEAD_SELECT = """SELECT id, name, real_name, phone, wechat, source, photo, birthday, intention_level, status, audit_status, matchmaker_id,
     organization_id, promoter_id, next_follow_at, converted_user_id, remark, created_by, created_at, updated_at,
     (SELECT GROUP_CONCAT(t.name ORDER BY t.id SEPARATOR ',')
         FROM customer_lead_tag_relation r JOIN customer_lead_tag t ON t.id = r.tag_id
         WHERE r.lead_id = customer_lead.id) AS tags_raw
     FROM customer_lead"""
+
+_LEAD_GENDER_RE = re.compile(r"\bFROM customer_lead\b")
+
+
+def _apply_gender_column(select_sql: str) -> str:
+    """在客源主表外层 FROM 前补 gender 列。
+
+    用 ``\bFROM customer_lead\b`` 只匹配外层表引用：子查询里的
+    ``FROM customer_lead_tag_relation`` 因 ``customer_lead`` 后紧跟 ``_``（单词字符）
+    不构成词边界，不会被误匹配，避免把 gender 注入标量子查询导致 MySQL 1241
+    （Operand should contain 1 column(s)）。
+    """
+    return _LEAD_GENDER_RE.sub(", CAST(gender AS SIGNED) AS gender FROM customer_lead", select_sql)
+
 
 # 导入模板表头（顺序即模板列顺序）
 _TEMPLATE_HEADERS: list[str] = ["姓名", "手机号", "微信号", "来源", "意向程度", "备注"]
@@ -106,11 +121,14 @@ async def create_lead(db: AsyncSession, account_id: int, request: CustomerLeadCr
     try:
         insert_columns = ["name", "real_name", "phone", "wechat", "source", "intention_level", "remark", "promoter_id", "audit_status", "created_by"]
         insert_payload = {**request.model_dump(exclude={"tags"}), "phone": phone, "wechat": wechat, "created_by": account_id}
-        if "gender" in await _lead_columns(db):
-            insert_columns.append("gender")
+        columns = await _lead_columns(db)
+        # photo/birthday/gender 列可能还没迁移，先发版后迁移时从写入列里剔除，避免 Unknown column 500。
+        insert_columns += [column for column in ("photo", "birthday", "gender") if column in columns]
+        # 每个占位符都要带冒号：`(:{', '.join(cols)})` 只会给第一列生成绑定参数，
+        # 其余列名会被当成列引用，MySQL 按列默认值插入 —— 静默丢掉操作员填的值。
         insert_sql = f"""INSERT INTO customer_lead
             ({', '.join(insert_columns)})
-            VALUES (:{', '.join(insert_columns)})"""
+            VALUES ({', '.join(f':{column}' for column in insert_columns)})"""
         result = await db.execute(text(insert_sql), insert_payload)
         lead_id = int(result.lastrowid)
         await _sync_tags(db, lead_id, request.tags)
@@ -153,14 +171,7 @@ async def get_lead(
         where.append("deleted_at IS NULL")
     select_sql = LEAD_SELECT
     if "gender" in columns:
-        # 只给主查询补 gender 列。tags_raw 子查询里的 customer_lead_tag_relation 含
-        # "FROM customer_lead" 子串，无边界 str.replace 会把它一并替换成返回 2 列，
-        # MySQL 报 1241 "Operand should contain 1 column(s)"（客源列表/详情 500）。
-        select_sql = re.sub(
-            r"FROM customer_lead(?![a-zA-Z0-9_])",
-            ", CAST(gender AS SIGNED) AS gender FROM customer_lead",
-            select_sql,
-        )
+        select_sql = _apply_gender_column(select_sql)
     row = (await db.execute(text(f"{select_sql} WHERE {' AND '.join(where)}"), params)).mappings().first()
     if not row:
         raise HTTPException(404, detail="客源线索不存在")
@@ -205,9 +216,10 @@ async def convert_lead(
     target_matchmaker_id = lead.matchmaker_id or matchmaker_user_id
     try:
         result = await db.execute(text("""INSERT INTO users
-            (openid, phone, phone_verified_at, nickname, gender, status, data_complete_rate, register_ip)
-            VALUES (:openid, :phone, UTC_TIMESTAMP(), :nickname, :gender, 1, 0, '127.0.0.1')"""), {
+            (openid, phone, password, password_algo, phone_verified_at, nickname, gender, status, data_complete_rate, register_ip)
+            VALUES (:openid, :phone, :password, :password_algo, UTC_TIMESTAMP(), :nickname, :gender, 1, 0, '127.0.0.1')"""), {
             "openid": f"lead-convert-{lead_id}", "phone": phone, "nickname": lead.name, "gender": request.gender,
+            **lead_convert_password_fields(),
         })
         user_id = int(result.lastrowid)
         await ensure_default_user_role(db, user_id)
@@ -321,6 +333,9 @@ async def list_leads(
     hide_called_today: bool | None = None,
     has_phone: bool | None = None,
     has_wechat: bool | None = None,
+    assigned: bool | None = None,
+    audit_status: str | None = None,
+    stored: bool | None = None,
     order: str | None = None,
     scope: str | None = None,
     scope_params: dict[str, Any] | None = None,
@@ -362,6 +377,19 @@ async def list_leads(
     if promoter_id is not None:
         where.append("promoter_id = :promoter_id")
         params["promoter_id"] = promoter_id
+    # B11③ 客源线索缺失筛选：待分派 / 审核状态 / 入库情况。
+    # matchmaker_id、audit_status、converted_user_id 均为 customer_lead 基础列（LEAD_SELECT 已引用）。
+    if assigned is True:
+        where.append("matchmaker_id IS NOT NULL")
+    elif assigned is False:
+        where.append("matchmaker_id IS NULL")
+    if audit_status:
+        where.append("audit_status = :audit_status")
+        params["audit_status"] = audit_status
+    if stored is True:
+        where.append("converted_user_id IS NOT NULL")
+    elif stored is False:
+        where.append("converted_user_id IS NULL")
     if start_date:
         where.append("created_at >= :start_date")
         params["start_date"] = start_date
@@ -434,14 +462,7 @@ async def list_leads(
     order_sql = _LEAD_ORDER_SQL.get(order or "latest", _LEAD_ORDER_SQL["latest"])
     select_sql = LEAD_SELECT
     if "gender" in columns:
-        # 只给主查询补 gender 列。tags_raw 子查询里的 customer_lead_tag_relation 含
-        # "FROM customer_lead" 子串，无边界 str.replace 会把它一并替换成返回 2 列，
-        # MySQL 报 1241 "Operand should contain 1 column(s)"（客源列表/详情 500）。
-        select_sql = re.sub(
-            r"FROM customer_lead(?![a-zA-Z0-9_])",
-            ", CAST(gender AS SIGNED) AS gender FROM customer_lead",
-            select_sql,
-        )
+        select_sql = _apply_gender_column(select_sql)
     rows = await db.execute(text(f"{select_sql} WHERE {clause} ORDER BY {order_sql} LIMIT :limit OFFSET :offset"), params)
     count = await db.execute(text(f"SELECT COUNT(*) FROM customer_lead WHERE {clause}"), {k: v for k, v in params.items() if k not in ("limit", "offset")})
     total = int(count.scalar() or 0)

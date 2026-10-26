@@ -25,6 +25,8 @@ from app.schemas.finance import (
     CommissionRuleResponse,
     CreditGrantRequest,
     CreditGrantResult,
+    CreditDeductRequest,
+    CreditDeductResult,
     CreditRecordItem,
     CreditRecordPage,
     CREDIT_CATEGORY_SOURCES,
@@ -698,6 +700,96 @@ async def admin_grant_credits(db: AsyncSession, admin: CurrentUser, request: Cre
     return CreditGrantResult(
         granted_count=len(targets),
         total_amount=len(targets) * request.amount,
+        sample_ledger_ids=ledger_ids[:10],
+        target_user_ids=targets,
+    )
+
+
+async def admin_deduct_credits(db: AsyncSession, admin: CurrentUser, request: CreditDeductRequest) -> CreditDeductResult:
+    """后台扣减积分（与发放积分对称）：写 account_ledger(DEBIT, AVAILABLE, source_type='admin_grant')。
+
+    口径：与「发放积分」同一账本（account_ledger account_type='user'），保证积分明细页发放/扣减同页
+    可见；不直改 C 端 user_points（遵设计文档「积分不支持前端直接修改」）。
+    原子性：扣减前对本批账户加行锁并校验可用额度，任一不足则整批 409，不产生部分扣减（与余额扣减同策略）。
+    """
+    targets = await _resolve_credit_targets(db, request.target_type, request.user_ids)
+    if not targets:
+        raise HTTPException(404, detail="扣减目标为空，请检查 target_type 或 user_ids")
+    amount = int(request.amount)
+    in_params: dict[str, object] = {}
+    placeholders = []
+    for index, uid in enumerate(targets):
+        key = f"uid_{index}"
+        in_params[key] = uid
+        placeholders.append(f":{key}")
+    in_clause = ", ".join(placeholders)
+    # 行锁：与余额调整同口径，防并发重复扣减。
+    await db.execute(
+        text(
+            f"""SELECT account_id FROM account_ledger
+                WHERE account_type = 'user' AND account_id IN ({in_clause}) FOR UPDATE"""
+        ),
+        in_params,
+    )
+    avail_rows = (
+        await db.execute(
+            text(
+                f"""SELECT account_id,
+                    COALESCE(SUM(CASE WHEN state = 'AVAILABLE' AND direction = 'CREDIT' THEN amount
+                                      WHEN state = 'AVAILABLE' AND direction = 'DEBIT' THEN -amount
+                                      ELSE 0 END), 0) AS available
+                    FROM account_ledger WHERE account_type = 'user' AND account_id IN ({in_clause})
+                    GROUP BY account_id"""
+            ),
+            in_params,
+        )
+    ).all()
+    available = {int(r[0]): Decimal(str(r[1])) for r in avail_rows}
+    need = Decimal(amount)
+    insufficient = [uid for uid in targets if available.get(uid, Decimal(0)) < need]
+    if insufficient:
+        raise HTTPException(409, detail=f"以下用户可用积分不足，扣减未执行：{insufficient[:20]}")
+    ledger_ids: list[int] = []
+    for uid in targets:
+        result = await db.execute(
+            text(
+                """INSERT INTO account_ledger
+                   (account_type, account_id, direction, amount, state, source_type, source_id, idempotency_key)
+                   VALUES ('user', :user_id, 'DEBIT', :amount, 'AVAILABLE', 'admin_grant', :source_id, :key)"""
+            ),
+            {
+                "user_id": uid,
+                "amount": amount,
+                "source_id": admin.id,
+                "key": f"credit-deduct:{admin.id}:{uid}:{amount}:{request.reason}",
+            },
+        )
+        ledger_ids.append(int(result.lastrowid or 0))
+    await db.execute(
+        text(
+            """INSERT INTO business_audit_log
+               (actor_user_id, action, resource_type, resource_id, reason, after_json)
+               VALUES (:admin_id, 'finance.credit_deduct', 'finance', NULL, :reason, :after_json)"""
+        ),
+        {
+            "admin_id": admin.id,
+            "reason": request.reason,
+            "after_json": json.dumps(
+                {
+                    "target_type": request.target_type,
+                    "deducted_count": len(targets),
+                    "amount_per_user": amount,
+                    "total_amount": len(targets) * amount,
+                    "ledger_ids": ledger_ids[:10],
+                },
+                ensure_ascii=False,
+            ),
+        },
+    )
+    await db.commit()
+    return CreditDeductResult(
+        deducted_count=len(targets),
+        total_amount=len(targets) * amount,
         sample_ledger_ids=ledger_ids[:10],
         target_user_ids=targets,
     )

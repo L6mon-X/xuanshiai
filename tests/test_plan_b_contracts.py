@@ -90,9 +90,15 @@ def test_plan_b_database_extensions_are_registered() -> None:
 
 
 def test_accept_application_writes_system_greeting() -> None:
+    from app.services import discovery
+
     source = (ROOT / "app" / "services" / "discovery.py").read_text(encoding="utf-8")
-    assert "你们已经互相同意认识，可以开始聊天了。" in source
-    assert "type = 6" in source
+    # 文案已抽成可配置常量（需求原文用字），这里断言契约而不是硬编码字面量：
+    # 「同意申请后写入一条 type=6 系统问候，并用幂等键去重」。
+    assert discovery.DEFAULT_AUTO_GREETING == "你好呀，我们可以开始聊天啦！"
+    # 问候写入 chat_message 时必须带 type=6（系统消息）与 client_message_id（幂等键）
+    assert "to_user_id, type, content, client_message_id, is_read" in source
+    assert "6, :greeting, :client_message_id" in source
 
 
 def test_sensitive_routes_use_permission_guards() -> None:

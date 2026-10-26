@@ -9,6 +9,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.security import decode_access_token
 from app.core.request_context import current_user_id_context
 from app.services.matchmaker_admin_auth import decode_matchmaker_admin_token, get_session_account
@@ -146,7 +147,7 @@ async def get_browsable_user(
         text("SELECT COALESCE(score, 0) FROM user_profile_completion WHERE user_id = :user_id"),
         {"user_id": current.id},
     )
-    if float(result.scalar() or 0) < 100:
+    if not settings.discovery_skip_gates_enabled and float(result.scalar() or 0) < 100:
         raise HTTPException(status_code=403, detail="请先完善资料后再进入首页")
     return current
 

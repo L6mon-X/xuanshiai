@@ -1166,10 +1166,6 @@ def _topic_response(row: dict[str, Any]) -> CommunityTopicResponse:
         heat=heat,
         joined=bool(row.get("joined")),
         created_at=row.get("created_at"),
-        background_url=row.get("background_url"),
-        description=row.get("description"),
-        view_count=int(row.get("view_count") or 0),
-        status=row.get("status"),
     )
 
 

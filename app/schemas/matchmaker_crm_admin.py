@@ -73,7 +73,8 @@ class MemberListItem(BaseModel):
     last_login_at: datetime | None = None
     ip_location: str | None = None
     # A12：积分余额取 user_points 流水最新一条 balance，无流水为 0（无需补列）。
-    points: int = Field(default=0, ge=0)
+    # 不施加 ge=0：与同源的 balance 一致，避免历史负值/未来扣减在列表构造时抛 ValidationError 拖垮整页。
+    points: int = Field(default=0)
     # A12-补列：累计登录次数取 users.login_num，缺列（迁移未执行）时降级为 None。
     login_num: int | None = None
     # A12-补列：IP 属地 / 手机号归属地取 users.ip_region / phone_region，
@@ -109,6 +110,18 @@ class MemberDetail(MemberListItem):
     wechat: str | None = None
     last_login_at: datetime | None = None
     ip_location: str | None = None
+    # A12-微信绑定（第389行）：抽屉展示微信绑定状态。openid 本身为登录身份标识，不外传，
+    # 只回是否已绑定与绑定时间；缺列时降级为未绑定。
+    wechat_bound: bool = False
+    wechat_bound_at: datetime | None = None
+
+
+class MemberWechatBindRequest(BaseModel):
+    """后台手动为会员绑定微信（写入 openid/unionid）。敏感写：需 confirm=true + Idempotency-Key。"""
+
+    openid: str = Field(min_length=1, max_length=64, description="待绑定的微信 openid（全局唯一）")
+    unionid: str | None = Field(default=None, max_length=64, description="微信 unionid，可选")
+    reason: str = Field(min_length=1, max_length=255, description="绑定理由（记入审计）")
 
 
 class MemberStatusUpdate(BaseModel):

@@ -145,6 +145,11 @@ EXTRA_FILTER_KEYS: frozenset[str] = frozenset(
         "nick",
         # A11-CMS：更新公告按分类筛选（category 存于 extra_json）。
         "category",
+        # B11④：自由表单(free_form) 的性别/落地页/客户来源筛选（均存于 extra_json）。
+        # 此前前端靠把这些字段塞进 keyword 做 JSON 子串匹配（脆弱 hack），现走正式参数。
+        "gender",
+        "landing_id",
+        "source",
     }
 )
 
@@ -194,6 +199,8 @@ async def list_items(
             if key in {"good_news_status", "matchmaker_id"} and domain != "good_news":
                 continue
             if key in {"group_id", "pay", "nick"} and domain != "group_signup":
+                continue
+            if key in {"gender", "landing_id", "source"} and domain != "free_form":
                 continue
             json_key = "status" if key == "good_news_status" else key
             operator = "LIKE" if key == "nick" else "="

@@ -149,7 +149,7 @@ Authorization: Bearer <access-token>
 | `tags` | array/object/string/null | 否 | 未填写/脏数据归一化为 null | `user_profile.tags`（JSON，非法 JSON 降级 null，不 500） |
 | `last_login_at` | datetime/null | 否 | 从未登录/缺列为 null | `users.last_login_at` |
 | `ip_location` | string/null | 否 | 无注册 IP/缺列为 null | `users.register_ip` |
-| `points` | int | 否 | 无流水为 `0` | **A12**：积分余额，取 `user_points` 流水最新一条 `balance`（相关子查询，无新表） |
+| `points` | int | 否 | 无流水为 `0` | **A12**：积分余额，取 `user_points` 流水最新一条 `balance`（相关子查询，无新表）；`sort_by=points`/`integral` 走同一表达式 |
 | `login_num` | int/null | 否 | 缺列（迁移未执行）为 `null` | **A12-补列**：累计登录次数，取 `users.login_num`（`migrations/user_login_num/20261024_01`，登录链路自增） |
 | `ip_region` | string/null | 否 | 缺列为 `null`；本轮仅展示、不自动解析 | **A12-属地**：`users.ip_region`（`migrations/user_region/20261024_01`） |
 | `phone_region` | string/null | 否 | 缺列为 `null` | **A12-属地**：`users.phone_region` |
@@ -194,7 +194,9 @@ Content-Type: application/json
 
 ## 变更记录
 
-- 2026-10-18：`weight` 校验范围由 40-120 放宽为 30-150（会员详情编辑 `PATCH /admin/matchmaker/members/{member_id}` 与红娘工作台会员录入同口径）；`height` 范围不变。向后兼容，旧客户端无需改动，仅此前被拒的 30-39 与 121-150 现可保存。
+- 2026-10-24（A12-积分排序）：`sort_by` 白名单新增 `points` 与 `integral`（两 token 同口径，均按 `user_points` 最新 `balance` 降序、`u.id` 兜底），复用列表 `points` 展示列同一表达式 `MEMBER_POINTS_EXPR`，**不新建 users 列**。修复「`sort_by=integral` 直接 422」。只读、向后兼容。
+- 2026-10-24（A12-会员删除）：`GET /admin/matchmaker/members` 与会员详情在 `users.deleted_at` 列存在时默认追加 `u.deleted_at IS NULL`，排除软删会员（列缺失时不拼，向后兼容）。新增 `DELETE /members/{member_id}` 与 `POST /members/batch-delete`（软删、敏感写、作用域收口、逐条归类），完整契约见 `docs/api/会员删除与批量删除接口-2026-10-24.md`。
+- 2026-10-24（A12-属地刷新）：新增 `GET /members/region-resolver`、`POST /members/refresh-ip-region`、`POST /members/refresh-phone-region`（provider 门控骨架，缺省 `disabled`→`503`，未接真实厂商，不写库）。契约见 `docs/api/一键刷新属地接口-2026-10-24.md`。
 - 2026-10-24（A12-钱包 balance）：`GET /admin/matchmaker/members` 与详情出参新增 `balance`（平台余额，取 `account_ledger` 中 `account_type='user'`、`state='AVAILABLE'` 的 CREDIT−DEBIT，与 `finance.get_balance` 同口径），相关子查询、不新建表；`sort_by` 白名单新增 `balance`。只读、向后兼容。余额发放/扣减与用户钱包视图见 `docs/api/钱包余额调整接口-2026-10-24.md`。
 - 2026-10-24（A12-属地 ip_region/phone_region）：`users` 新增 `ip_region` / `phone_region`（varchar(64) 可空，迁移 `migrations/user_region/20261024_01`，含 up/down/verify）；列表与详情按 `user_expr` 缺列降级输出两字段（迁移未执行为 `null`）。本轮仅补列+展示，不接 IP→属地批量解析（`ip_location` 仍为原始注册 IP）。向后兼容。
 - 2026-10-24（A12-补列 login_num）：`users` 新增 `login_num`（累计登录次数，int 默认 0，迁移 `migrations/user_login_num/20261024_01`，含 up/down/verify）；登录链路（手机验证码 / 微信 / 测试密码）经 `touch_login` 在列存在时自增、缺列时静默跳过；`GET /admin/matchmaker/members` 与详情出参新增 `login_num`（缺列降级 `null`），`sort_by` 白名单新增 `login_num`（缺列时回落默认排序不报错）。向后兼容：旧客户端忽略新字段即可。
@@ -202,6 +204,7 @@ Content-Type: application/json
 - 2026-10-24（缺口补全）：`GET /admin/matchmaker/members` 新增 `auth_status`（多值，B6）、`source__is_null`（B5）、`activity_id`（B0）、`weight_min/max`（B9）、`next_follow_start/end`（A15）；`MemberListItem` 出参补 `real_name/weight/tags/last_login_at/ip_location`（B8/A12）；`/statistics` 补 `source_distribution`（B5/A11）；`MemberDetail.tags` 放宽类型修复脏数据 500（B10）；兼容层 `getAdminIndexStatistic` 修复 `maleNums/femaleNums`（B7）；新增批量弃海 `POST /admin/members/batch-abandon`（A18）。全部向后兼容。
 
 - 2026-10-20（B3 / A9）：会员列表新增 `abandoned` 筛选参数与出参字段，统计新增 `abandoned` 计数；新增弃海 / 捞回接口。
+- 2026-10-18：`weight` 校验范围由 40-120 放宽为 30-150（会员详情编辑 `PATCH /admin/matchmaker/members/{member_id}` 与红娘工作台会员录入同口径）；`height` 范围不变。向后兼容，旧客户端无需改动，仅此前被拒的 30-39 与 121-150 现可保存。
 
 - 2026-10-17：`PATCH /admin/matchmaker/members/{member_id}` 新增 `phone`（11 位、全局唯一、撞号 409）与 `wechat_added`（0/1/2）。此前会员抽屉里手机号与微信号的「修改」、以及「加上了？」下拉都没有可写字段，是死控件。
 - 2026-10-11（D-9 敏感操作）：`PATCH /admin/matchmaker/members/{member_id}/assignment`（改派）与 `POST /admin/matchmaker/members/batch-status`（批量改状态）纳入统一敏感操作，强制 `Idempotency-Key` + `confirm=true`，同键重放不重复执行；越权在幂等预占之前拦截。

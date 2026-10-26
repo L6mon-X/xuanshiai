@@ -71,6 +71,9 @@ async def lead_list(
     hide_called_today: bool | None = Query(None, description="隐藏今日已通话的线索"),
     has_phone: bool | None = Query(None, description="是否登记手机号"),
     has_wechat: bool | None = Query(None, description="是否登记微信号"),
+    assigned: bool | None = Query(None, description="分派状态筛选：true 已分派 / false 待分派（B11）"),
+    audit_status: str | None = Query(None, pattern="^(active|pending)$", description="审核状态：active 有效 / pending 待核（B11）"),
+    stored: bool | None = Query(None, description="入库情况：true 已入库(已转会员) / false 未入库（B11）"),
     order: str | None = Query(None, pattern="^(latest|earliest)$", description="记录排序，默认 latest"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
@@ -106,6 +109,9 @@ async def lead_list(
         hide_called_today=hide_called_today,
         has_phone=has_phone,
         has_wechat=has_wechat,
+        assigned=assigned,
+        audit_status=audit_status,
+        stored=stored,
         order=order,
     )
 

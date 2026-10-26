@@ -77,6 +77,9 @@ class Settings(BaseSettings):
     superlike_daily_free_limit: int = 1
     superlike_daily_vip_limit: int = 3
     paper_plane_daily_limit: int = 3
+    # 测试环境专用：放开「发现/推荐/搜索/详情」链路的异性过滤与资料完整度门禁，
+    # 让测试号（含空资料、含同性）互相可见。仅在 development/testing 生效。
+    discovery_skip_gates: bool = False
 
     live_enabled: bool = False
     live_provider: Literal["mock", "tencent"] = "mock"
@@ -121,6 +124,11 @@ class Settings(BaseSettings):
     # mock 仅用于开发/联调（生成待付订单 + 模拟支付链接），生产禁止。
     # 套餐目录只读展示不受该开关影响。
     verification_recharge_provider: Literal["disabled", "mock", "real"] = "disabled"
+
+    # 属地解析（A12-一键刷新 IP/手机属地）：全项目当前无 IP→属地 / 号码归属地解析器（外部依赖）。
+    # disabled（默认）→ 刷新接口 503；mock → 干跑（只统计候选行、不写库，adapter_implemented=false）；
+    # real → 预留（适配器未接入时返回 501）。预发/生产禁止 mock。
+    region_resolver_provider: Literal["disabled", "mock", "real"] = "disabled"
 
     # AI avatar calls an OpenAI-compatible chat-completions service from the
     # backend only. API keys must never be exposed to the mini-program.
@@ -454,6 +462,11 @@ class Settings(BaseSettings):
         """Return whether development-only providers are allowed."""
         return self.environment in {"development", "testing"}
 
+    @property
+    def discovery_skip_gates_enabled(self) -> bool:
+        """测试环境专用：是否放开发现链路的性别/完整度门禁（fail-closed）。"""
+        return self.is_test_mode and self.discovery_skip_gates
+
     def membership_price_override(self, code: str, field: str, fallback: float | None) -> float | None:
         """Return an environment override for a membership package field."""
         value = getattr(self, f"membership_{code}_{field}", None)
@@ -473,6 +486,10 @@ class Settings(BaseSettings):
             raise ValueError("staging/production 环境禁止使用直播 Mock Provider")
         if self.environment in {"staging", "production"} and self.verification_recharge_provider == "mock":
             raise ValueError("staging/production 环境禁止使用核验充值 Mock Provider")
+        if self.environment in {"staging", "production"} and self.region_resolver_provider == "mock":
+            raise ValueError("staging/production 环境禁止使用属地解析 Mock Provider")
+        if self.environment in {"staging", "production"} and self.discovery_skip_gates:
+            raise ValueError("staging/production 环境禁止开启 DISCOVERY_SKIP_GATES")
         if self.live_enabled and self.live_provider == "tencent":
             sdk_secret = (
                 self.tencent_live_sdk_secret_key.get_secret_value().strip()

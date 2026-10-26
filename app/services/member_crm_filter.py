@@ -37,8 +37,10 @@ BEHAVIOR_TYPE_SQL: dict[str, str] = {
     "viewed": "EXISTS (SELECT 1 FROM user_browse_history bh WHERE bh.user_id = u.id)",
     "viewed_by": "EXISTS (SELECT 1 FROM user_browse_history bh WHERE bh.target_user_id = u.id)",
     "favorited": "EXISTS (SELECT 1 FROM user_favorite bv WHERE bv.user_id = u.id AND bv.type = 2)",
-    "boosted": "EXISTS (SELECT 1 FROM user_boost bo WHERE bo.user_id = u.id)",
-    "boosted_by": "EXISTS (SELECT 1 FROM user_boost bo WHERE bo.target_user_id = u.id)",
+    # user_boost 复用承载「置顶助推」（user_id = target_user_id = 自己），
+    # 两个方向都必须排除自指记录，否则「买过置顶」会被筛成「爆过灯 / 被爆过灯」。
+    "boosted": "EXISTS (SELECT 1 FROM user_boost bo WHERE bo.user_id = u.id AND bo.user_id <> bo.target_user_id)",
+    "boosted_by": "EXISTS (SELECT 1 FROM user_boost bo WHERE bo.target_user_id = u.id AND bo.user_id <> bo.target_user_id)",
     "gift_sent": "EXISTS (SELECT 1 FROM user_gift_record gr WHERE gr.user_id = u.id)",
     "gift_received": "EXISTS (SELECT 1 FROM user_gift_record gr WHERE gr.target_user_id = u.id)",
 }
@@ -56,6 +58,13 @@ MEMBER_BALANCE_EXPR = (
     " AND al.account_id = u.id AND al.state = 'AVAILABLE'), 0)"
 )
 
+# 积分口径（A12）：取 user_points 中该用户最新一条 balance（与会员列表 `points` 展示列同源）。
+# user_points 表已存在、无需新列，排序与展示复用同一表达式。
+MEMBER_POINTS_EXPR = (
+    "COALESCE((SELECT up.balance FROM user_points up"
+    " WHERE up.user_id = u.id ORDER BY up.id DESC LIMIT 1), 0)"
+)
+
 # 排序白名单：值全部由服务端写死，不拼接用户输入。
 SORT_SQL: dict[str, str] = {
     "created_at": "u.created_at DESC, u.id DESC",
@@ -66,6 +75,9 @@ SORT_SQL: dict[str, str] = {
     "assigned_at": "COALESCE(a.assigned_at, '1970-01-01') DESC, u.id DESC",
     "fetched_at": "COALESCE(u.fetched_at, '1970-01-01') DESC, u.id DESC",
     "balance": f"{MEMBER_BALANCE_EXPR} DESC, u.id DESC",
+    # 积分排序：前端列表用 `integral`、展示字段名是 `points`，两个 token 同一口径都受理。
+    "points": f"{MEMBER_POINTS_EXPR} DESC, u.id DESC",
+    "integral": f"{MEMBER_POINTS_EXPR} DESC, u.id DESC",
     "id": "u.id DESC",
 }
 

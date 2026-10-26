@@ -28,6 +28,9 @@ async def content_list(
     pay: str | None = Query(None, max_length=16, description="社群报名支付状态，取自 extra.pay"),
     nick: str | None = Query(None, max_length=64, description="社群报名昵称，按 extra.nick 精确/模糊筛选"),
     search_type: str | None = Query(None, max_length=32, description="keyword 的匹配目标（按域生效）：free_pay_order/gift_exchange 支持 nickname 会员昵称 / phone 手机号 / order_no 订单号；未定义时按标题等全字段模糊匹配"),
+    gender: str | None = Query(None, max_length=16, description="【仅 free_form】性别，取自 extra.gender：1 男 / 2 女"),
+    landing_id: str | None = Query(None, max_length=32, description="【仅 free_form】落地页 ID，取自 extra.landing_id"),
+    source: str | None = Query(None, max_length=64, description="【仅 free_form】客户来源，取自 extra.source，精确匹配"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> ContentItemPage:
@@ -41,6 +44,9 @@ async def content_list(
         "group_id": group_id,
         "pay": pay,
         "nick": nick,
+        "gender": gender,
+        "landing_id": landing_id,
+        "source": source,
     }
     return await list_items(db, domain, page, page_size, keyword, status, extra_filters, search_type)
 

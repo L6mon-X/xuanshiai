@@ -1,3 +1,5 @@
+import inspect
+
 import pytest
 
 from app.services.candidate_visibility import (
@@ -88,6 +90,18 @@ def test_sql_predicate_rejects_unknown_visibility_policies() -> None:
     )
 
     assert "COALESCE(pr.who_can_see_me, 1) IN (1, 2, 3)" in predicate.clause
+
+
+def test_sql_predicate_completion_gate_is_opt_out_only() -> None:
+    """DISCOVERY_SKIP_GATES 只在显式传参时放开完整度门禁（默认仍为 fail-closed）。"""
+    service = CandidateVisibilityService()
+    viewer = ViewerContext(user_id=1, realname_status=2, is_vip=True)
+
+    default = service.predicate(viewer, VisibilityScene.PROFILE)
+    skipped = service.predicate(viewer, VisibilityScene.PROFILE, skip_completion_gate=True)
+
+    assert "COALESCE(c.score, 0) >= 100" in default.clause
+    assert "COALESCE(c.score, 0) >= 100" not in skipped.clause
 
 
 @pytest.mark.parametrize("candidate_alias", ["candidate.id", "1candidate", "u; DROP TABLE users"])
@@ -364,3 +378,26 @@ def test_sql_predicate_waives_completion_for_organization_scope() -> None:
     assert predicate.params["visibility_waiver_organization_id"] == 3
     assert "visibility_waiver_matchmaker_id" not in predicate.params
     assert predicate.clause.count("(") == predicate.clause.count(")")
+
+
+def test_sql_predicate_only_excludes_rejected_or_hidden_media() -> None:
+    """审核中(0) 不得阻断可见性：公开资料的图片过滤由资料序列化层负责。
+
+    背景：上传头像/照片写入 review_status=0，若把 0 也算作未通过，用户传完图
+    就会立刻从推荐流与详情页消失，且前端无任何提示。
+    """
+    predicate = CandidateVisibilityService().predicate(
+        ViewerContext(user_id=1, realname_status=2, is_vip=True),
+        VisibilityScene.DISCOVERY,
+    )
+
+    assert "pending_media.review_status IN (2, 3)" in predicate.clause
+    assert "review_status IN (0, 2, 3)" not in predicate.clause
+
+
+def test_object_decision_only_excludes_rejected_or_hidden_media() -> None:
+    """对象级 decide() 与列表谓词必须同口径，否则会出现「列表可见、详情 404」。"""
+    source = inspect.getsource(CandidateVisibilityService.decide)
+
+    assert "review_status IN (2, 3)" in source
+    assert "review_status IN (0, 2, 3)" not in source

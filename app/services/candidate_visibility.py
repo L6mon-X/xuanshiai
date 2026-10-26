@@ -41,6 +41,9 @@ class CandidateContext:
     match_active: bool = True
     not_restricted: bool = True
     profile_complete: bool = True
+    # 只表示「没有被拒绝或隐藏的媒体」。审核中（review_status=0）不计入，
+    # 因为待审不代表内容违规，且公开资料序列化层（get_profile public）已只取
+    # review_status=1，图片本身不会因此泄露。
     media_approved: bool = True
     blocked: bool = False
     # profile_visibility 档位：all / friends / only_me。
@@ -98,6 +101,7 @@ def evaluate_visibility(
     if not candidate.profile_complete:
         return VisibilityDecision(False, "PROFILE_INCOMPLETE")
     if not candidate.media_approved:
+        # 只有「被拒绝 / 已隐藏」的媒体会命中；审核中（0）不再阻断可见性。
         return VisibilityDecision(False, "MEDIA_REVIEW_PENDING")
     if candidate.profile_visibility == "only_me":
         return VisibilityDecision(False, "PROFILE_VISIBILITY_ONLY_ME")
@@ -158,11 +162,13 @@ class CandidateVisibilityService:
                                OR candidate_restriction.ends_at > UTC_TIMESTAMP())
                     ) AS not_restricted,
                     COALESCE(candidate_completion.score, 0) >= 100 AS profile_complete,
+                    -- 只拦「拒绝(2) / 隐藏(3)」。审核中(0) 不算违规：公开资料序列化
+                    -- 层已只取 review_status = 1，待审图片本身不会外泄。
                     NOT EXISTS (
                         SELECT 1 FROM user_media pending_media
                         WHERE pending_media.user_id = candidate.id
                           AND pending_media.deleted_at IS NULL
-                          AND pending_media.review_status IN (0, 2, 3)
+                          AND pending_media.review_status IN (2, 3)
                     ) AS media_approved,
                     EXISTS (
                         SELECT 1 FROM user_block blocked_relationship
@@ -224,6 +230,7 @@ class CandidateVisibilityService:
         privacy_alias: str = "pr",
         completion_alias: str = "c",
         completion_waiver: CompletionWaiver | None = None,
+        skip_completion_gate: bool = False,
     ) -> SqlPredicate:
         for alias in (candidate_alias, privacy_alias, completion_alias):
             if not _SQL_ALIAS.fullmatch(alias):
@@ -247,48 +254,49 @@ class CandidateVisibilityService:
                 f"WHERE waiver_ra.user_id = {candidate_alias}.id "
                 f"AND waiver_ra.status = 1 AND {waiver_relation}))"
             )
-        clause = " AND ".join(
-            (
-                f"{candidate_alias}.id <> :visibility_viewer_id",
-                f"{candidate_alias}.status = 1",
-                completion_clause,
-                "NOT EXISTS (SELECT 1 FROM user_restriction ban "
-                f"WHERE ban.user_id = {candidate_alias}.id "
-                "AND ban.restriction_type = 'TOTAL_BAN' AND ban.status = 1 "
-                "AND ban.starts_at <= UTC_TIMESTAMP() "
-                "AND (ban.ends_at IS NULL OR ban.ends_at > UTC_TIMESTAMP()))",
-                f"COALESCE({privacy_alias}.show_profile, 1) = 1",
-                f"COALESCE({privacy_alias}.match_status, 1) = 1",
-                # profile_visibility：只有白名单档位放行；friends 要求双方已匹配。
-                f"COALESCE({privacy_alias}.profile_visibility, 'all') IN ('all', 'friends', 'only_me')",
-                f"COALESCE({privacy_alias}.profile_visibility, 'all') <> 'only_me'",
-                "("
-                f"COALESCE({privacy_alias}.profile_visibility, 'all') <> 'friends' "
-                "OR EXISTS (SELECT 1 FROM user_match vm "
-                "WHERE vm.status IN (1, 2) "
-                f"AND ((vm.user_id = :visibility_viewer_id AND vm.target_user_id = {candidate_alias}.id) "
-                f"OR (vm.user_id = {candidate_alias}.id AND vm.target_user_id = :visibility_viewer_id)))"
-                ")",
-                f"COALESCE({privacy_alias}.who_can_see_me, 1) IN (1, 2, 3)",
-                "(:visibility_realname_status = 2 "
-                f"OR COALESCE({privacy_alias}.who_can_see_me, 1) <> 2)",
-                "("
-                + active_membership_exists_sql(
-                    membership_alias="visibility_membership",
-                    user_id_param="visibility_viewer_id",
-                )
-                + f" OR COALESCE({privacy_alias}.who_can_see_me, 1) <> 3)",
-                "NOT EXISTS (SELECT 1 FROM user_media pending_media "
-                f"WHERE pending_media.user_id = {candidate_alias}.id "
-                "AND pending_media.deleted_at IS NULL "
-                "AND pending_media.review_status IN (0, 2, 3))",
-                "NOT EXISTS (SELECT 1 FROM user_block bl "
-                "WHERE (bl.user_id = :visibility_viewer_id "
-                f"AND bl.target_user_id = {candidate_alias}.id) "
-                f"OR (bl.user_id = {candidate_alias}.id "
-                "AND bl.target_user_id = :visibility_viewer_id))",
+        parts: list[str] = [
+            f"{candidate_alias}.id <> :visibility_viewer_id",
+            f"{candidate_alias}.status = 1",
+            "NOT EXISTS (SELECT 1 FROM user_restriction ban "
+            f"WHERE ban.user_id = {candidate_alias}.id "
+            "AND ban.restriction_type = 'TOTAL_BAN' AND ban.status = 1 "
+            "AND ban.starts_at <= UTC_TIMESTAMP() "
+            "AND (ban.ends_at IS NULL OR ban.ends_at > UTC_TIMESTAMP()))",
+            f"COALESCE({privacy_alias}.show_profile, 1) = 1",
+            f"COALESCE({privacy_alias}.match_status, 1) = 1",
+            # profile_visibility：只有白名单档位放行；friends 要求双方已匹配。
+            f"COALESCE({privacy_alias}.profile_visibility, 'all') IN ('all', 'friends', 'only_me')",
+            f"COALESCE({privacy_alias}.profile_visibility, 'all') <> 'only_me'",
+            "("
+            f"COALESCE({privacy_alias}.profile_visibility, 'all') <> 'friends' "
+            "OR EXISTS (SELECT 1 FROM user_match vm "
+            "WHERE vm.status IN (1, 2) "
+            f"AND ((vm.user_id = :visibility_viewer_id AND vm.target_user_id = {candidate_alias}.id) "
+            f"OR (vm.user_id = {candidate_alias}.id AND vm.target_user_id = :visibility_viewer_id)))"
+            ")",
+            f"COALESCE({privacy_alias}.who_can_see_me, 1) IN (1, 2, 3)",
+            "(:visibility_realname_status = 2 "
+            f"OR COALESCE({privacy_alias}.who_can_see_me, 1) <> 2)",
+            "("
+            + active_membership_exists_sql(
+                membership_alias="visibility_membership",
+                user_id_param="visibility_viewer_id",
             )
-        )
+            + f" OR COALESCE({privacy_alias}.who_can_see_me, 1) <> 3)",
+            # 与 decide() 保持一致：只拦拒绝(2)/隐藏(3)，审核中(0) 不阻断可见性。
+            "NOT EXISTS (SELECT 1 FROM user_media pending_media "
+            f"WHERE pending_media.user_id = {candidate_alias}.id "
+            "AND pending_media.deleted_at IS NULL "
+            "AND pending_media.review_status IN (2, 3))",
+            "NOT EXISTS (SELECT 1 FROM user_block bl "
+            "WHERE (bl.user_id = :visibility_viewer_id "
+            f"AND bl.target_user_id = {candidate_alias}.id) "
+            f"OR (bl.user_id = {candidate_alias}.id "
+            "AND bl.target_user_id = :visibility_viewer_id))",
+        ]
+        if not skip_completion_gate:
+            parts.insert(2, completion_clause)
+        clause = " AND ".join(parts)
         return SqlPredicate(
             clause=clause,
             params=params,

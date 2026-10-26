@@ -175,7 +175,10 @@ def _build(category: str, search: str | None, min_times: int | None, report_stat
             params["pay_status"] = pay_status
         base = (
             f"FROM user_boost b JOIN users u ON u.id = b.user_id "
-            f"LEFT JOIN users t ON t.id = b.target_user_id WHERE {clause}"
+            f"LEFT JOIN users t ON t.id = b.target_user_id "
+            # user_boost 复用承载「置顶助推」（user_id = target_user_id = 自己）；
+            # 后台「给谁爆灯 / 谁给用户爆灯」都不应把自置顶算成爆灯流水。
+            f"WHERE b.user_id <> b.target_user_id AND {clause}"
         )
         data_sql = (
             f"SELECT b.id AS event_id, b.user_id, {_code('b.user_id')} AS member_code, "

@@ -165,6 +165,11 @@ async def _is_vip(db: AsyncSession, user_id: int) -> bool:
     return await has_active_membership(db, user_id)
 
 
+def _skip_discovery_gates() -> bool:
+    """测试环境专用：是否放开发现链路的异性过滤与资料完整度门禁。"""
+    return settings.discovery_skip_gates_enabled
+
+
 def _visibility_predicate(
     viewer_id: int,
     viewer: dict[str, Any],
@@ -175,6 +180,7 @@ def _visibility_predicate(
     privacy_alias: str = "pr",
     completion_alias: str = "c",
     completion_waiver: CompletionWaiver | None = None,
+    skip_completion_gate: bool = False,
 ) -> SqlPredicate:
     return candidate_visibility_service.predicate(
         ViewerContext(
@@ -187,6 +193,7 @@ def _visibility_predicate(
         privacy_alias=privacy_alias,
         completion_alias=completion_alias,
         completion_waiver=completion_waiver,
+        skip_completion_gate=skip_completion_gate,
     )
 
 
@@ -421,11 +428,13 @@ def _candidate_snapshot(
     can advance through one logical result set without changing its identity.
     """
     scene = VisibilityScene.SEARCH if nickname or tag else VisibilityScene.DISCOVERY
+    skip_gates = _skip_discovery_gates()
     visibility = _visibility_predicate(
         viewer_id,
         viewer,
         viewer_is_vip,
         scene,
+        skip_completion_gate=skip_gates,
     )
     params: dict[str, Any] = {
         "viewer_id": viewer_id,
@@ -444,7 +453,7 @@ def _candidate_snapshot(
         )"""
         )
         params["search_tag"] = tag
-    if viewer.get("gender") in (1, 2):
+    if not skip_gates and viewer.get("gender") in (1, 2):
         clauses.append("u.gender <> :opposite_gender")
         params["opposite_gender"] = viewer["gender"]
     if respect_preferences:
@@ -474,6 +483,8 @@ def _candidate_snapshot(
     viewer_predicate_facts: dict[str, Any] = {
         "gender": viewer.get("gender"),
     }
+    if skip_gates:
+        viewer_predicate_facts["gender"] = None
     if respect_preferences:
         viewer_predicate_facts["partner_preferences"] = {
             "age_min": viewer.get("age_min"),
@@ -488,22 +499,23 @@ def _candidate_snapshot(
                 _json_city_list(viewer.get("preferred_city_codes"))
             ),
         }
-    query_fingerprint = build_query_fingerprint(
-        {
-            "viewer_id": viewer_id,
-            "viewer_realname_status": viewer.get("realname_status") or 0,
-            "viewer_is_vip": viewer_is_vip,
-            "viewer_predicate_facts": viewer_predicate_facts,
-            "scene": scene.value,
-            "plaza": plaza,
-            "respect_preferences": respect_preferences,
-            "nickname": nickname,
-            "tag": tag,
-            "filters": filter_facts,
-            "policy_revision": visibility.policy_revision,
-            "sort_version": SORT_VERSION,
-        }
-    )
+    fingerprint_payload: dict[str, Any] = {
+        "viewer_id": viewer_id,
+        "viewer_realname_status": viewer.get("realname_status") or 0,
+        "viewer_is_vip": viewer_is_vip,
+        "viewer_predicate_facts": viewer_predicate_facts,
+        "scene": scene.value,
+        "plaza": plaza,
+        "respect_preferences": respect_preferences,
+        "nickname": nickname,
+        "tag": tag,
+        "filters": filter_facts,
+        "policy_revision": visibility.policy_revision,
+        "sort_version": SORT_VERSION,
+    }
+    if skip_gates:
+        fingerprint_payload["skip_gates"] = True
+    query_fingerprint = build_query_fingerprint(fingerprint_payload)
     return CandidateQuerySnapshot(
         select_sql=CARD_SELECT + CARD_FROM,
         count_sql="SELECT COUNT(DISTINCT u.id)" + CARD_FROM,
@@ -575,7 +587,7 @@ async def get_discovery_page(db: AsyncSession, viewer_id: int, filters: Discover
     if not await platform_browse_open(db):
         raise HTTPException(403, detail=await platform_maintenance_message(db))
     viewer = await _viewer_context(db, viewer_id)
-    if viewer["completion_score"] < 100:
+    if not _skip_discovery_gates() and viewer["completion_score"] < 100:
         raise HTTPException(403, detail="请先完善资料后再进入推荐")
     _, viewer_is_vip, candidate_page = await _candidate_query_page(
         db, viewer_id, filters, plaza=plaza
@@ -609,7 +621,7 @@ async def search_discovery(db: AsyncSession, viewer_id: int, query: DiscoverySea
         page_size=query.page_size,
     )
     viewer = await _viewer_context(db, viewer_id)
-    if viewer["completion_score"] < 100:
+    if not _skip_discovery_gates() and viewer["completion_score"] < 100:
         raise HTTPException(403, detail="请先完善资料后再搜索用户")
     _, viewer_is_vip, candidate_page = await _candidate_query_page(
         db,
@@ -752,8 +764,9 @@ async def view_profile(db: AsyncSession, viewer_id: int, target_id: int) -> Publ
         raise HTTPException(422, detail="不能浏览自己的名片")
     # 服务红娘代管的会员本就多为半成品，先按代管关系拿到完整度豁免再判可见性。
     waiver = await _serving_matchmaker_waiver(db, viewer_id)
-    await _ensure_target(db, viewer_id, target_id, completion_waiver=waiver)
-    rows = await _target_rows(db, viewer_id, [target_id], completion_waiver=waiver)
+    skip = _skip_discovery_gates()
+    await _ensure_target(db, viewer_id, target_id, completion_waiver=waiver, skip_completion_gate=skip)
+    rows = await _target_rows(db, viewer_id, [target_id], completion_waiver=waiver, skip_completion_gate=skip)
     row = rows.get(target_id)
     if not row:
         raise HTTPException(404, detail="用户不存在或当前不可见")
@@ -790,6 +803,7 @@ async def _target_rows(
     target_ids: list[int],
     *,
     completion_waiver: CompletionWaiver | None = None,
+    skip_completion_gate: bool = False,
 ) -> dict[int, dict[str, Any]]:
     if not target_ids:
         return {}
@@ -801,6 +815,7 @@ async def _target_rows(
         await _is_vip(db, viewer_id),
         VisibilityScene.PROFILE,
         completion_waiver=completion_waiver,
+        skip_completion_gate=skip_completion_gate,
     )
     params = {
         "viewer_id": viewer_id,
@@ -907,10 +922,21 @@ async def _ensure_target(
     target_id: int,
     *,
     completion_waiver: CompletionWaiver | None = None,
+    skip_completion_gate: bool | None = None,
 ) -> None:
+    """Raise 404 when the target is not visible to the viewer.
+
+    ``skip_completion_gate=None`` follows the test-only DISCOVERY_SKIP_GATES
+    switch, so展示链路（推荐/广场/搜索/详情）与交互链路（申请/收藏/爆灯/海报）
+    使用同一套可见性口径：否则测试号在推荐里能看到对方、点进去却是 404。
+    """
+    if skip_completion_gate is None:
+        skip_completion_gate = _skip_discovery_gates()
     if viewer_id == target_id:
         raise HTTPException(422, detail="不能对自己执行此操作")
-    if target_id not in await _target_rows(db, viewer_id, [target_id], completion_waiver=completion_waiver):
+    if target_id not in await _target_rows(
+        db, viewer_id, [target_id], completion_waiver=completion_waiver, skip_completion_gate=skip_completion_gate
+    ):
         raise HTTPException(404, detail="目标用户不存在或当前不可见")
 
 
@@ -1067,7 +1093,7 @@ async def create_application(db: AsyncSession, viewer_id: int, target_id: int, r
     await _ensure_target(db, viewer_id, target_id)
     await _expire_pending_applications(db)
     viewer = await _viewer_context(db, viewer_id)
-    if viewer["completion_score"] < 100:
+    if not _skip_discovery_gates() and viewer["completion_score"] < 100:
         raise HTTPException(403, detail="请先完善资料后再申请认识")
     if not viewer.get("phone"):
         raise HTTPException(403, detail="请先绑定手机号")
@@ -1166,6 +1192,21 @@ async def list_applications(db: AsyncSession, viewer_id: int, incoming: bool, pa
     return ApplicationPage(items=items, page=page, page_size=page_size, total=total, has_more=page * page_size < total)
 
 
+DEFAULT_AUTO_GREETING = "你好呀，我们可以开始聊天啦！"
+
+
+async def _auto_greeting(db: AsyncSession) -> str:
+    """「同意认识申请」后自动发送的问候文案。
+
+    运营可在后台 ``platform_permissions.auto_greeting_template`` 覆盖，
+    未配置/配置为空时回落到 :data:`DEFAULT_AUTO_GREETING`（需求原文用字）。
+    纯文本，不做变量替换：避免在没有消费方时引入模板引擎。
+    """
+    value = await get_runtime_value(db, "platform_permissions", "auto_greeting_template", DEFAULT_AUTO_GREETING)
+    template = "" if value is None else str(value).strip()
+    return template or DEFAULT_AUTO_GREETING
+
+
 async def respond_application(db: AsyncSession, viewer_id: int, application_id: int, accepted: bool, request: ApplicationRejectRequest | None = None) -> ApplicationResponse:
     await _expire_pending_applications(db)
     result = await db.execute(text("SELECT id, from_user_id, to_user_id, message, status, expire_at, created_at FROM match_apply WHERE id = :id AND to_user_id = :user_id FOR UPDATE"), {"id": application_id, "user_id": viewer_id})
@@ -1191,19 +1232,30 @@ async def respond_application(db: AsyncSession, viewer_id: int, application_id: 
         first, second = sorted((row["from_user_id"], row["to_user_id"]))
         session = await db.execute(text("SELECT id FROM chat_session WHERE user1_id = :first AND user2_id = :second LIMIT 1"), {"first": first, "second": second})
         session_id = session.scalar()
-        if not session_id:
+        if session_id:
+            # 复用已有会话时必须复位双方「隐藏」标记（DELETE /chat/sessions/{id} 会把对应列置 1）。
+            # 否则用户此前隐藏过该会话，重新通过申请后聊天列表仍然看不到它，
+            # 与需求「申请通过后这里会显示聊天」直接冲突。
+            await db.execute(text("""UPDATE chat_session
+                SET is_user1_hidden = 0, is_user2_hidden = 0, updated_at = UTC_TIMESTAMP()
+                WHERE id = :session_id"""), {"session_id": session_id})
+        else:
             created_session = await db.execute(text("INSERT INTO chat_session (user1_id, user2_id) VALUES (:first, :second)"), {"first": first, "second": second})
             session_id = int(created_session.lastrowid)
-        greeting = "你们已经互相同意认识，可以开始聊天了。"
+        greeting = await _auto_greeting(db)
+        # 问候去重按幂等键而不是 content：文案一旦调整，content 全等比较会失效并插入第二条。
+        greeting_key = f"accept-greeting:{application_id}"
         existing_greeting = await db.execute(text("""SELECT id FROM chat_message
-            WHERE session_id = :session_id AND type = 6 AND content = :greeting LIMIT 1"""),
-            {"session_id": session_id, "greeting": greeting})
+            WHERE session_id = :session_id AND from_user_id = :from_user_id
+              AND client_message_id = :client_message_id LIMIT 1"""),
+            {"session_id": session_id, "from_user_id": viewer_id, "client_message_id": greeting_key})
         if not existing_greeting.scalar():
             await db.execute(text("""INSERT INTO chat_message
-                (session_id, from_user_id, to_user_id, type, content, is_read)
-                VALUES (:session_id, :from_user_id, :to_user_id, 6, :greeting, 0)"""), {
+                (session_id, from_user_id, to_user_id, type, content, client_message_id, is_read)
+                VALUES (:session_id, :from_user_id, :to_user_id, 6, :greeting, :client_message_id, 0)"""), {
                 "session_id": session_id, "from_user_id": viewer_id,
                 "to_user_id": row["from_user_id"], "greeting": greeting,
+                "client_message_id": greeting_key,
             })
             unread_field = "unread_count_user1" if first == row["from_user_id"] else "unread_count_user2"
             await db.execute(text(f"""UPDATE chat_session SET last_message = :greeting,
@@ -1247,7 +1299,7 @@ async def create_superlike(db: AsyncSession, viewer_id: int, target_id: int, ide
     viewer = viewer_result.mappings().first()
     if not viewer or not viewer["phone"]:
         raise HTTPException(403, detail="请先绑定手机号")
-    if float(viewer["completion_score"] or 0) < 100:
+    if not _skip_discovery_gates() and float(viewer["completion_score"] or 0) < 100:
         raise HTTPException(403, detail="请先完善资料后再爆灯")
     if int(viewer["realname_status"] or 0) != 2:
         raise HTTPException(403, detail="请先完成实名认证后再爆灯")
@@ -1304,7 +1356,9 @@ async def list_superlikes(db: AsyncSession, viewer_id: int, direction: str, page
         "limit": page_size,
         "offset": (page - 1) * page_size,
     }
-    where = f"{owner_field} = :user_id AND {predicate.clause}"
+    # user_boost 同时承载「置顶助推」（order_type=4，写 user_id=target_user_id=自己），
+    # 排除自指记录，否则自己买的置顶会被算成「我给自己爆灯 / 我收到一次爆灯」。
+    where = f"{owner_field} = :user_id AND b.user_id <> b.target_user_id AND {predicate.clause}"
     total = int((await db.execute(text(f"""SELECT COUNT(*) FROM user_boost b
         JOIN users u ON u.id = {other_field}
         LEFT JOIN user_privacy pr ON pr.user_id = u.id
