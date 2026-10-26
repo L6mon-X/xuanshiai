@@ -867,8 +867,16 @@ async def visitor_count(db: AsyncSession, viewer_id: int, target_id: int) -> dic
 
 
 async def _ensure_target(
-    db: AsyncSession, viewer_id: int, target_id: int, *, skip_completion_gate: bool = False
+    db: AsyncSession, viewer_id: int, target_id: int, *, skip_completion_gate: bool | None = None
 ) -> None:
+    """Raise 404 when the target is not visible to the viewer.
+
+    ``skip_completion_gate=None`` follows the test-only DISCOVERY_SKIP_GATES
+    switch, so展示链路（推荐/广场/搜索/详情）与交互链路（申请/收藏/爆灯/海报）
+    使用同一套可见性口径：否则测试号在推荐里能看到对方、点进去却是 404。
+    """
+    if skip_completion_gate is None:
+        skip_completion_gate = _skip_discovery_gates()
     if viewer_id == target_id:
         raise HTTPException(422, detail="不能对自己执行此操作")
     if target_id not in await _target_rows(db, viewer_id, [target_id], skip_completion_gate=skip_completion_gate):
@@ -1028,7 +1036,7 @@ async def create_application(db: AsyncSession, viewer_id: int, target_id: int, r
     await _ensure_target(db, viewer_id, target_id)
     await _expire_pending_applications(db)
     viewer = await _viewer_context(db, viewer_id)
-    if viewer["completion_score"] < 100:
+    if not _skip_discovery_gates() and viewer["completion_score"] < 100:
         raise HTTPException(403, detail="请先完善资料后再申请认识")
     if not viewer.get("phone"):
         raise HTTPException(403, detail="请先绑定手机号")
@@ -1190,7 +1198,7 @@ async def create_superlike(db: AsyncSession, viewer_id: int, target_id: int, ide
     viewer = viewer_result.mappings().first()
     if not viewer or not viewer["phone"]:
         raise HTTPException(403, detail="请先绑定手机号")
-    if float(viewer["completion_score"] or 0) < 100:
+    if not _skip_discovery_gates() and float(viewer["completion_score"] or 0) < 100:
         raise HTTPException(403, detail="请先完善资料后再爆灯")
     if int(viewer["realname_status"] or 0) != 2:
         raise HTTPException(403, detail="请先完成实名认证后再爆灯")
