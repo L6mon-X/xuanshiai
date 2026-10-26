@@ -251,7 +251,8 @@ async def all_behavior(
         base = f"FROM user_favorite f JOIN users u ON u.id = f.user_id LEFT JOIN users t ON t.id = f.target_user_id WHERE {where}"
         data_sql = f"SELECT f.id AS event_id, f.user_id, u.nickname, f.target_user_id, t.nickname AS target_nickname, f.created_at AS occurred_at {base} ORDER BY occurred_at DESC, event_id DESC LIMIT :limit OFFSET :offset"
     elif category == "superlike":
-        where = f"1=1{scope_filter}"
+        # user_boost 复用承载「置顶助推」（user_id = target_user_id = 自己），排除自指记录。
+        where = f"b.user_id <> b.target_user_id{scope_filter}"
         if search:
             where += " AND (u.nickname LIKE CONCAT('%', :search, '%') OR u.phone LIKE CONCAT('%', :search, '%'))"
         base = f"FROM user_boost b JOIN users u ON u.id = b.user_id LEFT JOIN users t ON t.id = b.target_user_id WHERE {where}"

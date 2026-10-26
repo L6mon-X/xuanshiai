@@ -25,10 +25,14 @@ jobs:
       # 全仓 Ruff 存量告警另行收敛；本门禁不跳过这些规则，只限定本阶段改动域。
       - name: Ruff (message and media scope)
         run: uv run --no-sync ruff check app/api/routes/social.py app/api/routes/discovery.py app/services/social.py app/services/media.py app/services/member_follow_up_admin.py scripts/reproduce_upload_exposure.py tests/test_social_features.py tests/test_social_message_idempotency.py tests/test_discovery_features.py tests/test_member_follow_up_media.py
+      # 2026-10-26「优先解决」三项需求改动域：可见性口径统一、同意后会话与系统问候、爆灯统计排除自置顶。
+      # 这些文件此前不在任何 Ruff 列表内，新增/改动后必须纳入，否则 F821 之类的运行期错误逃过 CI。
+      - name: Ruff (discovery, profile and superlike scope)
+        run: uv run --no-sync ruff check app/services/discovery.py app/services/profile.py app/services/member_behavior_admin.py app/services/member_crm_filter.py app/api/routes/member_follow_up_admin.py tests/test_apply_chat_greeting_and_superlike_scope.py
       - name: Message and media unit contracts (no integration/live/manual)
         env:
           UPLOAD_DIR: ${{ runner.temp }}/xuanshiai-uploads
-        run: uv run --no-sync pytest tests/test_social_features.py tests/test_social_message_idempotency.py tests/test_discovery_features.py tests/test_member_follow_up_media.py -q
+        run: uv run --no-sync pytest tests/test_social_features.py tests/test_social_message_idempotency.py tests/test_discovery_features.py tests/test_member_follow_up_media.py tests/test_apply_chat_greeting_and_superlike_scope.py -q
 
   ai-unit:
     runs-on: ubuntu-24.04

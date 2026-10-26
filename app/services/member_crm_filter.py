@@ -37,8 +37,10 @@ BEHAVIOR_TYPE_SQL: dict[str, str] = {
     "viewed": "EXISTS (SELECT 1 FROM user_browse_history bh WHERE bh.user_id = u.id)",
     "viewed_by": "EXISTS (SELECT 1 FROM user_browse_history bh WHERE bh.target_user_id = u.id)",
     "favorited": "EXISTS (SELECT 1 FROM user_favorite bv WHERE bv.user_id = u.id AND bv.type = 2)",
-    "boosted": "EXISTS (SELECT 1 FROM user_boost bo WHERE bo.user_id = u.id)",
-    "boosted_by": "EXISTS (SELECT 1 FROM user_boost bo WHERE bo.target_user_id = u.id)",
+    # user_boost 复用承载「置顶助推」（user_id = target_user_id = 自己），
+    # 两个方向都必须排除自指记录，否则「买过置顶」会被筛成「爆过灯 / 被爆过灯」。
+    "boosted": "EXISTS (SELECT 1 FROM user_boost bo WHERE bo.user_id = u.id AND bo.user_id <> bo.target_user_id)",
+    "boosted_by": "EXISTS (SELECT 1 FROM user_boost bo WHERE bo.target_user_id = u.id AND bo.user_id <> bo.target_user_id)",
     "gift_sent": "EXISTS (SELECT 1 FROM user_gift_record gr WHERE gr.user_id = u.id)",
     "gift_received": "EXISTS (SELECT 1 FROM user_gift_record gr WHERE gr.target_user_id = u.id)",
 }

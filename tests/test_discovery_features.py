@@ -548,6 +548,33 @@ async def test_target_rows_uses_the_realname_visibility_predicate(
 
 
 @pytest.mark.asyncio
+async def test_ensure_target_follows_discovery_skip_gates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """交互链路必须和展示链路共用同一开关，否则测试号会「看得到却申请不到」。"""
+    recorded: dict[str, bool] = {}
+
+    async def fake_target_rows(
+        _db: object, _viewer_id: int, _target_ids: list[int], *, skip_completion_gate: bool = False
+    ) -> dict[int, dict[str, object]]:
+        recorded["skip"] = skip_completion_gate
+        return {}
+
+    monkeypatch.setattr(discovery, "_target_rows", fake_target_rows)
+
+    monkeypatch.setattr(discovery, "_skip_discovery_gates", lambda: True)
+    with pytest.raises(HTTPException) as skipped:
+        await discovery._ensure_target(object(), 1, 22)
+    assert skipped.value.status_code == 404
+    assert recorded["skip"] is True
+
+    monkeypatch.setattr(discovery, "_skip_discovery_gates", lambda: False)
+    with pytest.raises(HTTPException):
+        await discovery._ensure_target(object(), 1, 22)
+    assert recorded["skip"] is False
+
+
+@pytest.mark.asyncio
 async def test_application_list_keeps_ids_alongside_nested_users(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
