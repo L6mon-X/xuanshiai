@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     # member_auto_assign_organization_id 那家门店并进入资料待审；门店 id 不配置时不自动分派，
     # 自然注册的会员只能等在后台手工分派。
     member_auto_assign_organization_id: int | None = Field(default=None, ge=1)
+    # 一键入库生成会员账号时写入的初始登录密码（库里只存 bcrypt 哈希）。
+    # 置空 = 不设密码，新账号只能走手机号验证码/微信登录；改这里要同步后台客源页的入库须知文案。
+    lead_convert_initial_password: str = "abc123"
     superlike_daily_free_limit: int = 1
     superlike_daily_vip_limit: int = 3
     paper_plane_daily_limit: int = 3

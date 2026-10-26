@@ -405,13 +405,15 @@ class WorkspaceMatchCandidatePage(BaseModel):
 
 
 class WorkspaceMatchHistoryItem(BaseModel):
+    """会员的一条牵线记录（matchmaker_introduction），对方视角。"""
+
     id: int
     counterpart_user_id: int
     counterpart_nickname: str
-    status: Literal[0, 1, 2, 3]
+    status: IntroductionStatus
     direction: Literal["OUTGOING", "INCOMING"]
     created_at: datetime
-    responded_at: datetime | None
+    updated_at: datetime
 
 
 class WorkspaceMatchHistoryPage(BaseModel):

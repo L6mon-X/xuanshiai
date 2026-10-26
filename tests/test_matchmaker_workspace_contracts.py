@@ -1,3 +1,4 @@
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 import pytest
@@ -12,6 +13,7 @@ from app.schemas.matchmaker_workspace import (
     WorkspaceMemberReviewUpdate,
 )
 from app.services.customer_lead_contact import normalize_contact
+from app.services.matchmaker_workspace import WorkspaceActor, require_review_authority
 
 
 client = TestClient(app)
@@ -33,6 +35,17 @@ def test_workspace_routes_are_registered_and_require_normal_user_authentication(
     assert expected <= set(paths)
     assert client.get("/api/v1/matchmaker/management-center/access").status_code == 401
     assert paths["/api/v1/matchmaker/workbench/members"]["get"].get("security")
+
+
+def test_public_profile_review_is_limited_to_headquarters_matchmakers() -> None:
+    """审核闸门：只有总店（SUPER）红娘能判定通过/驳回，普通红娘 403。"""
+    headquarters = WorkspaceActor(user_id=2, display_name="总店红娘", level="SUPER", organization_id=None)
+    ordinary = WorkspaceActor(user_id=21, display_name="普通红娘", level="NORMAL", organization_id=None)
+    assert require_review_authority(headquarters) is headquarters
+    with pytest.raises(HTTPException) as excinfo:
+        require_review_authority(ordinary)
+    assert excinfo.value.status_code == 403
+    assert "总店" in excinfo.value.detail
 
 
 def test_workspace_schemas_enforce_non_payment_and_review_boundaries() -> None:
@@ -71,6 +84,13 @@ def test_lead_contact_schemas_normalize_and_require_a_valid_phone() -> None:
     with pytest.raises(ValidationError):
         # 仅提交空白联系方式等价于没有任何修改项。
         CustomerLeadUpdate(wechat="  ")
+
+
+def test_lead_update_accepts_the_source_channel_from_the_create_form() -> None:
+    """后台「编辑客源」与录入同一套表单，来源必须可改；空白来源仍是无效输入。"""
+    assert CustomerLeadUpdate(source="本地群").model_dump(exclude_unset=True) == {"source": "本地群"}
+    with pytest.raises(ValidationError):
+        CustomerLeadUpdate(source="")
 
 
 def test_normalize_contact_treats_blank_as_missing() -> None:

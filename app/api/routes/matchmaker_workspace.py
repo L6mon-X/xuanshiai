@@ -105,6 +105,7 @@ from app.services.matchmaker_workspace import (
     list_member_follow_ups,
     list_workspace_leads,
     list_workspace_members,
+    require_review_authority,
     require_workspace,
     restore_workspace_lead,
     review_workspace_member,
@@ -332,7 +333,8 @@ async def review_workbench_member(
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> WorkspaceMember:
-    return await review_workspace_member(db, await require_workspace(db, current), member_id, body)
+    actor = require_review_authority(await require_workspace(db, current))
+    return await review_workspace_member(db, actor, member_id, body)
 
 
 @router.get(
@@ -529,7 +531,11 @@ async def workbench_match_candidates(
     return await list_match_candidates(db, await require_workspace(db, current), member_id, page, page_size)
 
 
-@router.get("/workbench/members/{member_id}/match-history", response_model=WorkspaceMatchHistoryPage, summary="查询只读牵线历史")
+@router.get(
+    "/workbench/members/{member_id}/match-history",
+    response_model=WorkspaceMatchHistoryPage,
+    summary="查询会员的牵线记录（只读，数据源为 matchmaker_introduction）",
+)
 async def workbench_match_history(
     member_id: int = Path(..., ge=1),
     page: int = Query(1, ge=1, le=1000),
