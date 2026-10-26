@@ -160,6 +160,11 @@ async def _is_vip(db: AsyncSession, user_id: int) -> bool:
     return await has_active_membership(db, user_id)
 
 
+def _skip_discovery_gates() -> bool:
+    """测试环境专用：是否放开发现链路的异性过滤与资料完整度门禁。"""
+    return settings.discovery_skip_gates_enabled
+
+
 def _visibility_predicate(
     viewer_id: int,
     viewer: dict[str, Any],
@@ -169,6 +174,7 @@ def _visibility_predicate(
     candidate_alias: str = "u",
     privacy_alias: str = "pr",
     completion_alias: str = "c",
+    skip_completion_gate: bool = False,
 ) -> SqlPredicate:
     return candidate_visibility_service.predicate(
         ViewerContext(
@@ -180,6 +186,7 @@ def _visibility_predicate(
         candidate_alias=candidate_alias,
         privacy_alias=privacy_alias,
         completion_alias=completion_alias,
+        skip_completion_gate=skip_completion_gate,
     )
 
 
@@ -385,11 +392,13 @@ def _candidate_snapshot(
     can advance through one logical result set without changing its identity.
     """
     scene = VisibilityScene.SEARCH if nickname or tag else VisibilityScene.DISCOVERY
+    skip_gates = _skip_discovery_gates()
     visibility = _visibility_predicate(
         viewer_id,
         viewer,
         viewer_is_vip,
         scene,
+        skip_completion_gate=skip_gates,
     )
     params: dict[str, Any] = {
         "viewer_id": viewer_id,
@@ -408,7 +417,7 @@ def _candidate_snapshot(
         )"""
         )
         params["search_tag"] = tag
-    if viewer.get("gender") in (1, 2):
+    if not skip_gates and viewer.get("gender") in (1, 2):
         clauses.append("u.gender <> :opposite_gender")
         params["opposite_gender"] = viewer["gender"]
     if respect_preferences:
@@ -438,6 +447,8 @@ def _candidate_snapshot(
     viewer_predicate_facts: dict[str, Any] = {
         "gender": viewer.get("gender"),
     }
+    if skip_gates:
+        viewer_predicate_facts["gender"] = None
     if respect_preferences:
         viewer_predicate_facts["partner_preferences"] = {
             "age_min": viewer.get("age_min"),
@@ -452,22 +463,23 @@ def _candidate_snapshot(
                 _json_city_list(viewer.get("preferred_city_codes"))
             ),
         }
-    query_fingerprint = build_query_fingerprint(
-        {
-            "viewer_id": viewer_id,
-            "viewer_realname_status": viewer.get("realname_status") or 0,
-            "viewer_is_vip": viewer_is_vip,
-            "viewer_predicate_facts": viewer_predicate_facts,
-            "scene": scene.value,
-            "plaza": plaza,
-            "respect_preferences": respect_preferences,
-            "nickname": nickname,
-            "tag": tag,
-            "filters": filter_facts,
-            "policy_revision": visibility.policy_revision,
-            "sort_version": SORT_VERSION,
-        }
-    )
+    fingerprint_payload: dict[str, Any] = {
+        "viewer_id": viewer_id,
+        "viewer_realname_status": viewer.get("realname_status") or 0,
+        "viewer_is_vip": viewer_is_vip,
+        "viewer_predicate_facts": viewer_predicate_facts,
+        "scene": scene.value,
+        "plaza": plaza,
+        "respect_preferences": respect_preferences,
+        "nickname": nickname,
+        "tag": tag,
+        "filters": filter_facts,
+        "policy_revision": visibility.policy_revision,
+        "sort_version": SORT_VERSION,
+    }
+    if skip_gates:
+        fingerprint_payload["skip_gates"] = True
+    query_fingerprint = build_query_fingerprint(fingerprint_payload)
     return CandidateQuerySnapshot(
         select_sql=CARD_SELECT + CARD_FROM,
         count_sql="SELECT COUNT(DISTINCT u.id)" + CARD_FROM,
@@ -539,7 +551,7 @@ async def get_discovery_page(db: AsyncSession, viewer_id: int, filters: Discover
     if not await platform_browse_open(db):
         raise HTTPException(403, detail=await platform_maintenance_message(db))
     viewer = await _viewer_context(db, viewer_id)
-    if viewer["completion_score"] < 100:
+    if not _skip_discovery_gates() and viewer["completion_score"] < 100:
         raise HTTPException(403, detail="请先完善资料后再进入推荐")
     _, viewer_is_vip, candidate_page = await _candidate_query_page(
         db, viewer_id, filters, plaza=plaza
@@ -573,7 +585,7 @@ async def search_discovery(db: AsyncSession, viewer_id: int, query: DiscoverySea
         page_size=query.page_size,
     )
     viewer = await _viewer_context(db, viewer_id)
-    if viewer["completion_score"] < 100:
+    if not _skip_discovery_gates() and viewer["completion_score"] < 100:
         raise HTTPException(403, detail="请先完善资料后再搜索用户")
     _, viewer_is_vip, candidate_page = await _candidate_query_page(
         db,
@@ -714,8 +726,9 @@ async def view_profile(db: AsyncSession, viewer_id: int, target_id: int) -> Publ
         raise HTTPException(403, detail=await platform_maintenance_message(db))
     if viewer_id == target_id:
         raise HTTPException(422, detail="不能浏览自己的名片")
-    await _ensure_target(db, viewer_id, target_id)
-    rows = await _target_rows(db, viewer_id, [target_id])
+    skip = _skip_discovery_gates()
+    await _ensure_target(db, viewer_id, target_id, skip_completion_gate=skip)
+    rows = await _target_rows(db, viewer_id, [target_id], skip_completion_gate=skip)
     row = rows.get(target_id)
     if not row:
         raise HTTPException(404, detail="用户不存在或当前不可见")
@@ -740,7 +753,9 @@ async def view_profile(db: AsyncSession, viewer_id: int, target_id: int) -> Publ
     return PublicProfileResponse(user_id=target_id, card=card, profile=profile, is_vip_viewer=vip, browse_quota_remaining=quota, can_apply=viewer["completion_score"] >= 100)
 
 
-async def _target_rows(db: AsyncSession, viewer_id: int, target_ids: list[int]) -> dict[int, dict[str, Any]]:
+async def _target_rows(
+    db: AsyncSession, viewer_id: int, target_ids: list[int], *, skip_completion_gate: bool = False
+) -> dict[int, dict[str, Any]]:
     if not target_ids:
         return {}
     placeholders = ", ".join(f":target_{index}" for index in range(len(target_ids)))
@@ -750,6 +765,7 @@ async def _target_rows(db: AsyncSession, viewer_id: int, target_ids: list[int]) 
         viewer,
         await _is_vip(db, viewer_id),
         VisibilityScene.PROFILE,
+        skip_completion_gate=skip_completion_gate,
     )
     params = {
         "viewer_id": viewer_id,
@@ -850,10 +866,12 @@ async def visitor_count(db: AsyncSession, viewer_id: int, target_id: int) -> dic
     return {"user_id": target_id, "visitor_count": int(result.scalar() or 0)}
 
 
-async def _ensure_target(db: AsyncSession, viewer_id: int, target_id: int) -> None:
+async def _ensure_target(
+    db: AsyncSession, viewer_id: int, target_id: int, *, skip_completion_gate: bool = False
+) -> None:
     if viewer_id == target_id:
         raise HTTPException(422, detail="不能对自己执行此操作")
-    if target_id not in await _target_rows(db, viewer_id, [target_id]):
+    if target_id not in await _target_rows(db, viewer_id, [target_id], skip_completion_gate=skip_completion_gate):
         raise HTTPException(404, detail="目标用户不存在或当前不可见")
 
 

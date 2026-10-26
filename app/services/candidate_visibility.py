@@ -211,52 +211,53 @@ class CandidateVisibilityService:
         candidate_alias: str = "u",
         privacy_alias: str = "pr",
         completion_alias: str = "c",
+        skip_completion_gate: bool = False,
     ) -> SqlPredicate:
         for alias in (candidate_alias, privacy_alias, completion_alias):
             if not _SQL_ALIAS.fullmatch(alias):
                 raise ValueError("invalid SQL alias")
-        clause = " AND ".join(
-            (
-                f"{candidate_alias}.id <> :visibility_viewer_id",
-                f"{candidate_alias}.status = 1",
-                f"COALESCE({completion_alias}.score, 0) >= 100",
-                "NOT EXISTS (SELECT 1 FROM user_restriction ban "
-                f"WHERE ban.user_id = {candidate_alias}.id "
-                "AND ban.restriction_type = 'TOTAL_BAN' AND ban.status = 1 "
-                "AND ban.starts_at <= UTC_TIMESTAMP() "
-                "AND (ban.ends_at IS NULL OR ban.ends_at > UTC_TIMESTAMP()))",
-                f"COALESCE({privacy_alias}.show_profile, 1) = 1",
-                f"COALESCE({privacy_alias}.match_status, 1) = 1",
-                # profile_visibility：只有白名单档位放行；friends 要求双方已匹配。
-                f"COALESCE({privacy_alias}.profile_visibility, 'all') IN ('all', 'friends', 'only_me')",
-                f"COALESCE({privacy_alias}.profile_visibility, 'all') <> 'only_me'",
-                "("
-                f"COALESCE({privacy_alias}.profile_visibility, 'all') <> 'friends' "
-                "OR EXISTS (SELECT 1 FROM user_match vm "
-                "WHERE vm.status IN (1, 2) "
-                f"AND ((vm.user_id = :visibility_viewer_id AND vm.target_user_id = {candidate_alias}.id) "
-                f"OR (vm.user_id = {candidate_alias}.id AND vm.target_user_id = :visibility_viewer_id)))"
-                ")",
-                f"COALESCE({privacy_alias}.who_can_see_me, 1) IN (1, 2, 3)",
-                "(:visibility_realname_status = 2 "
-                f"OR COALESCE({privacy_alias}.who_can_see_me, 1) <> 2)",
-                "("
-                + active_membership_exists_sql(
-                    membership_alias="visibility_membership",
-                    user_id_param="visibility_viewer_id",
-                )
-                + f" OR COALESCE({privacy_alias}.who_can_see_me, 1) <> 3)",
-                "NOT EXISTS (SELECT 1 FROM user_media pending_media "
-                f"WHERE pending_media.user_id = {candidate_alias}.id "
-                "AND pending_media.deleted_at IS NULL "
-                "AND pending_media.review_status IN (0, 2, 3))",
-                "NOT EXISTS (SELECT 1 FROM user_block bl "
-                "WHERE (bl.user_id = :visibility_viewer_id "
-                f"AND bl.target_user_id = {candidate_alias}.id) "
-                f"OR (bl.user_id = {candidate_alias}.id "
-                "AND bl.target_user_id = :visibility_viewer_id))",
+        parts: list[str] = [
+            f"{candidate_alias}.id <> :visibility_viewer_id",
+            f"{candidate_alias}.status = 1",
+            "NOT EXISTS (SELECT 1 FROM user_restriction ban "
+            f"WHERE ban.user_id = {candidate_alias}.id "
+            "AND ban.restriction_type = 'TOTAL_BAN' AND ban.status = 1 "
+            "AND ban.starts_at <= UTC_TIMESTAMP() "
+            "AND (ban.ends_at IS NULL OR ban.ends_at > UTC_TIMESTAMP()))",
+            f"COALESCE({privacy_alias}.show_profile, 1) = 1",
+            f"COALESCE({privacy_alias}.match_status, 1) = 1",
+            # profile_visibility：只有白名单档位放行；friends 要求双方已匹配。
+            f"COALESCE({privacy_alias}.profile_visibility, 'all') IN ('all', 'friends', 'only_me')",
+            f"COALESCE({privacy_alias}.profile_visibility, 'all') <> 'only_me'",
+            "("
+            f"COALESCE({privacy_alias}.profile_visibility, 'all') <> 'friends' "
+            "OR EXISTS (SELECT 1 FROM user_match vm "
+            "WHERE vm.status IN (1, 2) "
+            f"AND ((vm.user_id = :visibility_viewer_id AND vm.target_user_id = {candidate_alias}.id) "
+            f"OR (vm.user_id = {candidate_alias}.id AND vm.target_user_id = :visibility_viewer_id)))"
+            ")",
+            f"COALESCE({privacy_alias}.who_can_see_me, 1) IN (1, 2, 3)",
+            "(:visibility_realname_status = 2 "
+            f"OR COALESCE({privacy_alias}.who_can_see_me, 1) <> 2)",
+            "("
+            + active_membership_exists_sql(
+                membership_alias="visibility_membership",
+                user_id_param="visibility_viewer_id",
             )
-        )
+            + f" OR COALESCE({privacy_alias}.who_can_see_me, 1) <> 3)",
+            "NOT EXISTS (SELECT 1 FROM user_media pending_media "
+            f"WHERE pending_media.user_id = {candidate_alias}.id "
+            "AND pending_media.deleted_at IS NULL "
+            "AND pending_media.review_status IN (0, 2, 3))",
+            "NOT EXISTS (SELECT 1 FROM user_block bl "
+            "WHERE (bl.user_id = :visibility_viewer_id "
+            f"AND bl.target_user_id = {candidate_alias}.id) "
+            f"OR (bl.user_id = {candidate_alias}.id "
+            "AND bl.target_user_id = :visibility_viewer_id))",
+        ]
+        if not skip_completion_gate:
+            parts.insert(2, f"COALESCE({completion_alias}.score, 0) >= 100")
+        clause = " AND ".join(parts)
         return SqlPredicate(
             clause=clause,
             params={
