@@ -1,3 +1,5 @@
+import inspect
+
 import pytest
 
 from app.services.candidate_visibility import (
@@ -324,3 +326,26 @@ def test_sql_predicate_enforces_profile_visibility() -> None:
     assert "user_match vm" in predicate.clause
     assert "vm.status IN (1, 2)" in predicate.clause
     assert predicate.clause.count("(") == predicate.clause.count(")")
+
+
+def test_sql_predicate_only_excludes_rejected_or_hidden_media() -> None:
+    """审核中(0) 不得阻断可见性：公开资料的图片过滤由资料序列化层负责。
+
+    背景：上传头像/照片写入 review_status=0，若把 0 也算作未通过，用户传完图
+    就会立刻从推荐流与详情页消失，且前端无任何提示。
+    """
+    predicate = CandidateVisibilityService().predicate(
+        ViewerContext(user_id=1, realname_status=2, is_vip=True),
+        VisibilityScene.DISCOVERY,
+    )
+
+    assert "pending_media.review_status IN (2, 3)" in predicate.clause
+    assert "review_status IN (0, 2, 3)" not in predicate.clause
+
+
+def test_object_decision_only_excludes_rejected_or_hidden_media() -> None:
+    """对象级 decide() 与列表谓词必须同口径，否则会出现「列表可见、详情 404」。"""
+    source = inspect.getsource(CandidateVisibilityService.decide)
+
+    assert "review_status IN (2, 3)" in source
+    assert "review_status IN (0, 2, 3)" not in source
