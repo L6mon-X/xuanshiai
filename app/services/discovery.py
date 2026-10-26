@@ -1133,6 +1133,21 @@ async def list_applications(db: AsyncSession, viewer_id: int, incoming: bool, pa
     return ApplicationPage(items=items, page=page, page_size=page_size, total=total, has_more=page * page_size < total)
 
 
+DEFAULT_AUTO_GREETING = "你好呀，我们可以开始聊天啦！"
+
+
+async def _auto_greeting(db: AsyncSession) -> str:
+    """「同意认识申请」后自动发送的问候文案。
+
+    运营可在后台 ``platform_permissions.auto_greeting_template`` 覆盖，
+    未配置/配置为空时回落到 :data:`DEFAULT_AUTO_GREETING`（需求原文用字）。
+    纯文本，不做变量替换：避免在没有消费方时引入模板引擎。
+    """
+    value = await get_runtime_value(db, "platform_permissions", "auto_greeting_template", DEFAULT_AUTO_GREETING)
+    template = "" if value is None else str(value).strip()
+    return template or DEFAULT_AUTO_GREETING
+
+
 async def respond_application(db: AsyncSession, viewer_id: int, application_id: int, accepted: bool, request: ApplicationRejectRequest | None = None) -> ApplicationResponse:
     await _expire_pending_applications(db)
     result = await db.execute(text("SELECT id, from_user_id, to_user_id, message, status, expire_at, created_at FROM match_apply WHERE id = :id AND to_user_id = :user_id FOR UPDATE"), {"id": application_id, "user_id": viewer_id})
@@ -1150,19 +1165,30 @@ async def respond_application(db: AsyncSession, viewer_id: int, application_id: 
         first, second = sorted((row["from_user_id"], row["to_user_id"]))
         session = await db.execute(text("SELECT id FROM chat_session WHERE user1_id = :first AND user2_id = :second LIMIT 1"), {"first": first, "second": second})
         session_id = session.scalar()
-        if not session_id:
+        if session_id:
+            # 复用已有会话时必须复位双方「隐藏」标记（DELETE /chat/sessions/{id} 会把对应列置 1）。
+            # 否则用户此前隐藏过该会话，重新通过申请后聊天列表仍然看不到它，
+            # 与需求「申请通过后这里会显示聊天」直接冲突。
+            await db.execute(text("""UPDATE chat_session
+                SET is_user1_hidden = 0, is_user2_hidden = 0, updated_at = UTC_TIMESTAMP()
+                WHERE id = :session_id"""), {"session_id": session_id})
+        else:
             created_session = await db.execute(text("INSERT INTO chat_session (user1_id, user2_id) VALUES (:first, :second)"), {"first": first, "second": second})
             session_id = int(created_session.lastrowid)
-        greeting = "你们已经互相同意认识，可以开始聊天了。"
+        greeting = await _auto_greeting(db)
+        # 问候去重按幂等键而不是 content：文案一旦调整，content 全等比较会失效并插入第二条。
+        greeting_key = f"accept-greeting:{application_id}"
         existing_greeting = await db.execute(text("""SELECT id FROM chat_message
-            WHERE session_id = :session_id AND type = 6 AND content = :greeting LIMIT 1"""),
-            {"session_id": session_id, "greeting": greeting})
+            WHERE session_id = :session_id AND from_user_id = :from_user_id
+              AND client_message_id = :client_message_id LIMIT 1"""),
+            {"session_id": session_id, "from_user_id": viewer_id, "client_message_id": greeting_key})
         if not existing_greeting.scalar():
             await db.execute(text("""INSERT INTO chat_message
-                (session_id, from_user_id, to_user_id, type, content, is_read)
-                VALUES (:session_id, :from_user_id, :to_user_id, 6, :greeting, 0)"""), {
+                (session_id, from_user_id, to_user_id, type, content, client_message_id, is_read)
+                VALUES (:session_id, :from_user_id, :to_user_id, 6, :greeting, :client_message_id, 0)"""), {
                 "session_id": session_id, "from_user_id": viewer_id,
                 "to_user_id": row["from_user_id"], "greeting": greeting,
+                "client_message_id": greeting_key,
             })
             unread_field = "unread_count_user1" if first == row["from_user_id"] else "unread_count_user2"
             await db.execute(text(f"""UPDATE chat_session SET last_message = :greeting,
@@ -1255,7 +1281,9 @@ async def list_superlikes(db: AsyncSession, viewer_id: int, direction: str, page
         "limit": page_size,
         "offset": (page - 1) * page_size,
     }
-    where = f"{owner_field} = :user_id AND {predicate.clause}"
+    # user_boost 同时承载「置顶助推」（order_type=4，写 user_id=target_user_id=自己），
+    # 排除自指记录，否则自己买的置顶会被算成「我给自己爆灯 / 我收到一次爆灯」。
+    where = f"{owner_field} = :user_id AND b.user_id <> b.target_user_id AND {predicate.clause}"
     total = int((await db.execute(text(f"""SELECT COUNT(*) FROM user_boost b
         JOIN users u ON u.id = {other_field}
         LEFT JOIN user_privacy pr ON pr.user_id = u.id
