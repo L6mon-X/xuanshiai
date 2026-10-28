@@ -8,7 +8,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.core.profile_tags import ALL_TAG_OPTIONS, TAG_OPTIONS_BY_CATEGORY, LEGACY_TAG_OPTIONS_BY_CATEGORY, PERSONALITY_OPTIONS, MAX_PERSONAL_TAGS, MAX_CUSTOM_TAGS, CUSTOM_TAG_MIN_LENGTH, CUSTOM_TAG_MAX_LENGTH, normalize_custom_tag, validate_personal_tag_selection
+from app.core import tag_catalog
+from app.core.profile_tags import LEGACY_TAG_OPTIONS_BY_CATEGORY, MAX_PERSONAL_TAGS, MAX_CUSTOM_TAGS, CUSTOM_TAG_MIN_LENGTH, CUSTOM_TAG_MAX_LENGTH, normalize_custom_tag, validate_personal_tag_selection
 
 
 MbtiType = Literal[
@@ -142,6 +143,24 @@ class ProfileUpdateRequest(BaseModel):
     residence_province_code: str | None = Field(default=None, max_length=32)
     residence_city_code: str | None = Field(default=None, max_length=32)
     residence_district_code: str | None = Field(default=None, max_length=32)
+    # —— 详细资料（2026-10-27，与后台会员管理同一套字段口径）——
+    # 注意：column 名必须与目标表列名逐字一致 —— update_profile 直接把键名
+    # 拼进 SQL（无列白名单），拼错会 Unknown column 500。
+    constellation: str | None = Field(default=None, max_length=16)
+    zodiac: str | None = Field(default=None, max_length=16)
+    household: str | None = Field(default=None, max_length=128)
+    household_province_code: str | None = Field(default=None, max_length=32)
+    household_city_code: str | None = Field(default=None, max_length=32)
+    household_district_code: str | None = Field(default=None, max_length=32)
+    ethnicity: str | None = Field(default=None, max_length=32)
+    house: str | None = Field(default=None, max_length=32)
+    car: str | None = Field(default=None, max_length=32)
+    smoking: str | None = Field(default=None, max_length=32)
+    drinking: str | None = Field(default=None, max_length=32)
+    religion: str | None = Field(default=None, max_length=32)
+    # school / company 落 user_auth（不在 user_profile），由 update_profile 单列更新
+    school: str | None = Field(default=None, max_length=128)
+    company: str | None = Field(default=None, max_length=128)
     self_intro: str | None = Field(default=None, max_length=500)
     personal_tags: list[str] | None = Field(
         default=None, max_length=MAX_PERSONAL_TAGS,
@@ -181,25 +200,28 @@ class ProfileUpdateRequest(BaseModel):
                 return validate_personal_tag_selection(value)
             if len(value) != len(set(value)):
                 raise ValueError("标签不能重复")
-            if any(tag not in ALL_TAG_OPTIONS for tag in value):
+            if any(tag not in tag_catalog.all_tag_options() for tag in value):
                 raise ValueError("只能选择当前目录中的兴趣标签")
         return value
 
     @model_validator(mode="after")
     def validate_tag_fields(self) -> ProfileUpdateRequest:
+        all_options = tag_catalog.all_tag_options()
+        personality = tag_catalog.personality_options()
+        by_category = tag_catalog.options_by_category()
         if "personal_tags" in self.model_fields_set:
             if self.personal_tags is None:
                 raise ValueError("personal_tags 不能为 null，清空请传 []")
             if self.model_fields_set & {"interest_tags", "personality_tags", "tag_selections"}:
                 raise ValueError("personal_tags 不能与旧标签字段同时提交")
-            custom = [tag for tag in self.personal_tags if tag not in ALL_TAG_OPTIONS]
+            custom = [tag for tag in self.personal_tags if tag not in all_options]
             raw_categories = self.custom_tag_categories or {}
             normalized_categories: dict[str, str] = {}
             for raw_label, category in raw_categories.items():
                 label = normalize_custom_tag(raw_label)
-                if label in ALL_TAG_OPTIONS:
+                if label in all_options:
                     raise ValueError("系统标签无需提交自定义分区")
-                if category not in TAG_OPTIONS_BY_CATEGORY:
+                if category not in by_category:
                     raise ValueError(f"不支持的自定义标签分区: {category}")
                 if label.casefold() in {item.casefold() for item in normalized_categories}:
                     raise ValueError("自定义标签分区不能重复")
@@ -212,9 +234,9 @@ class ProfileUpdateRequest(BaseModel):
             }
         elif "custom_tag_categories" in self.model_fields_set:
             raise ValueError("custom_tag_categories 必须与 personal_tags 同时提交")
-        if any(tag in PERSONALITY_OPTIONS for tag in self.interest_tags or []):
+        if any(tag in personality for tag in self.interest_tags or []):
             raise ValueError("性格标签请通过 personal_tags 或 personality_tags 提交")
-        if any(tag not in PERSONALITY_OPTIONS for tag in self.personality_tags or []):
+        if any(tag not in personality for tag in self.personality_tags or []):
             raise ValueError("personality_tags 只能包含性格标签")
         if self.qa_answers is not None:
             ids = [item.question_id for item in self.qa_answers]
@@ -228,7 +250,7 @@ class ProfileUpdateRequest(BaseModel):
         if value is None:
             return value
         for category, selected in value.items():
-            current = TAG_OPTIONS_BY_CATEGORY.get(category, frozenset())
+            current = tag_catalog.options_by_category().get(category, frozenset())
             legacy = LEGACY_TAG_OPTIONS_BY_CATEGORY.get(category, frozenset())
             if not current and not legacy:
                 raise ValueError(f"不支持的标签分类: {category}")
@@ -297,6 +319,23 @@ class ProfileResponse(BaseModel):
     residence_city_code: str | None
     residence_district_code: str | None
     residence_display: str | None = None
+    # —— 详细资料 12 项（2026-10-27）——
+    constellation: str | None = None
+    zodiac: str | None = None
+    household: str | None = None
+    household_display: str | None = None
+    household_province_code: str | None = None
+    household_city_code: str | None = None
+    household_district_code: str | None = None
+    ethnicity: str | None = None
+    house: str | None = None
+    car: str | None = None
+    smoking: str | None = None
+    drinking: str | None = None
+    religion: str | None = None
+    marriage_plan: str | None = None
+    school: str | None = None
+    company: str | None = None
     self_intro: str | None
     qa_answers: list[ProfileQaAnswer] = Field(default_factory=list, description="关于我问答，不计资料完整度")
     personal_tags: list[str] = Field(default_factory=list, description="合并去重后的有效兴趣标签")
@@ -440,6 +479,15 @@ class PreferenceUpdateRequest(BaseModel):
     dating_goal: Literal["倾向恋爱", "倾向结婚"] | None = None
     meeting_pace: Literal["倾向尽快见面", "真诚高效", "了解清楚再见面", "都行看对方的见面意愿"] | None = None
     children_intention: Literal["想要孩子", "看情况决定是否要孩子", "不想要孩子"] | None = None
+    # —— 后台会员管理同一套单选口径（2026-10-27），列已存在于 user_partner_preference ——
+    income_range: str | None = Field(default=None, max_length=32)
+    education_requirement: str | None = Field(default=None, max_length=32)
+    marriage_requirement: str | None = Field(default=None, max_length=32)
+    housing_expectation: str | None = Field(default=None, max_length=32)
+    smoking_expectation: str | None = Field(default=None, max_length=32)
+    drinking_expectation: str | None = Field(default=None, max_length=32)
+    marriage_timeline: str | None = Field(default=None, max_length=32)
+    preferred_occupation: str | None = Field(default=None, max_length=128)
     extra_requirement: str | None = Field(default=None, max_length=255)
 
     @model_validator(mode="after")
@@ -460,9 +508,11 @@ class PreferenceResponse(BaseModel):
     education_min: int | None
     income_min: float | None
     marriage_status: int | None
-    occupation_requirement: str | None
-    marriage_accept: str | None
-    wedding_plan: str | None
+    # 这三列只在会员侧有；未入库客源的暂存表 customer_lead_preference 没有它们，
+    # 读取时按「未填」返回，所以给默认值而不是必填——否则暂存表整行反序列化 500。
+    occupation_requirement: str | None = None
+    marriage_accept: str | None = None
+    wedding_plan: str | None = None
     preferred_province_code: str | None
     preferred_city_codes: list[str]
     accept_long_distance: bool
@@ -473,6 +523,15 @@ class PreferenceResponse(BaseModel):
     dating_goal: str | None
     meeting_pace: str | None
     children_intention: str | None
+    # —— 后台会员管理同一套单选口径（2026-10-27）——
+    income_range: str | None = None
+    education_requirement: str | None = None
+    marriage_requirement: str | None = None
+    housing_expectation: str | None = None
+    smoking_expectation: str | None = None
+    drinking_expectation: str | None = None
+    marriage_timeline: str | None = None
+    preferred_occupation: str | None = None
     extra_requirement: str | None
 
 

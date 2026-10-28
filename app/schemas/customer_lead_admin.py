@@ -5,10 +5,12 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.schemas.auth import PreferenceResponse
+
 
 LeadStatus = Literal["NEW", "CONTACTED", "INTENDED", "CONVERTED", "LOST", "CLOSED"]
-# 客源审核状态：active 有效 / pending 待核
-LeadAuditStatus = Literal["active", "pending"]
+# 客源审核状态：active 有效 / pending 待核 / rejected 无效
+LeadAuditStatus = Literal["active", "pending", "rejected"]
 # 入库后会员公开资料的审核状态
 LeadReviewStatus = Literal["PENDING", "PASSED", "REJECTED"]
 # 客源性别（A13）：0未知 1男 2女，与 users.gender 同语义
@@ -31,26 +33,16 @@ class CustomerLeadCreate(BaseModel):
     source: str = Field(min_length=1, max_length=64)
     photo: str | None = Field(default=None, max_length=512)
     birthday: date | None = None
-    intention_level: Literal[1, 2, 3] = 1
+    intention_level: Literal[1, 2, 3, 4, 5, 6, 7] = 1
     gender: LeadGender = Field(default=0, description="性别 0未知 1男 2女（A13）")
     remark: str | None = Field(default=None, max_length=2000)
     promoter_id: int | None = Field(default=None, ge=1, description="推广红娘用户ID")
     audit_status: LeadAuditStatus = "active"
-    tags: list[str] = Field(default_factory=list, max_length=20, description="客源标签名称")
 
     @field_validator("phone", "wechat", mode="before")
     @classmethod
     def normalize_contact(cls, value: object) -> object:
         return _strip_contact(value)
-
-    @field_validator("tags", mode="before")
-    @classmethod
-    def normalize_tags(cls, value: object) -> object:
-        if value is None:
-            return []
-        if isinstance(value, str):
-            return [item.strip() for item in value.split(",") if item.strip()]
-        return value
 
     @model_validator(mode="after")
     def require_phone(self) -> "CustomerLeadCreate":
@@ -69,15 +61,13 @@ class CustomerLeadUpdate(BaseModel):
     source: str | None = Field(default=None, min_length=1, max_length=64)
     photo: str | None = Field(default=None, max_length=512)
     birthday: date | None = None
-    intention_level: Literal[1, 2, 3] | None = None
+    intention_level: Literal[1, 2, 3, 4, 5, 6, 7] | None = None
     gender: LeadGender | None = None
     status: LeadStatus | None = None
     remark: str | None = Field(default=None, max_length=2000)
     next_follow_at: datetime | None = None
     promoter_id: int | None = Field(default=None, ge=1)
     audit_status: LeadAuditStatus | None = None
-    # 追加标签，不清空已有标签（批量打标签用）。空数组视为不改动标签。
-    tags: list[str] = Field(default_factory=list, max_length=20, description="追加的客源标签名称")
 
     @model_validator(mode="before")
     @classmethod
@@ -100,7 +90,25 @@ class CustomerLeadUpdate(BaseModel):
         # 显式传 phone=null/"" 会被归一化成 None：那等于把线索改成联系不上人的死数据。
         if "phone" in self.model_fields_set and not self.phone:
             raise ValueError("手机号不能清空，只能改成有效的 11 位手机号")
-        if not self.tags and all(value is None for value in (self.name, self.real_name, self.phone, self.wechat, self.source, self.photo, self.gender, self.birthday, self.intention_level, self.status, self.remark, self.next_follow_at, self.promoter_id, self.audit_status)):
+        if all(
+            value is None
+            for value in (
+                self.name,
+                self.real_name,
+                self.phone,
+                self.wechat,
+                self.source,
+                self.photo,
+                self.gender,
+                self.birthday,
+                self.intention_level,
+                self.status,
+                self.remark,
+                self.next_follow_at,
+                self.promoter_id,
+                self.audit_status,
+            )
+        ):
             raise ValueError("至少提供一个需要修改的字段")
         return self
 
@@ -119,7 +127,7 @@ class CustomerLeadAssignment(BaseModel):
 class CustomerLeadFollowUpCreate(BaseModel):
     method: Literal["PHONE", "WECHAT", "VISIT", "OTHER"]
     content: str = Field(min_length=1, max_length=2000)
-    intention_level: Literal[1, 2, 3] | None = None
+    intention_level: Literal[1, 2, 3, 4, 5, 6, 7] | None = None
     next_follow_at: datetime | None = None
 
 
@@ -141,16 +149,15 @@ class CustomerLead(BaseModel):
     phone: str | None
     wechat: str | None
     source: str
-    photo: str | None
-    birthday: date | None
-    intention_level: Literal[1, 2, 3]
+    photo: str | None = None
+    birthday: date | None = None
+    intention_level: Literal[1, 2, 3, 4, 5, 6, 7]
     gender: LeadGender = 0
     status: LeadStatus
     audit_status: LeadAuditStatus = "active"
     matchmaker_id: int | None
     organization_id: int | None
     promoter_id: int | None = None
-    tags: list[str] = Field(default_factory=list)
     next_follow_at: datetime | None
     converted_user_id: int | None
     remark: str | None
@@ -234,7 +241,7 @@ class CustomerLeadImportRow(BaseModel):
     phone: str | None = Field(default=None, max_length=32)
     wechat: str | None = Field(default=None, max_length=128)
     source: str = Field(min_length=1, max_length=64)
-    intention_level: Literal[1, 2, 3] = 1
+    intention_level: Literal[1, 2, 3, 4, 5, 6, 7] = 1
     gender: LeadGender = Field(default=0, description="性别 0未知 1男 2女（A13）")
     remark: str | None = Field(default=None, max_length=2000)
 
@@ -271,7 +278,6 @@ class CustomerLeadOptions(BaseModel):
     matchmakers: list[CustomerLeadOption] = Field(default_factory=list)
     promoters: list[CustomerLeadOption] = Field(default_factory=list)
     stores: list[CustomerLeadOption] = Field(default_factory=list)
-    tags: list[CustomerLeadOption] = Field(default_factory=list)
 
 
 class CustomerLeadFollowUpRecord(BaseModel):
@@ -334,3 +340,20 @@ class CustomerLeadPromoterStat(BaseModel):
     valid_female: int = 0
     pending: int = 0
     invalid: int = 0
+
+
+class LeadPreferenceResponse(BaseModel):
+    """客源线索「择偶要求」读写响应。
+
+    字段口径与 C 端 ``PreferenceResponse`` 完全一致。存储位置随入库状态不同一：
+    已入库（``converted_user_id`` 非空）读写账号那份 ``user_partner_preference``；
+    未入库读写 ``customer_lead_preference`` 暂存表（``converted_user_id`` 为 None、
+    内层 ``preference.user_id`` 为 0），入库时由服务搬运至账号。
+    两种情况 ``editable`` 均为 True（未入库现已可维护）；无暂存行时 ``preference``
+    返回空默认值（非 None）。前端用 ``converted_user_id`` 区分是否已入库。
+    """
+
+    lead_id: int
+    converted_user_id: int | None = None
+    editable: bool = False
+    preference: PreferenceResponse | None = None

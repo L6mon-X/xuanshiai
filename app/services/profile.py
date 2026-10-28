@@ -22,12 +22,11 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core import tag_catalog
 from app.core.profile_tags import (
-    ALL_TAG_OPTIONS,
     CUSTOM_TAG_CATEGORY_KEY,
     CUSTOM_TAG_CATEGORY_MAP_KEY,
     display_personal_tags,
-    TAG_CATEGORIES,
     TAG_CATALOG_REVISION,
     normalize_custom_tag_categories,
     personal_tags,
@@ -103,7 +102,7 @@ COMPLETION_RULES: tuple[tuple[str, str, int], ...] = (
     ("weight", "体重", 4),
     ("hometown", "家乡", 4),
     ("avatar", "头像", 15),
-    ("intro", "自我介绍", 10),
+    ("intro", "关于我", 10),
     ("album", "相册", 8),
     ("personal_tags", "兴趣标签", 8),
     ("mbti", "MBTI", 2),
@@ -341,8 +340,12 @@ async def get_profile(db: AsyncSession, user_id: int, public: bool = False) -> d
     result = await db.execute(
         text("""SELECT u.id AS user_id, u.nickname, u.gender, u.birthday, u.is_married, u.avatar,
                       p.height, p.weight, p.occupation, p.industry, p.education_level, p.income,
-                      p.house, p.car, p.ethnicity, p.ideal_partner,
+                      p.constellation, p.zodiac, p.household, p.ethnicity,
+                      p.house, p.car, p.smoking, p.drinking, p.religion, p.marriage_plan,
+                      p.ideal_partner,
+                      p.household_province_code, p.household_city_code, p.household_district_code,
                       p.hometown AS hometown_text, p.residence AS residence_text,
+                      ua.school, ua.company,
                       p.hometown_province_code, p.hometown_city_code, p.hometown_district_code,
                       p.residence_province_code, p.residence_city_code, p.residence_district_code,
                       p.self_intro, p.qa_answers, p.interest_tags, p.personality_tags, p.mbti, p.tags,
@@ -351,6 +354,7 @@ async def get_profile(db: AsyncSession, user_id: int, public: bool = False) -> d
                       COALESCE(pr.hide_company, 0) AS hide_company,
                       COALESCE(pr.only_vip_can_see_detail, 0) AS only_vip_can_see_detail
                FROM users u LEFT JOIN user_profile p ON p.user_id = u.id
+               LEFT JOIN user_auth ua ON ua.user_id = u.id
                LEFT JOIN user_profile_completion c ON c.user_id = u.id
                LEFT JOIN user_privacy pr ON pr.user_id = u.id
                WHERE u.id = :id"""),
@@ -377,7 +381,7 @@ async def get_profile(db: AsyncSession, user_id: int, public: bool = False) -> d
     data["interest_tags"], data["personality_tags"] = split_personal_tags(raw_tags, data["custom_tags"])
     data["tag_selections"] = {
         key: [tag for tag in stored_tags if tag in options]
-        for key, _, options in TAG_CATEGORIES
+        for key, _, options in tag_catalog.category_rows()
         if any(tag in options for tag in stored_tags)
     }
     if data["custom_tags"]:
@@ -401,17 +405,24 @@ async def get_profile(db: AsyncSession, user_id: int, public: bool = False) -> d
     data["residence_display"] = region_display(
         data.get("residence_province_code"), data.get("residence_city_code"), data.get("residence_district_code")
     ) or legacy_residence or None
+    # 户口：优先用省市区码合成展示名；老数据只有自由文本 household 时回落到原文。
+    data["household_display"] = region_display(
+        data.get("household_province_code"), data.get("household_city_code"), data.get("household_district_code")
+    ) or data.get("household")
     if public:
         # Public profile responses must not expose exact location or income by default.
         for field in ("income", "hometown_province_code", "hometown_city_code", "hometown_district_code", "residence_province_code", "residence_city_code", "residence_district_code"):
             data[field] = None
         if data["hide_school"]:
             data["education_level"] = None
+            data["school"] = None
         if data["hide_company"]:
             data["occupation"] = None
             data["industry"] = None
+            data["company"] = None
         if data["only_vip_can_see_detail"]:
-            for field in ("height", "occupation", "industry", "education_level", "is_married", "mbti"):
+            for field in ("height", "occupation", "industry", "education_level", "is_married", "mbti",
+                          "school", "company"):
                 data[field] = None
             data["personal_tags"] = []
             data["custom_tags"] = []
@@ -440,14 +451,14 @@ async def update_profile(
 ) -> dict[str, Any]:
     """更新用户资料并重算完整度。
 
-    allow_gender_change 供服务红娘代为修改会员资料使用：本人自助编辑时性别一经提交不可更改，
-    红娘需要纠正录入错误，因此代改路径放行。
+    allow_gender_change 供服务红娘代为修改会员资料使用：本人自助编辑时实名通过后性别与生日
+    一并锁定，红娘需要纠正录入错误，因此代改路径放行这一道锁。
     """
     values = request.model_dump(exclude_unset=True)
     if "personal_tags" in values:
         selected = values.pop("personal_tags")
         selected_custom_categories = values.pop("custom_tag_categories", {})
-        selected_custom_tags = [tag for tag in selected if tag not in ALL_TAG_OPTIONS]
+        selected_custom_tags = [tag for tag in selected if tag not in tag_catalog.all_tag_options()]
         for tag in selected_custom_tags:
             decision = await moderate_text(db, tag, field="自定义标签")
             if decision.action != "allow":
@@ -455,7 +466,7 @@ async def update_profile(
         values["interest_tags"], values["personality_tags"] = split_personal_tags(selected, selected_custom_tags)
         values["tag_selections"] = {
             key: [tag for tag in selected if tag in options]
-            for key, _, options in TAG_CATEGORIES if any(tag in options for tag in selected)
+            for key, _, options in tag_catalog.category_rows() if any(tag in options for tag in selected)
         }
         if selected_custom_tags:
             values["tag_selections"][CUSTOM_TAG_CATEGORY_KEY] = selected_custom_tags
@@ -463,18 +474,50 @@ async def update_profile(
     if "birthday" in values and values["birthday"] and _calculate_age(values["birthday"]) < 18:
         raise HTTPException(422, detail="用户必须年满18周岁")
     await _lock_profile_update(db, user_id)
-    if "gender" in values and not allow_gender_change:
-        result = await db.execute(text("SELECT gender FROM users WHERE id = :id FOR UPDATE"), {"id": user_id})
-        old_gender = result.scalar()
-        if old_gender is not None and old_gender != values["gender"]:
-            raise HTTPException(
-                409,
-                detail={
-                    "code": "GENDER_IMMUTABLE",
-                    "message": "性别提交后不可自行修改",
-                    "retryable": False,
-                },
+    if ("gender" in values or "birthday" in values) and not allow_gender_change:
+        # 2026-10-27 决策：未实名可改，实名后「性别 + 生日」一并锁定。
+        # 依据：实名信息里身份证第 17 位决定性别、第 7-14 位即出生日期，实名后两者都
+        # 已被身份证锚定；且生日决定年龄，是推荐/筛选/年龄要求的输入，只锁性别等于
+        # 留了一个改年龄的口子（45 岁改成 30 岁即可进入年轻用户推荐池）。
+        # allow_gender_change 是服务红娘代改会员资料的豁免口子，只放过这一道实名锁。
+        realname_status = int(
+            (
+                await db.execute(
+                    text("SELECT COALESCE(realname_status, 0) FROM user_auth WHERE user_id = :id"),
+                    {"id": user_id},
+                )
+            ).scalar()
+            or 0
+        )
+        current = (
+            await db.execute(
+                text("SELECT gender, birthday FROM users WHERE id = :id FOR UPDATE"),
+                {"id": user_id},
             )
+        ).mappings().first()
+        if realname_status == 2 and current is not None:
+            changed: list[str] = []
+            if (
+                "gender" in values
+                and current["gender"] is not None
+                and current["gender"] != values["gender"]
+            ):
+                changed.append("性别")
+            if (
+                "birthday" in values
+                and current["birthday"] is not None
+                and current["birthday"] != values["birthday"]
+            ):
+                changed.append("生日")
+            if changed:
+                raise HTTPException(
+                    409,
+                    detail={
+                        "code": "GENDER_LOCKED_BY_REALNAME",
+                        "message": f"完成实名认证后{'与'.join(changed)}不可更改",
+                        "retryable": False,
+                    },
+                )
 
     user_fields = {key: values.pop(key) for key in ("gender", "birthday", "is_married") if key in values}
     if user_fields:
@@ -482,6 +525,21 @@ async def update_profile(
         await db.execute(
             text(f"UPDATE users SET {assignments}, updated_at = UTC_TIMESTAMP() WHERE id = :user_id"),
             {**user_fields, "user_id": user_id},
+        )
+
+    # school / company 落 user_auth（不是 user_profile 的列），必须在下面的通用 UPSERT
+    # 之前从 values 里取走，否则会被当成 user_profile 列名拼进 SQL 而 Unknown column 500。
+    # 只单列 UPDATE，禁止整行 upsert —— 会覆盖 id_card / realname_status / 审核字段。
+    auth_fields = {key: values.pop(key) for key in ("school", "company") if key in values}
+    if auth_fields:
+        await db.execute(
+            text("INSERT IGNORE INTO user_auth (user_id) VALUES (:user_id)"),
+            {"user_id": user_id},
+        )
+        auth_assignments = ", ".join(f"{key} = :{key}" for key in auth_fields)
+        await db.execute(
+            text(f"UPDATE user_auth SET {auth_assignments} WHERE user_id = :user_id"),
+            {**auth_fields, "user_id": user_id},
         )
 
     if "interest_tags" in values:
@@ -765,6 +823,10 @@ async def get_preferences(db: AsyncSession, user_id: int) -> dict[str, Any]:
             "housing_requirement": None, "smoking_requirement": None,
             "drinking_requirement": None, "dating_goal": None,
             "meeting_pace": None, "children_intention": None, "extra_requirement": None,
+            "income_range": None, "education_requirement": None, "marriage_requirement": None,
+            "housing_expectation": None, "smoking_expectation": None,
+            "drinking_expectation": None, "marriage_timeline": None,
+            "preferred_occupation": None,
         }
     data = dict(row)
     data["preferred_city_codes"] = _json_list(data["preferred_city_codes"])
@@ -1038,7 +1100,7 @@ async def get_tag_options() -> TagOptionsResponse:
         catalog_revision=TAG_CATALOG_REVISION,
         categories=[
             TagCategoryResponse(key=key, label=label, options=list(options))
-            for key, label, options in TAG_CATEGORIES
+            for key, label, options in tag_catalog.category_rows()
         ],
     )
 

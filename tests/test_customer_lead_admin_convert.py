@@ -36,7 +36,7 @@ _LEAD_COLUMNS = [("id",), ("name",), ("real_name",), ("phone",), ("wechat",), ("
                  ("photo",), ("gender",), ("birthday",), ("intention_level",), ("status",),
                  ("audit_status",), ("matchmaker_id",), ("organization_id",), ("promoter_id",),
                  ("next_follow_at",), ("converted_user_id",), ("remark",), ("created_by",),
-                 ("created_at",), ("updated_at",), ("tags_raw",), ("deleted_at",)]
+                 ("created_at",), ("updated_at",), ("deleted_at",)]
 
 
 class StubResult:
@@ -79,7 +79,7 @@ class StubDB:
             return StubResult(rows=_LEAD_COLUMNS)
         if sql.strip().startswith("SELECT COUNT"):
             return StubResult(scalar=1)
-        if "tags_raw" in sql:
+        if "SELECT id, name, real_name" in sql:
             return StubResult(rows=[self._lead_row])
         if "SELECT phone FROM customer_lead" in sql:
             return StubResult(first=(self._lead_row.get("phone"),))
@@ -119,7 +119,7 @@ def _lead_row(**overrides) -> dict:
         "intention_level": 2, "status": "NEW", "audit_status": "active",
         "matchmaker_id": None, "organization_id": None, "promoter_id": None,
         "next_follow_at": None, "converted_user_id": None, "remark": None,
-        "created_by": 1, "created_at": NOW, "updated_at": NOW, "tags_raw": None,
+        "created_by": 1, "created_at": NOW, "updated_at": NOW,
     }
     row.update(overrides)
     return row
@@ -285,12 +285,14 @@ async def test_list_leads_normalizes_null_gender_rows() -> None:
     assert page.items[0].name == "历史NULL行"
 
 
-def test_gender_injection_never_touches_the_tags_subquery() -> None:
+def test_gender_injection_lands_only_on_the_outer_from() -> None:
     """gender 列注入必须带表名边界。
 
-    tags_raw 子查询里的 customer_lead_tag_relation 含 "FROM customer_lead" 子串，
-    无边界 replace 会把子查询改成返回 2 列，MySQL 报 1241（客源列表/详情 500）。
-    StubDB 按 SQL 文本分派、不校验语法，这类错误单测抓不到，只能静态钉住。
+    客源标签 2026-10-27 在上游下线后 LEAD_SELECT 不含子查询，但注入仍要只落在外层
+    `FROM customer_lead` 上：一旦有人再往里加 `FROM customer_lead_tag …` 这类以
+    "FROM customer_lead" 开头的子查询，无边界替换会把子查询改成返回 2 列，MySQL 报
+    1241（客源列表/详情 500）。StubDB 按 SQL 文本分派、不校验语法，这类错误单测抓不到，
+    只能静态钉住。
     """
     injected = re.sub(
         r"FROM customer_lead(?![a-zA-Z0-9_])",
@@ -298,6 +300,4 @@ def test_gender_injection_never_touches_the_tags_subquery() -> None:
         LEAD_SELECT,
     )
     assert injected.count("CAST(gender AS SIGNED) AS gender") == 1
-    assert "gender FROM customer_lead_tag_relation" not in injected
-    sub = injected[injected.index("(SELECT GROUP_CONCAT"):injected.index("AS tags_raw")]
-    assert "CAST(gender AS SIGNED) AS gender" not in sub
+    assert "FROM customer_lead_tag" not in LEAD_SELECT

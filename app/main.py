@@ -12,7 +12,7 @@ from uuid import uuid4
 from urllib.parse import parse_qs
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import JSONResponse, Response
@@ -78,6 +78,19 @@ async def verify_ai_advisor_knowledge_on_startup() -> None:
         logger.warning("AI 军师知识版本校验未能执行：%s", exc)
 
 
+async def load_tag_catalog_on_startup() -> None:
+    """启动期从 interest_tag 两表加载兴趣标签目录缓存；失败回退常量目录，不阻断启动。"""
+    if session_factory is None:
+        return
+    from app.core import tag_catalog
+
+    try:
+        async with session_factory() as db:
+            await tag_catalog.reload(db)
+    except Exception as exc:  # 迁移未跑/表缺失属预期，缓存保持常量回退
+        logger.warning("兴趣标签目录缓存加载失败，回退常量目录：%s", exc)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     logger.info(
@@ -87,6 +100,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     )
     await initialize_database_on_startup()
     await verify_ai_advisor_knowledge_on_startup()
+    await load_tag_catalog_on_startup()
     yield
     if engine is not None:
         await engine.dispose()
@@ -116,6 +130,25 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @application.exception_handler(HTTPException)
+    async def http_exception_with_message(_: Request, exc: HTTPException) -> JSONResponse:
+        """在 ``detail`` 之外补一个顶层 ``message``。
+
+        2026-10-27 起业务 403 的 ``detail`` 改为 ``{"code","message","retryable"}``
+        （前端按 ``code`` 分流到完善资料/绑手机/实名认证）。为兼容仍读
+        ``res.message`` 的旧客户端，把中文文案同时提到顶层；``detail``
+        结构本身保持不变，既有读 ``detail`` / ``detail.code`` 的调用不受影响。
+        """
+        detail = exc.detail
+        payload: dict[str, object] = {"detail": detail}
+        if isinstance(detail, dict):
+            message = detail.get("message")
+            if isinstance(message, str):
+                payload["message"] = message
+        elif isinstance(detail, str):
+            payload["message"] = detail
+        return JSONResponse(status_code=exc.status_code, content=payload, headers=exc.headers)
 
     @application.middleware("http")
     async def log_requests(request: Request, call_next) -> Response:

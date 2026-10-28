@@ -16,6 +16,7 @@ from app.core.sensitive_fields import REDACTION_LEVEL_STANDARD, is_masked_value,
 from app.core.security import lead_convert_password_fields
 # 复用登录注册链路的默认角色发放实现，避免入库账号缺少默认 user_role。
 from app.services.auth import ensure_default_user_role
+from app.schemas.auth import PreferenceUpdateRequest
 
 from app.schemas.customer_lead_admin import (
     CustomerLead, CustomerLeadAbandonment, CustomerLeadAssignment, CustomerLeadConvertRequest, CustomerLeadConvertResult,
@@ -26,37 +27,47 @@ from app.schemas.customer_lead_admin import (
     CustomerLeadOption, CustomerLeadOptions,
     CustomerLeadPage, CustomerLeadStatistics, CustomerLeadUpdate,
     CustomerLeadFollowUpRecord, CustomerLeadFollowUpRecordPage, CustomerLeadFollowBucket,
-    MatchmakerFollowStat, CustomerLeadPromoterStat,
+    MatchmakerFollowStat, CustomerLeadPromoterStat, LeadPreferenceResponse,
 )
 from app.services.customer_lead_contact import (
     ensure_contact_available, normalize_contact, raise_duplicate_contact,
 )
 
 LEAD_SELECT = """SELECT id, name, real_name, phone, wechat, source, photo, birthday, intention_level, status, audit_status, matchmaker_id,
-    organization_id, promoter_id, next_follow_at, converted_user_id, remark, created_by, created_at, updated_at,
-    (SELECT GROUP_CONCAT(t.name ORDER BY t.id SEPARATOR ',')
-        FROM customer_lead_tag_relation r JOIN customer_lead_tag t ON t.id = r.tag_id
-        WHERE r.lead_id = customer_lead.id) AS tags_raw
+    organization_id, promoter_id, next_follow_at, converted_user_id, remark, created_by, created_at, updated_at
     FROM customer_lead"""
 
 _LEAD_GENDER_RE = re.compile(r"\bFROM customer_lead\b")
 
 
 def _apply_gender_column(select_sql: str) -> str:
-    """在客源主表外层 FROM 前补 gender 列。
-
-    用 ``\bFROM customer_lead\b`` 只匹配外层表引用：子查询里的
-    ``FROM customer_lead_tag_relation`` 因 ``customer_lead`` 后紧跟 ``_``（单词字符）
-    不构成词边界，不会被误匹配，避免把 gender 注入标量子查询导致 MySQL 1241
-    （Operand should contain 1 column(s)）。
-    """
+    """在客源主表外层 FROM 前补 gender 列。"""
     return _LEAD_GENDER_RE.sub(", CAST(gender AS SIGNED) AS gender FROM customer_lead", select_sql)
 
 
 # 导入模板表头（顺序即模板列顺序）
 _TEMPLATE_HEADERS: list[str] = ["姓名", "手机号", "微信号", "来源", "意向程度", "备注"]
-_TEMPLATE_SAMPLE: list[str] = ["示例：张女士", "13800000000", "zhang_wx", "抖音", "中", "示例行，导入前请删除"]
-_INTENTION_ALIASES: dict[str, int] = {"低": 1, "中": 2, "高": 3, "1": 1, "2": 2, "3": 3}
+_TEMPLATE_SAMPLE: list[str] = ["示例：张女士", "13800000000", "zhang_wx", "抖音", "B", "示例行，导入前请删除"]
+# 客户意向七档（A-G），与后台筛选 / 首页意向统计标签同口径。
+LEAD_INTENTION_GRADES: dict[int, str] = {
+    1: "A类未接",
+    2: "B类初步沟通",
+    3: "C类深入沟通未缔结",
+    4: "D类待确定到店时间",
+    5: "E类已确定到店",
+    6: "F类预约需二邀",
+    7: "G类已到店未签约",
+}
+# 导入别名：数字 1-7 / 字母 A-G（大小写）/ 全称 / 旧粗粒度（低→A、中→D、高→F）。
+_INTENTION_ALIASES: dict[str, int] = {
+    **{str(g): g for g in LEAD_INTENTION_GRADES},
+    **{chr(64 + g): g for g in LEAD_INTENTION_GRADES},
+    **{chr(64 + g).lower(): g for g in LEAD_INTENTION_GRADES},
+    **{label: g for g, label in LEAD_INTENTION_GRADES.items()},
+    "低": 1,
+    "中": 4,
+    "高": 6,
+}
 _PHONE_PATTERN = re.compile(r"^1[3-9]\d{9}$")
 
 
@@ -69,8 +80,6 @@ def _lead(row: Any, redaction_level: str = REDACTION_LEVEL_STANDARD) -> Customer
     不接受 None，这里归一为 0（未知），否则整行序列化 500。
     """
     payload = dict(row)
-    raw = payload.pop("tags_raw", None)
-    payload["tags"] = [item for item in (raw or "").split(",") if item]
     payload["wechat"] = mask_contact(payload.get("wechat"), redaction_level)
     payload["gender"] = payload.get("gender") or 0
     return CustomerLead(**payload)
@@ -87,19 +96,6 @@ async def _validate_owner(db: AsyncSession, assignment: CustomerLeadAssignment) 
         result = await db.execute(text("SELECT 1 FROM organization WHERE id = :id AND org_type = 'store' AND status = 1"), {"id": assignment.organization_id})
         if not result.scalar():
             raise HTTPException(422, detail="门店不存在或已停用")
-
-
-async def _sync_tags(db: AsyncSession, lead_id: int, tags: list[str]) -> None:
-    """按名称写入客源标签关联；不存在的标签名自动补建配置行。"""
-    names = [name.strip() for name in tags if name and name.strip()]
-    if not names:
-        return
-    await db.execute(text("DELETE FROM customer_lead_tag_relation WHERE lead_id = :id"), {"id": lead_id})
-    for name in dict.fromkeys(names):
-        await db.execute(text("""INSERT IGNORE INTO customer_lead_tag (name, enabled, sort) VALUES (:name, 1, 0)"""), {"name": name})
-        tag_id = (await db.execute(text("SELECT id FROM customer_lead_tag WHERE name = :name"), {"name": name})).scalar()
-        if tag_id:
-            await db.execute(text("""INSERT IGNORE INTO customer_lead_tag_relation (lead_id, tag_id) VALUES (:lead_id, :tag_id)"""), {"lead_id": lead_id, "tag_id": int(tag_id)})
 
 
 async def _ensure_user_in_scope(db: AsyncSession, user_id: int | None, scope: str | None, scope_params: dict[str, Any] | None) -> None:
@@ -120,7 +116,7 @@ async def create_lead(db: AsyncSession, account_id: int, request: CustomerLeadCr
     await ensure_contact_available(db, phone, wechat)
     try:
         insert_columns = ["name", "real_name", "phone", "wechat", "source", "intention_level", "remark", "promoter_id", "audit_status", "created_by"]
-        insert_payload = {**request.model_dump(exclude={"tags"}), "phone": phone, "wechat": wechat, "created_by": account_id}
+        insert_payload = {**request.model_dump(), "phone": phone, "wechat": wechat, "created_by": account_id}
         columns = await _lead_columns(db)
         # photo/birthday/gender 列可能还没迁移，先发版后迁移时从写入列里剔除，避免 Unknown column 500。
         insert_columns += [column for column in ("photo", "birthday", "gender") if column in columns]
@@ -131,7 +127,6 @@ async def create_lead(db: AsyncSession, account_id: int, request: CustomerLeadCr
             VALUES ({', '.join(f':{column}' for column in insert_columns)})"""
         result = await db.execute(text(insert_sql), insert_payload)
         lead_id = int(result.lastrowid)
-        await _sync_tags(db, lead_id, request.tags)
         await db.execute(text("""INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id)
             VALUES (:actor, 'customer_lead.create', 'customer_lead', :id)"""), {"actor": account_id, "id": lead_id})
         await db.commit()
@@ -241,6 +236,13 @@ async def convert_lead(
         await db.execute(text("""UPDATE customer_lead
             SET status = 'CONVERTED', converted_user_id = :user_id, updated_at = UTC_TIMESTAMP()
             WHERE id = :lead_id AND converted_user_id IS NULL"""), {"user_id": user_id, "lead_id": lead_id})
+        # 未入库期间在 customer_lead_preference 维护的择偶要求，入库时搬运至新账号的
+        # user_partner_preference（INSERT..SELECT：线索未填过偏好则无行、自然跳过）。
+        pref_cols = ", ".join(_LEAD_PREF_COLUMNS)
+        await db.execute(text(
+            f"INSERT INTO user_partner_preference (user_id, {pref_cols}) "
+            f"SELECT :user_id, {pref_cols} FROM customer_lead_preference WHERE lead_id = :lead_id"
+        ), {"user_id": user_id, "lead_id": lead_id})
         await db.execute(text("""INSERT INTO business_audit_log
             (actor_user_id, action, resource_type, resource_id, reason)
             VALUES (:actor, 'customer_lead.convert', 'customer_lead', :id, :reason)"""),
@@ -319,7 +321,6 @@ async def list_leads(
     xiangqin_status: int | None = None,
     bind_mode: str | None = None,
     wechat_added: int | None = None,
-    tags: str | None = None,
     age_min: int | None = None,
     age_max: int | None = None,
     height_min: int | None = None,
@@ -410,13 +411,6 @@ async def list_leads(
     elif has_wechat is False:
         where.append("(wechat IS NULL OR TRIM(wechat) = '')")
 
-    tag_names = _split_multi(tags)
-    if tag_names:
-        where.append(f"""EXISTS (SELECT 1 FROM customer_lead_tag_relation tr
-            JOIN customer_lead_tag lt ON lt.id = tr.tag_id
-            WHERE tr.lead_id = customer_lead.id
-              AND lt.name IN ({_placeholders('tag', tag_names, params)}))""")
-
     # 以下筛选项依赖新增列，缺列时跳过。
     def has(name: str) -> bool:
         return name in columns
@@ -484,8 +478,6 @@ async def update_lead(
     # gender 列未迁移时从写入字段剔除，避免 Unknown column 500（先发版后迁移）。
     if "gender" in values and "gender" not in await _lead_columns(db):
         values.pop("gender")
-    # tags 不是 customer_lead 的列，必须先从写入字段里剔除，再单独走标签同步。
-    new_tags = [t.strip() for t in (values.pop("tags", None) or []) if t and t.strip()]
     # 掩码值不写回：表单预填的是脱敏后的展示值，原样落库会把真实微信号毁成 ***
     if is_masked_value(values.get("wechat")):
         values.pop("wechat")
@@ -504,17 +496,138 @@ async def update_lead(
     _merge_scope(update_where, update_params, scope, scope_params)
     try:
         await db.execute(text(f"UPDATE customer_lead SET {set_clause}updated_at = UTC_TIMESTAMP() WHERE {' AND '.join(update_where)}"), update_params)
-        if new_tags:
-            # _sync_tags 会先清空该线索的标签关联，所以传入「已有 + 新增」的并集，
-            # 保持批量打标签的追加语义，而不是覆盖掉原有标签。
-            existing_tags = [n for n in (current.tags or [])]
-            await _sync_tags(db, lead_id, list(dict.fromkeys([*existing_tags, *new_tags])))
         await db.execute(text("INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id) VALUES (:actor, 'customer_lead.update', 'customer_lead', :id)"), {"actor": account_id, "id": lead_id})
         await db.commit()
     except IntegrityError:
         await db.rollback()
         raise_duplicate_contact()
     return await get_lead(db, lead_id, redaction_level, scope=scope, scope_params=scope_params)
+
+
+# 未入库客源择偶要求可写列（与 C 端 PreferenceUpdateRequest 口径一致，主键为 lead_id）。
+_LEAD_PREF_COLUMNS = [
+    "age_min", "age_max", "height_min", "height_max", "education_min", "income_min",
+    "marriage_status", "preferred_province_code", "preferred_city_codes",
+    "accept_long_distance", "accept_cross_province", "housing_requirement",
+    "smoking_requirement", "drinking_requirement", "dating_goal", "meeting_pace",
+    "children_intention", "extra_requirement",
+]
+
+
+async def _get_lead_preference_dict(db: AsyncSession, lead_id: int) -> dict[str, Any]:
+    """读取未入库客源的择偶要求（customer_lead_preference），无行时返回空默认值。
+
+    输出形状对齐 PreferenceResponse：user_id 固定为 0（未入库无账号），
+    preferred_city_codes/布尔列按 C 端口径反解。多余键（id/lead_id/时间戳）由
+    PreferenceResponse 忽略。
+    """
+    from app.services.profile import _json_list  # 延迟导入避免模块级循环依赖
+
+    result = await db.execute(
+        text("SELECT * FROM customer_lead_preference WHERE lead_id = :lead_id"), {"lead_id": lead_id}
+    )
+    row = result.mappings().first()
+    if not row:
+        return {
+            "user_id": 0, "preferred_city_codes": [],
+            "accept_long_distance": False, "accept_cross_province": False,
+            **{c: None for c in _LEAD_PREF_COLUMNS
+               if c not in ("preferred_city_codes", "accept_long_distance", "accept_cross_province")},
+        }
+    data = dict(row)
+    data["user_id"] = 0
+    data["preferred_city_codes"] = _json_list(data["preferred_city_codes"])
+    data["accept_long_distance"] = bool(data["accept_long_distance"])
+    data["accept_cross_province"] = bool(data["accept_cross_province"])
+    return data
+
+
+async def _upsert_lead_preference(db: AsyncSession, lead_id: int, request: PreferenceUpdateRequest) -> None:
+    """部分更新未入库客源择偶要求（与 profile.update_preferences 同口径，但不涉及完整度/画像）。"""
+    from app.services.profile import _json_value  # 延迟导入避免模块级循环依赖
+
+    values = request.model_dump(exclude_unset=True)
+    if "preferred_city_codes" in values:
+        values["preferred_city_codes"] = _json_value(values["preferred_city_codes"])
+    values = {k: (int(v) if isinstance(v, bool) else v) for k, v in values.items()}
+    exists = (await db.execute(
+        text("SELECT id FROM customer_lead_preference WHERE lead_id = :lead_id"), {"lead_id": lead_id}
+    )).scalar()
+    if exists and values:
+        assignments = ", ".join(f"{k} = :{k}" for k in values)
+        await db.execute(
+            text(f"UPDATE customer_lead_preference SET {assignments}, updated_at = UTC_TIMESTAMP() WHERE lead_id = :lead_id"),
+            {**values, "lead_id": lead_id},
+        )
+    elif not exists:
+        columns = ["lead_id", *values]
+        placeholders = ", ".join(f":{c}" for c in columns)
+        await db.execute(
+            text(f"INSERT INTO customer_lead_preference ({', '.join(columns)}) VALUES ({placeholders})"),
+            {"lead_id": lead_id, **values},
+        )
+
+
+async def get_lead_preferences(
+    db: AsyncSession,
+    lead_id: int,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> LeadPreferenceResponse:
+    """读取客源线索的择偶要求。
+
+    先走 get_lead 做作用域与存在校验（D-16）。已入库（有 converted_user_id）读账号那份
+    user_partner_preference；未入库读 customer_lead_preference 暂存表（无行则返回空默认值）。
+    两种情况 editable 均为 True（未入库现已可维护）。
+    """
+    lead = await get_lead(db, lead_id, scope=scope, scope_params=scope_params)
+    if lead.converted_user_id:
+        # 延迟导入避免与 profile 服务形成模块级循环依赖。
+        from app.services.profile import get_preferences
+
+        data = await get_preferences(db, lead.converted_user_id)
+        return LeadPreferenceResponse(
+            lead_id=lead_id, converted_user_id=lead.converted_user_id, editable=True, preference=data
+        )
+    data = await _get_lead_preference_dict(db, lead_id)
+    return LeadPreferenceResponse(
+        lead_id=lead_id, converted_user_id=None, editable=True, preference=data
+    )
+
+
+async def update_lead_preferences(
+    db: AsyncSession,
+    account_id: int,
+    lead_id: int,
+    request: PreferenceUpdateRequest,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> LeadPreferenceResponse:
+    """写入客源线索的择偶要求。
+
+    已入库则复用 C 端 update_preferences（含完整度重算与画像 revision 入队），与会员
+    自助编辑同口径；未入库写 customer_lead_preference 暂存表，入库时再搬运至账号。
+    两种情况均追加审计 action='customer_lead.preference_update'。
+    """
+    lead = await get_lead(db, lead_id, scope=scope, scope_params=scope_params)
+    if lead.converted_user_id:
+        from app.services.profile import update_preferences
+
+        data = await update_preferences(db, lead.converted_user_id, request)
+    else:
+        await _upsert_lead_preference(db, lead_id, request)
+        data = await _get_lead_preference_dict(db, lead_id)
+    await db.execute(
+        text("INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id) "
+             "VALUES (:actor, 'customer_lead.preference_update', 'customer_lead', :id)"),
+        {"actor": account_id, "id": lead_id},
+    )
+    await db.commit()
+    return LeadPreferenceResponse(
+        lead_id=lead_id, converted_user_id=lead.converted_user_id, editable=True, preference=data
+    )
 
 
 async def assign_lead(
@@ -747,31 +860,32 @@ async def promoter_acquisition_stats(
 ) -> list[CustomerLeadPromoterStat]:
     """推广红娘获客统计（A13）：含男/女拆分。gender 列未迁移时男女相关列落 0。"""
     has_gender = "gender" in await _lead_columns(db)
-    where = ["promoter_id IS NOT NULL"]
+    where = ["cl.promoter_id IS NOT NULL"]
     params: dict[str, Any] = {}
     if "deleted_at" in await _lead_columns(db):
-        where.append("deleted_at IS NULL")
+        where.append("cl.deleted_at IS NULL")
     if scope:
         where.append(f"({scope})")
         params.update(scope_params or {})
     if promoter_id is not None:
-        where.append("promoter_id = :promoter_id")
+        where.append("cl.promoter_id = :promoter_id")
         params["promoter_id"] = promoter_id
     clause = " AND ".join(where)
     if has_gender:
-        gender_cols = ("SUM(gender = 1) male, SUM(gender = 2) female, "
-                       "SUM(gender = 1 AND audit_status = 'active' AND status NOT IN ('LOST','CLOSED')) valid_male, "
-                       "SUM(gender = 2 AND audit_status = 'active' AND status NOT IN ('LOST','CLOSED')) valid_female")
+        # users 表也有 gender，JOIN 后必须带 cl. 前缀，否则 MySQL 1052 列歧义
+        gender_cols = ("SUM(cl.gender = 1) male, SUM(cl.gender = 2) female, "
+                       "SUM(cl.gender = 1 AND cl.audit_status = 'active' AND cl.status NOT IN ('LOST','CLOSED')) valid_male, "
+                       "SUM(cl.gender = 2 AND cl.audit_status = 'active' AND cl.status NOT IN ('LOST','CLOSED')) valid_female")
     else:
         gender_cols = "0 male, 0 female, 0 valid_male, 0 valid_female"
-    rows = (await db.execute(text(f"""SELECT promoter_id,
-        COALESCE(NULLIF(u.nickname, ''), u.phone, CONCAT('红娘', promoter_id)) promoter_name,
+    rows = (await db.execute(text(f"""SELECT cl.promoter_id,
+        COALESCE(NULLIF(u.nickname, ''), u.phone, CONCAT('红娘', cl.promoter_id)) promoter_name,
         COUNT(*) total, {gender_cols},
-        SUM(audit_status = 'pending') pending,
-        SUM(status IN ('LOST','CLOSED')) invalid
+        SUM(cl.audit_status = 'pending') pending,
+        SUM(cl.status IN ('LOST','CLOSED')) invalid
         FROM customer_lead cl LEFT JOIN users u ON u.id = cl.promoter_id
         WHERE {clause}
-        GROUP BY promoter_id, promoter_name
+        GROUP BY cl.promoter_id, promoter_name
         ORDER BY total DESC"""), params)).mappings().all()
     return [CustomerLeadPromoterStat(
         promoter_id=int(r["promoter_id"]), promoter_name=str(r["promoter_name"] or ""),
@@ -953,7 +1067,6 @@ async def _insert_leads(
     default_matchmaker_id: int | None = None,
     default_promoter_id: int | None = None,
     default_audit_status: str = "active",
-    default_tags: list[str] | None = None,
     start_index: int = 2,
     assignment_scope: str | None = None,
     assignment_scope_params: dict[str, Any] | None = None,
@@ -963,7 +1076,6 @@ async def _insert_leads(
     errors: list[str] = []
     await _ensure_user_in_scope(db, default_matchmaker_id, assignment_scope, assignment_scope_params)
     await _ensure_user_in_scope(db, default_promoter_id, assignment_scope, assignment_scope_params)
-    tag_names = [name.strip() for name in (default_tags or []) if name and name.strip()]
     for index, row in enumerate(rows, start=start_index):  # Excel 数据从第 2 行起
         # 业务口径：线索必须有有效手机号，否则联系不上人、也无法一键入库成会员。
         phone = normalize_contact(row.phone)
@@ -1008,7 +1120,6 @@ async def _insert_leads(
                 },
             )
             lead_id = int(result.lastrowid)
-            await _sync_tags(db, lead_id, tag_names)
             await db.execute(text("""INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id)
                 VALUES (:actor, 'customer_lead.import', 'customer_lead', :id)"""),
                 {"actor": account_id, "id": lead_id},
@@ -1135,7 +1246,6 @@ async def import_leads_file(
     default_source: str = "批量导入",
     default_matchmaker_id: int | None = None,
     default_promoter_id: int | None = None,
-    default_tags: list[str] | None = None,
     dup_mode: str = "skip",
     assignment_scope: str | None = None,
     assignment_scope_params: dict[str, Any] | None = None,
@@ -1151,7 +1261,6 @@ async def import_leads_file(
         default_matchmaker_id=default_matchmaker_id,
         default_promoter_id=default_promoter_id,
         default_audit_status=audit_status,
-        default_tags=default_tags,
         assignment_scope=assignment_scope,
         assignment_scope_params=assignment_scope_params,
     )
@@ -1163,9 +1272,9 @@ async def lead_options(
     scope: str | None = None,
     scope_params: dict[str, Any] | None = None,
 ) -> CustomerLeadOptions:
-    """客源线索页面下拉字典：来源、服务红娘、推广红娘、标签。
+    """客源线索页面下拉字典：来源、服务红娘、推广红娘。
 
-    「来源」取自本账号可见的线索集合（带作用域，D-16）；红娘/推广/标签为全局
+    「来源」取自本账号可见的线索集合（带作用域，D-16）；红娘/推广为全局
     配置型字典，不随数据范围收敛。
     """
     source_where = ["source <> ''"]
@@ -1207,8 +1316,4 @@ async def lead_options(
         for row in (await db.execute(text("""SELECT id, COALESCE(NULLIF(display_name, ''), name) AS label
             FROM organization WHERE org_type = 'store' AND status = 1 ORDER BY id"""))).mappings().all()
     ]
-    tags = [
-        CustomerLeadOption(value=row["name"], label=row["name"])
-        for row in (await db.execute(text("SELECT name FROM customer_lead_tag WHERE enabled = 1 ORDER BY sort, id"))).mappings().all()
-    ]
-    return CustomerLeadOptions(sources=sources, matchmakers=matchmakers, promoters=promoters, stores=stores, tags=tags)
+    return CustomerLeadOptions(sources=sources, matchmakers=matchmakers, promoters=promoters, stores=stores)
