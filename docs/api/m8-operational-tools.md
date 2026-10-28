@@ -105,6 +105,8 @@ PUT   /admin/configs/{namespace}    保存（整体覆盖）
 }
 ```
 
+> 消费方：小程序「红娘管理中心 → 服务导航 → 红娘喜讯」读同一批行，并且红娘能在里面「报喜 - 反馈喜讯」代会员插待审行（`status=2`，等后台放行），接口契约与字段回落规则见 `docs/红娘后台接口.md` 19 / 19.4。`from_user_id` / `to_user_id` / `blessing_count` 后台喜讯抽屉与红娘端都不写，`images` 只有红娘端会写。
+
 ### 3.2 good_news_pennant（锦旗管理）
 
 ```json

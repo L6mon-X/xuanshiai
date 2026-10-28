@@ -9,7 +9,8 @@
 4. 手机号已是会员 → 409 可读提示（含会员 ID），不抛数据库唯一键异常；
 5. 归属回退：线索无分派时取操作账号的门店/红娘，写入 resource_assignment；
 6. 四张表写入内容（users / member_review / resource_assignment / customer_lead）；
-7. 连点两次入库撞唯一键时转 409，不冒 500。
+7. 连点两次入库撞唯一键时转 409，不冒 500；
+8. 建号写入 lead_convert_initial_password 的 bcrypt 哈希（后台须知承诺的初始密码），配置为空时不设密码。
 全部用 StubDB 按 SQL 文本分派结果，走真实 service 逻辑，不依赖 MySQL。
 """
 
@@ -22,6 +23,8 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 
+from app.core.config import settings
+from app.core.security import verify_password
 from app.schemas.customer_lead_admin import CustomerLead, CustomerLeadConvertRequest
 from app.services.customer_lead_admin import LEAD_SELECT, convert_lead, list_leads
 
@@ -133,9 +136,10 @@ async def test_convert_creates_a_pending_member_and_writes_four_tables() -> None
     assert lead.id == 3
     assert db.committed is True
 
-    assert db.params_for("INSERT INTO users") == {
-        "openid": "lead-convert-3", "phone": PHONE, "nickname": "张女士", "gender": None,
-    }
+    assert db.params_for("INSERT INTO users")["openid"] == "lead-convert-3"
+    assert db.params_for("INSERT INTO users")["phone"] == PHONE
+    assert db.params_for("INSERT INTO users")["nickname"] == "张女士"
+    assert db.params_for("INSERT INTO users")["gender"] is None
     assert db.params_for("INSERT INTO matchmaker_member_review") == {"user_id": NEW_USER_ID}
     # 归属取线索上已有的分派（route 未传操作账号归属时）
     assert db.params_for("INSERT INTO resource_assignment") == {
@@ -143,6 +147,29 @@ async def test_convert_creates_a_pending_member_and_writes_four_tables() -> None
     }
     assert "'lead_convert'" in db.sql()
     assert db.params_for("customer_lead.convert")["actor"] == 1
+
+
+@pytest.mark.asyncio
+async def test_convert_writes_the_configured_initial_password_as_a_bcrypt_hash(monkeypatch) -> None:
+    """后台须知承诺「初始登录密码 abc123」，入库建号必须真的写 users.password（只存哈希）。"""
+    monkeypatch.setattr(settings, "lead_convert_initial_password", "abc123")
+    db = StubDB(_lead_row())
+    await convert_lead(db, 1, None, None, 3, CustomerLeadConvertRequest())
+    params = db.params_for("INSERT INTO users")
+    assert params["password_algo"] == "bcrypt"
+    assert params["password"] != "abc123"
+    assert verify_password("abc123", params["password"]) is True
+
+
+@pytest.mark.asyncio
+async def test_convert_creates_a_passwordless_account_when_the_initial_password_is_blank(monkeypatch) -> None:
+    """配置留空表示不给初始密码，新账号只能走验证码/微信登录。"""
+    monkeypatch.setattr(settings, "lead_convert_initial_password", "")
+    db = StubDB(_lead_row())
+    await convert_lead(db, 1, None, None, 3, CustomerLeadConvertRequest())
+    params = db.params_for("INSERT INTO users")
+    assert params["password"] is None
+    assert params["password_algo"] is None
 
 
 @pytest.mark.asyncio

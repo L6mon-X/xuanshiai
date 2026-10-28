@@ -39,11 +39,15 @@ from app.schemas.matchmaker_workspace import (
     WorkspaceLeadFollower,
     WorkspaceLeadPage,
     WorkspaceLeadUpdate,
+    WorkspaceGoodNewsCreate,
+    WorkspaceGoodNewsCreated,
+    WorkspaceGoodNewsPage,
     WorkspaceIntroductionCreate,
     WorkspaceIntroductionCreated,
     WorkspaceIntroductionPage,
     WorkspaceMatchCandidatePage,
     WorkspaceMatchHistoryPage,
+    WorkspacePennantPage,
     WorkspaceMemberContact,
     WorkspaceMemberFollowUp,
     WorkspaceMemberFollowUpCreate,
@@ -103,6 +107,9 @@ from app.services.matchmaker_workspace import (
     update_workspace_introduction_status,
     update_workspace_meeting_status,
     list_member_follow_ups,
+    list_workbench_good_news,
+    list_workbench_good_news_pennants,
+    create_workbench_good_news,
     list_workspace_leads,
     list_workspace_members,
     require_review_authority,
@@ -115,6 +122,7 @@ from app.services.matchmaker_workspace import (
     update_workspace_homepage,
     update_workspace_profile,
     upload_lead_photo,
+    upload_workspace_photo,
     workspace_access,
     workspace_dashboard,
 )
@@ -544,6 +552,59 @@ async def workbench_match_history(
     db: AsyncSession = Depends(get_db),
 ) -> WorkspaceMatchHistoryPage:
     return await list_match_history(db, await require_workspace(db, current), member_id, page, page_size)
+
+
+@router.get(
+    "/workbench/good-news",
+    response_model=WorkspaceGoodNewsPage,
+    summary="查询红娘喜讯（只读，数据源为后台 good_news 内容域）",
+)
+async def workbench_good_news(
+    stage: str = Query("", max_length=20, description="喜讯阶段中文文案，空为全部"),
+    page: int = Query(1, ge=1, le=1000),
+    page_size: int = Query(20, ge=1, le=100),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WorkspaceGoodNewsPage:
+    return await list_workbench_good_news(db, await require_workspace(db, current), stage, page, page_size)
+
+
+@router.post(
+    "/workbench/good-news",
+    response_model=WorkspaceGoodNewsCreated,
+    status_code=201,
+    summary="红娘代会员提交反馈喜讯（落后台喜讯内容域待审行）",
+)
+async def submit_workbench_good_news(
+    body: WorkspaceGoodNewsCreate,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WorkspaceGoodNewsCreated:
+    return await create_workbench_good_news(db, await require_workspace(db, current), body)
+
+
+@router.post("/workbench/good-news/photo", status_code=201, summary="上传反馈喜讯图片")
+async def upload_workbench_good_news_photo(
+    file: UploadFile = File(...),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """喜讯图片上传，返回可直接写入 extra.images 的 URL。"""
+    return await upload_workspace_photo(db, await require_workspace(db, current), file, "good-news")
+
+
+@router.get(
+    "/workbench/good-news/pennants",
+    response_model=WorkspacePennantPage,
+    summary="查询锦旗墙（只读，数据源为后台 good_news_pennant 内容域）",
+)
+async def workbench_good_news_pennants(
+    page: int = Query(1, ge=1, le=1000),
+    page_size: int = Query(20, ge=1, le=100),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WorkspacePennantPage:
+    return await list_workbench_good_news_pennants(db, await require_workspace(db, current), page, page_size)
 
 
 @router.get("/workbench/matchmakers", response_model=list[WorkspaceLeadFollower], summary="查询可改派的服务红娘")

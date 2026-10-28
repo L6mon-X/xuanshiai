@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -63,6 +64,12 @@ from app.schemas.matchmaker_workspace import (
     PromotionCode,
     WorkspaceAbandonRequest,
     WorkspaceAssignRequest,
+    WorkspaceGoodNewsCreated,
+    WorkspaceGoodNewsCreate,
+    WorkspaceGoodNewsItem,
+    WorkspaceGoodNewsPage,
+    WorkspacePennantItem,
+    WorkspacePennantPage,
     WorkspaceLead,
     WorkspaceLevel,
     WorkspaceLeadConvertRequest,
@@ -845,9 +852,16 @@ async def upload_lead_photo(
     db: AsyncSession, actor: WorkspaceActor, file: UploadFile
 ) -> dict[str, Any]:
     """客源线索照片上传：写入 storage/uploads/leads/，返回可直接存入 photo 字段的 URL。"""
+    return await upload_workspace_photo(db, actor, file, "leads")
+
+
+async def upload_workspace_photo(
+    db: AsyncSession, actor: WorkspaceActor, file: UploadFile, subdir: str
+) -> dict[str, Any]:
+    """工作台图片上传：按业务子目录写入 storage/uploads/<subdir>/，返回可入库的 URL 对。"""
     data = await _read_limited(file, 5 * 1024 * 1024)
     image_data, thumbnail_data = await asyncio.to_thread(_image_outputs, data)
-    directory = Path(settings.upload_dir) / "leads"
+    directory = Path(settings.upload_dir) / subdir
     directory.mkdir(parents=True, exist_ok=True)
     name = uuid.uuid4().hex
     image_path = directory / f"photo-{name}.webp"
@@ -857,8 +871,8 @@ async def upload_lead_photo(
         _write_lead_photo(thumbnail_path, thumbnail_data),
     )
     return {
-        "url": f"/storage/uploads/leads/{image_path.name}",
-        "thumbnail_url": f"/storage/uploads/leads/{thumbnail_path.name}",
+        "url": f"/storage/uploads/{subdir}/{image_path.name}",
+        "thumbnail_url": f"/storage/uploads/{subdir}/{thumbnail_path.name}",
         "size": len(image_data),
     }
 
@@ -2785,4 +2799,208 @@ async def sync_admin_match_record_introduction(
             "f": from_user_id, "t": to_user_id, "m": matchmaker_id, "org": organization_id,
             "status": introduction_status, "reason": reason, "note": note, "created_at": created_at,
         },
+    )
+
+
+GOOD_NEWS_DOMAIN = "good_news"
+GOOD_NEWS_PENNANT_DOMAIN = "good_news_pennant"
+"""红娘喜讯与锦旗墙的数据源域：后台「运营工具-喜讯管理」写这两域，工作台只读同一批行。"""
+
+_HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
+
+
+def _content_extra(row: dict) -> dict:
+    try:
+        extra = json.loads(row.get("extra_json") or "{}")
+    except (TypeError, ValueError):
+        extra = {}
+    return extra if isinstance(extra, dict) else {}
+
+
+def _plain_text(html: str) -> str:
+    """后台喜讯正文是富文本；小程序按纯文本渲染，所以剥标签并把 &nbsp; 还原成空格。"""
+    return _HTML_TAG_PATTERN.sub("", html or "").replace("&nbsp;", " ").strip()
+
+
+def _meet_duration_text(raw: object) -> str:
+    """后台「相识时间」按月份数字录入（历史表单口径），纯数字时补单位，其它文本原样显示。"""
+    value = str(raw or "").strip()
+    return f"{value}个月" if value.isdigit() else value
+
+
+async def _member_profiles(db: AsyncSession, user_ids: list[int]) -> dict[int, dict]:
+    if not user_ids:
+        return {}
+    keys = {f"profile_u{index}": value for index, value in enumerate(user_ids)}
+    placeholders = ", ".join(f":{key}" for key in keys)
+    rows = (
+        await db.execute(text(f"SELECT id, nickname, avatar FROM users WHERE id IN ({placeholders})"), keys)
+    ).mappings().all()
+    return {int(row["id"]): dict(row) for row in rows}
+
+
+def _positive_id(raw: object) -> int | None:
+    return raw if isinstance(raw, int) and raw > 0 else None
+
+
+async def list_workbench_good_news(
+    db: AsyncSession, actor: WorkspaceActor, stage: str, page: int, page_size: int
+) -> WorkspaceGoodNewsPage:
+    """红娘工作台的「红娘喜讯」列表。
+
+    数据源是后台「运营工具-喜讯管理」写入的 admin_content_item(domain=good_news)：
+    后台录一条红娘这边就能看到，不另建表，公开开关沿用 extra.public。
+    范围与其它中心一致——总店（SUPER）看全部，普通红娘只看 extra.matchmaker_id 是自己
+    的那些；后台代录常常先不填归属红娘，这类无归属行只有总店看得见。
+    可见性上红娘端「报喜」的行会先停在待审（status=2），所以 SELF 放宽到 status IN (1, 2)
+    （归属条件保证她只会看到自己代报的），SUPER 也放行归属到她名下的待审行，
+    否则总店账号报完喜在自己的工作区里看不到那条记录。
+    双方昵称头像按 extra.from_user_id/to_user_id 回查 users，查不到（后台手填的自定义姓名）
+    才退回 extra.feedback_name/partner_name。
+    """
+    conditions = ["tenant_id = 1", "domain = :domain"]
+    params: dict[str, object] = {
+        "domain": GOOD_NEWS_DOMAIN, "limit": page_size, "offset": (page - 1) * page_size,
+    }
+    if stage:
+        conditions.append("JSON_UNQUOTE(JSON_EXTRACT(extra_json, '$.status')) = :stage")
+        params["stage"] = stage
+    own_matchmaker_id = str(actor.user_id)
+    if actor.scope == "SELF":
+        conditions.append("status IN (1, 2)")
+        conditions.append("JSON_UNQUOTE(JSON_EXTRACT(extra_json, '$.matchmaker_id')) = :own_matchmaker_id")
+        params["own_matchmaker_id"] = own_matchmaker_id
+    else:
+        # 待审行只认 extra.matchmaker_id，不用 created_by：那一列在后台写入时存的是管理员 ID，
+        # 与 C 端 user_id 同号段，拿它放行会把后台标为不公开的别人的行漏出来。
+        conditions.append("(status = 1 OR JSON_UNQUOTE(JSON_EXTRACT(extra_json, '$.matchmaker_id')) = :own_matchmaker_id)")
+        params["own_matchmaker_id"] = own_matchmaker_id
+    where = " AND ".join(conditions)
+    total = int(await db.scalar(text(f"SELECT COUNT(*) FROM admin_content_item WHERE {where}"), params) or 0)
+    rows = (
+        await db.execute(text(f"""SELECT id, title, subtitle, image_url, status, extra_json, created_at
+            FROM admin_content_item WHERE {where}
+            ORDER BY sort DESC, created_at DESC, id DESC LIMIT :limit OFFSET :offset"""), params)
+    ).mappings().all()
+    parsed = [(dict(row), _content_extra(dict(row))) for row in rows]
+    member_ids = sorted({
+        value for _, extra in parsed for value in (_positive_id(extra.get("from_user_id")), _positive_id(extra.get("to_user_id"))) if value
+    })
+    profiles = await _member_profiles(db, member_ids)
+    items: list[WorkspaceGoodNewsItem] = []
+    for row, extra in parsed:
+        from_id = _positive_id(extra.get("from_user_id"))
+        to_id = _positive_id(extra.get("to_user_id"))
+        left = profiles.get(from_id or 0) or {}
+        right = profiles.get(to_id or 0) or {}
+        raw_images = extra.get("images")
+        images = [str(url).strip() for url in raw_images if str(url or "").strip()] if isinstance(raw_images, list) else []
+        if not images and str(row.get("image_url") or "").strip():
+            images = [str(row["image_url"]).strip()]
+        items.append(WorkspaceGoodNewsItem(
+            id=int(row["id"]),
+            stage=str(extra.get("status") or row.get("title") or ""),
+            from_user_id=from_id,
+            to_user_id=to_id,
+            from_name=str(left.get("nickname") or extra.get("feedback_name") or "未命名会员"),
+            to_name=str(right.get("nickname") or extra.get("partner_name") or "未命名会员"),
+            from_avatar=left.get("avatar"),
+            to_avatar=right.get("avatar"),
+            matchmaker_name=str(extra.get("matchmaker_name") or row.get("subtitle") or "服务红娘"),
+            meet_duration=_meet_duration_text(extra.get("meet_duration")),
+            images=images,
+            content=_plain_text(str(extra.get("content_html") or "")),
+            blessing=str(extra.get("blessing") or ""),
+            blessing_count=int(extra.get("blessing_count") or 0),
+            public=bool(extra.get("public", True)),
+            pending_review=int(row.get("status") or 1) != 1,
+            created_at=row.get("created_at"),
+        ))
+    return WorkspaceGoodNewsPage(
+        items=items, page=page, page_size=page_size, total=total, has_more=_page(total, page, page_size)
+    )
+
+
+async def create_workbench_good_news(
+    db: AsyncSession, actor: WorkspaceActor, request: WorkspaceGoodNewsCreate
+) -> WorkspaceGoodNewsCreated:
+    """红娘代会员报喜，写入后台喜讯内容域的待审行。
+
+    与后台「运营工具-喜讯管理」共用 admin_content_item(domain=good_news)，不另建表：
+    红娘端没有会员选择器，双方都只存姓名文本（extra.partner_name），读侧按文本回退；
+    行落 status=2 待审，由后台喜讯管理放行（status=1）后才对其它红娘和总店可见，
+    提交人自己在「红娘喜讯」里能立刻看到带「待审」标记的这条。
+    """
+    stage = request.stage.strip()
+    partner_name = request.partner_name.strip()
+    if not stage or not partner_name:
+        raise HTTPException(422, detail="当前状态与对方称呼都要填写")
+    images = [url.strip() for url in request.images if url.strip()][:9]
+    extra = {
+        "status": stage,
+        "partner_name": partner_name,
+        "matchmaker_id": str(actor.user_id),
+        "matchmaker_name": actor.display_name,
+        "meet_duration": request.meet_duration.strip(),
+        "content_html": request.content.strip(),
+        "images": images,
+        "blessing_count": 0,
+        "source": "matchmaker_workspace",
+    }
+    result = await db.execute(
+        text(
+            "INSERT INTO admin_content_item "
+            "(tenant_id, domain, title, subtitle, image_url, status, sort, extra_json, created_by) "
+            "VALUES (1, :domain, :title, :subtitle, :image_url, 2, 0, :extra, :created_by)"
+        ),
+        {
+            "domain": GOOD_NEWS_DOMAIN,
+            "title": stage,
+            "subtitle": actor.display_name,
+            "image_url": images[0] if images else None,
+            "extra": json.dumps(extra, ensure_ascii=False),
+            "created_by": actor.user_id,
+        },
+    )
+    await db.commit()
+    return WorkspaceGoodNewsCreated(id=int(result.lastrowid or 0), pending_review=True)
+
+
+async def list_workbench_good_news_pennants(
+    db: AsyncSession, actor: WorkspaceActor, page: int, page_size: int
+) -> WorkspacePennantPage:
+    """锦旗墙（domain=good_news_pennant）。
+
+    锦旗的受赠人是 `extra.target` 文本（后台按红娘姓名录入，没有 ID 列），所以普通红娘只能按
+    本人工作台显示名精确匹配，改名即失配；这类归属问题等红娘端能上传锦旗时再补 ID 字段。
+    """
+    conditions = ["tenant_id = 1", "domain = :domain", "status = 1"]
+    params: dict[str, object] = {
+        "domain": GOOD_NEWS_PENNANT_DOMAIN, "limit": page_size, "offset": (page - 1) * page_size,
+    }
+    if actor.scope == "SELF":
+        conditions.append("JSON_UNQUOTE(JSON_EXTRACT(extra_json, '$.target')) = :own_target")
+        params["own_target"] = actor.display_name
+    where = " AND ".join(conditions)
+    total = int(await db.scalar(text(f"SELECT COUNT(*) FROM admin_content_item WHERE {where}"), params) or 0)
+    rows = (
+        await db.execute(text(f"""SELECT id, title, subtitle, image_url, extra_json, created_at
+            FROM admin_content_item WHERE {where}
+            ORDER BY sort DESC, created_at DESC, id DESC LIMIT :limit OFFSET :offset"""), params)
+    ).mappings().all()
+    items = []
+    for raw in rows:
+        row = dict(raw)
+        extra = _content_extra(row)
+        items.append(WorkspacePennantItem(
+            id=int(row["id"]),
+            maker=str(extra.get("maker") or ""),
+            giver=str(extra.get("giver") or row.get("title") or ""),
+            target=str(extra.get("target") or row.get("subtitle") or ""),
+            words=str(extra.get("words") or ""),
+            image_url=row.get("image_url"),
+            created_at=row.get("created_at"),
+        ))
+    return WorkspacePennantPage(
+        items=items, page=page, page_size=page_size, total=total, has_more=_page(total, page, page_size)
     )

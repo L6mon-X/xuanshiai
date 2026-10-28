@@ -65,6 +65,8 @@ class CustomerLeadUpdate(BaseModel):
     real_name: str | None = Field(default=None, max_length=64)
     phone: str | None = Field(default=None, pattern=r"^1[3-9]\d{9}$")
     wechat: str | None = Field(default=None, max_length=128)
+    # 来源在录入时必填，编辑表单与录入同口径，所以也允许改（原站「编辑客源」可重选来源渠道）。
+    source: str | None = Field(default=None, min_length=1, max_length=64)
     photo: str | None = Field(default=None, max_length=512)
     birthday: date | None = None
     intention_level: Literal[1, 2, 3] | None = None
@@ -98,7 +100,7 @@ class CustomerLeadUpdate(BaseModel):
         # 显式传 phone=null/"" 会被归一化成 None：那等于把线索改成联系不上人的死数据。
         if "phone" in self.model_fields_set and not self.phone:
             raise ValueError("手机号不能清空，只能改成有效的 11 位手机号")
-        if not self.tags and all(value is None for value in (self.name, self.real_name, self.phone, self.wechat, self.photo, self.gender, self.birthday, self.intention_level, self.status, self.remark, self.next_follow_at, self.promoter_id, self.audit_status)):
+        if not self.tags and all(value is None for value in (self.name, self.real_name, self.phone, self.wechat, self.source, self.photo, self.gender, self.birthday, self.intention_level, self.status, self.remark, self.next_follow_at, self.promoter_id, self.audit_status)):
             raise ValueError("至少提供一个需要修改的字段")
         return self
 

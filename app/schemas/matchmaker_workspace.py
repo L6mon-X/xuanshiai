@@ -755,3 +755,68 @@ class WorkspaceIntroductionCreate(BaseModel):
 class WorkspaceIntroductionCreated(BaseModel):
     id: int
     status: Literal["PENDING", "IN_PROGRESS", "SUCCEEDED", "FAILED"]
+
+
+class WorkspaceGoodNewsItem(BaseModel):
+    """后台「运营工具-喜讯管理」录入的一条红娘喜讯（admin_content_item domain=good_news）。"""
+
+    id: int
+    stage: str
+    from_user_id: int | None
+    to_user_id: int | None
+    from_name: str
+    to_name: str
+    from_avatar: str | None
+    to_avatar: str | None
+    matchmaker_name: str
+    meet_duration: str
+    images: list[str]
+    content: str
+    blessing: str
+    blessing_count: int
+    public: bool
+    pending_review: bool
+    created_at: datetime | None
+
+
+class WorkspaceGoodNewsCreate(BaseModel):
+    """红娘在「红娘喜讯」里代会员提交的反馈喜讯，落后台 good_news 内容域待审行。"""
+
+    stage: str = Field(min_length=1, max_length=20, description="当前状态，取栏目配置的喜讯分类")
+    partner_name: str = Field(min_length=1, max_length=40, description="对方称呼")
+    meet_duration: str = Field("", max_length=20, description="相识时间，按月填数字或自由文本")
+    content: str = Field("", max_length=1000, description="情感状态描述与对服务的反馈")
+    images: list[str] = Field(default_factory=list, max_length=9, description="已上传图片 URL")
+
+
+class WorkspaceGoodNewsCreated(BaseModel):
+    id: int
+    pending_review: bool
+
+
+class WorkspaceGoodNewsPage(BaseModel):
+    items: list[WorkspaceGoodNewsItem]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
+
+
+class WorkspacePennantItem(BaseModel):
+    """锦旗墙的一条（admin_content_item domain=good_news_pennant）。"""
+
+    id: int
+    maker: str
+    giver: str
+    target: str
+    words: str
+    image_url: str | None
+    created_at: datetime | None
+
+
+class WorkspacePennantPage(BaseModel):
+    items: list[WorkspacePennantItem]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
