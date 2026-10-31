@@ -87,4 +87,5 @@ async def test_import_row_with_malformed_phone_never_reaches_sql() -> None:
     db = _StubDB()
     summary = await _insert_leads(db, 1, [_row(phone="138-0000-0000"), _row(phone="23800000000")])
     assert (summary.created, summary.failed) == (0, 2)
-    assert db.statements == []
+    # 坏号行一条写入 SQL 都不能发出去；列探测（information_schema）是只读的，允许发生。
+    assert [sql for sql, _ in db.statements if not sql.strip().startswith("SELECT COLUMN_NAME")] == []

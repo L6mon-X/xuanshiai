@@ -79,7 +79,9 @@ class StubDB:
             return StubResult(rows=_LEAD_COLUMNS)
         if sql.strip().startswith("SELECT COUNT"):
             return StubResult(scalar=1)
-        if "SELECT id, name, real_name" in sql:
+        # 外层 SELECT 的列名清单由 _lead_select_for 按真实列动态拼装（上游 2026-10-28 起
+        # real_name 等资料列不再硬写在 LEAD_SELECT 里），所以只按固定前缀识别线索行查询。
+        if "SELECT id, name, phone" in sql:
             return StubResult(rows=[self._lead_row])
         if "SELECT phone FROM customer_lead" in sql:
             return StubResult(first=(self._lead_row.get("phone"),))

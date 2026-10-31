@@ -23,7 +23,7 @@ from app.services.auth import ensure_default_user_role
 from app.schemas.auth import PreferenceUpdateRequest
 
 from app.schemas.customer_lead_admin import (
-    CustomerLead, CustomerLeadAbandonment, CustomerLeadAssignment, CustomerLeadConvertResult,
+    CustomerLead, CustomerLeadAbandonment, CustomerLeadAssignment,
     CustomerLeadCreate, CustomerLeadCreateResult, CustomerLeadFollowUp,
     CustomerLeadBatchImportResult, CustomerLeadConvertRequest, CustomerLeadFollowUpCreate, CustomerLeadImportRow, CustomerLeadImportSummary,
     CustomerLeadOption, CustomerLeadOptions,
