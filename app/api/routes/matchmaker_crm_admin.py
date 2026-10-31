@@ -1178,7 +1178,12 @@ async def member_preferences(member_id: int = Path(..., ge=1), current: CurrentM
 
 
 @router.patch("/members/{member_id}/preferences", response_model=PreferenceResponse, summary="修改会员择偶要求")
-async def update_member_preferences_route(member_id: int = Path(..., ge=1), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> dict:
+async def update_member_preferences_route(
+    body: PreferenceUpdateRequest,
+    member_id: int = Path(..., ge=1),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
     return await update_member_preferences(db, member_id, body)
 
 
