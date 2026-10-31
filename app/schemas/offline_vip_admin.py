@@ -179,3 +179,11 @@ class OfflineVipOptions(BaseModel):
     service_matchmakers: list[OfflineVipOption] = Field(default_factory=list)
     promoters: list[OfflineVipOption] = Field(default_factory=list)
     packages: list[str] = Field(default_factory=list)
+
+
+class OfflineVipDeleteResponse(BaseModel):
+    """删除结果：线下VIP 只做软删除（offline_vip.deleted_at），不物理删行。"""
+
+    id: int
+    deleted: bool
+    reason: str | None = Field(default=None, description="删除理由（已写入 business_audit_log）")

@@ -91,6 +91,8 @@ Authorization: Bearer <access-token>
 | `items[].success_count` | int | 是 | `0` | — | 牵线成功次数 | `30` |
 | `items[].commission_amount` | string(decimal) | 是 | `"0.00"` | — | 累计分成金额（元） | `"4500.00"` |
 | `items[].locked` | bool | 是 | — | — | 是否锁定 | `false` |
+| `items[].menu_permission_count` | int | 是 | `0` | — | 已授权菜单条数 | `4` |
+| `items[].menu_permission_configured` | bool | 是 | `false` | — | 是否保存过菜单权限（F15）：`false` = 未配置（默认全部菜单）；`true` = 已配置，此时 `menu_permission_count=0` 表示「已清空 = 无权限」 | `true` |
 | `items[].visible` | bool | 是 | — | — | 前台是否展示 | `true` |
 | `items[].description` | string? | 是 | `null` | — | 个人简介 | `"..."` |
 | `items[].slogan` | string? | 是 | `null` | — | 标语 | `"为你牵线"` |
@@ -892,17 +894,24 @@ Authorization: Bearer <access-token>
 | --- | --- | --- | --- |
 | `matchmaker_id` | int | 是 | 红娘 ID（**驼峰**字段名） |
 | `menuIds` | int[] | 是 | 已授权菜单节点 ID 数组（**驼峰**字段名） |
+| `configured` | bool | 是 | 是否保存过菜单权限（F15）。`false` = 从未配置，沿用「全部菜单」默认；`true` = 按 `menuIds` 精确授权，此时 `menuIds=[]` 代表「已清空 = 无权限」 |
 
 **返回示例（有数据）**
 
 ```json
-{ "matchmaker_id": 12, "menuIds": [1, 11, 12, 20] }
+{ "matchmaker_id": 12, "menuIds": [1, 11, 12, 20], "configured": true }
 ```
 
 **返回示例（空数据）**
 
 ```json
-{ "matchmaker_id": 12, "menuIds": [] }
+{ "matchmaker_id": 12, "menuIds": [], "configured": false }
+```
+
+**返回示例（已清空）**
+
+```json
+{ "matchmaker_id": 12, "menuIds": [], "configured": true }
 ```
 
 **使用方法与业务规则**
@@ -957,7 +966,7 @@ Content-Type: application/json
 - `menuIds` 长度 201（→ 422，超过 200 上限）。
 - `menuIds` 含非整数（→ 422）。
 
-**返回参数**：同 2.11（`matchmaker_id` + `menuIds`）。
+**返回参数**：同 2.11（`matchmaker_id` + `menuIds` + `configured`）。保存空数组同样会置 `configured=true`（即「已配置为无权限」）。
 
 **返回示例**：同 2.11 有数据示例。
 

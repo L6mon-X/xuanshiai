@@ -1,11 +1,15 @@
 """Customer lead management for the independent back office."""
 
+import asyncio
+import json
 import re
+import uuid
 from datetime import datetime
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 
-from fastapi import HTTPException
+from fastapi import HTTPException, UploadFile
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 from sqlalchemy import text
@@ -19,10 +23,8 @@ from app.services.auth import ensure_default_user_role
 from app.schemas.auth import PreferenceUpdateRequest
 
 from app.schemas.customer_lead_admin import (
-    CustomerLead, CustomerLeadAbandonment, CustomerLeadAssignment, CustomerLeadConvertRequest, CustomerLeadConvertResult,
-    CustomerLeadCreate, CustomerLeadFollowUp,
-    CustomerLeadBatchImportResult, CustomerLeadFollowUpCreate, CustomerLeadImportRow, CustomerLeadImportSummary,
-    CustomerLead, CustomerLeadAbandonment, CustomerLeadAssignment, CustomerLeadCreate, CustomerLeadFollowUp,
+    CustomerLead, CustomerLeadAbandonment, CustomerLeadAssignment, CustomerLeadConvertResult,
+    CustomerLeadCreate, CustomerLeadCreateResult, CustomerLeadFollowUp,
     CustomerLeadBatchImportResult, CustomerLeadConvertRequest, CustomerLeadFollowUpCreate, CustomerLeadImportRow, CustomerLeadImportSummary,
     CustomerLeadOption, CustomerLeadOptions,
     CustomerLeadPage, CustomerLeadStatistics, CustomerLeadUpdate,
@@ -32,17 +34,69 @@ from app.schemas.customer_lead_admin import (
 from app.services.customer_lead_contact import (
     ensure_contact_available, normalize_contact, raise_duplicate_contact,
 )
+from app.services.lead_apportion import resolve_assigned_matchmaker
+from app.core.config import settings
+from app.services.audio_duration import parse_audio_duration
+from app.services.media_access import MEDIA_CATEGORY_FOLLOW_UP, sign_media_url
+# 客源跟进附件与会员侧完全同构：直接复用会员跟进的落盘/webp/录音校验/JSON 解析助手，
+# 避免两套实现漂移（图片转 webp、录音白名单、限流读取等均单一真相源）。
+from app.services.member_follow_up_admin import (
+    FOLLOW_UP_IMAGE_MAX_BYTES,
+    FOLLOW_UP_MAX_IMAGES,
+    FOLLOW_UP_VOICE_MAX_BYTES,
+    _fu_image_outputs,
+    _fu_read_limited,
+    _fu_write_bytes,
+    _parse_follow_up_images,
+    _voice_suffix,
+)
 
-LEAD_SELECT = """SELECT id, name, real_name, phone, wechat, source, photo, birthday, intention_level, status, audit_status, matchmaker_id,
+LEAD_SELECT = """SELECT id, name, phone, wechat, source, intention_level, status, audit_status, matchmaker_id,
     organization_id, promoter_id, next_follow_at, converted_user_id, remark, created_by, created_at, updated_at
     FROM customer_lead"""
 
-_LEAD_GENDER_RE = re.compile(r"\bFROM customer_lead\b")
+_LEAD_FROM_RE = re.compile(r"\bFROM customer_lead\b")
+
+# 客源「本人资料」可读写列（与 _LeadProfileFields 一一对应）。gender/age 单列处理：
+# gender 沿用 CAST，age 由 birth_date 派生。列不存在时读写均静默降级（先发版后迁移）。
+# photo/birthday 是 2026-10-29 为红娘工作台卡片补的单值列（后台表单用 photos/birth_date），
+# 一并列入后两套字段都能读写，读取方按各自口径取值，不会因为列名分叉丢数据。
+_LEAD_PROFILE_COLUMNS: tuple[str, ...] = (
+    "real_name", "birth_date", "marriage", "occupation", "income", "height",
+    "weight", "education", "hometown", "residence", "house", "car",
+    "smoking", "drinking", "ethnicity", "school", "company", "photos",
+    "photo", "birthday",
+)
 
 
-def _apply_gender_column(select_sql: str) -> str:
-    """在客源主表外层 FROM 前补 gender 列。"""
-    return _LEAD_GENDER_RE.sub(", CAST(gender AS SIGNED) AS gender FROM customer_lead", select_sql)
+def _named_placeholders(columns: "list[str] | tuple[str, ...]") -> str:
+    """把列名列表渲染成 ``:col, :col`` 形式的命名占位符。
+
+    必须逐列加冒号：写成 ``f"VALUES (:{', '.join(cols)})"`` 只会给第一列加冒号，
+    其余列退化成裸列名，MySQL 会当作同表列引用（新行里为 NULL），于是校验通过、
+    写入成功、但除首列外全部丢值——这类假成功极难从响应里看出来。
+    """
+    return ", ".join(f":{col}" for col in columns)
+
+
+def _lead_select_for(columns: frozenset[str]) -> str:
+    """在客源主表外层 SELECT 补 gender 与已存在的本人资料列。
+
+    age 优先由 birth_date 派生（TIMESTAMPDIFF），无 birth_date 时回退到 filters 迁移
+    补的 raw age 列；两者都缺则不输出 age。缺列静默跳过，保证「先发版后迁移」
+    不报 Unknown column。只在外层 ``FROM customer_lead`` 词边界处注入一次。
+    """
+    extra: list[str] = []
+    if "gender" in columns:
+        extra.append("CAST(gender AS SIGNED) AS gender")
+    extra.extend(col for col in _LEAD_PROFILE_COLUMNS if col in columns)
+    if "birth_date" in columns:
+        extra.append("TIMESTAMPDIFF(YEAR, birth_date, UTC_DATE()) AS age")
+    elif "age" in columns:
+        extra.append("age")
+    if not extra:
+        return LEAD_SELECT
+    return _LEAD_FROM_RE.sub(", " + ", ".join(extra) + " FROM customer_lead", LEAD_SELECT)
 
 
 # 导入模板表头（顺序即模板列顺序）
@@ -75,13 +129,18 @@ def _lead(row: Any, redaction_level: str = REDACTION_LEVEL_STANDARD) -> Customer
     """客源线索序列化。
 
     `wechat` 按敏感等级掩码后返回（审计第 1 项：完整微信号不得返回）；默认标准级，
-    调用方忘记传等级时落到最严格一档，不会泄露完整值。
+    调用方忘记传等级时落到最严格一档，不会泄露完整值。`photos` 为 JSON 列，
+    raw SQL 取回的是文本，归一化为 URL 列表（NULL 保持 None）。
     `gender` 历史行有 NULL（A13 加列前的数据），CustomerLead 是 Literal[0,1,2]
     不接受 None，这里归一为 0（未知），否则整行序列化 500。
     """
+    from app.services.profile import _json_list  # 延迟导入避免模块级循环依赖
+
     payload = dict(row)
     payload["wechat"] = mask_contact(payload.get("wechat"), redaction_level)
     payload["gender"] = payload.get("gender") or 0
+    if payload.get("photos") is not None:
+        payload["photos"] = _json_list(payload["photos"])
     return CustomerLead(**payload)
 
 
@@ -109,22 +168,38 @@ async def _ensure_user_in_scope(db: AsyncSession, user_id: int | None, scope: st
         raise HTTPException(404, detail="目标人员不在当前数据范围")
 
 
-async def create_lead(db: AsyncSession, account_id: int, request: CustomerLeadCreate, redaction_level: str = REDACTION_LEVEL_STANDARD, *, assignment_scope: str | None = None, assignment_scope_params: dict[str, Any] | None = None) -> CustomerLead:
+async def create_lead(db: AsyncSession, account_id: int, request: CustomerLeadCreate, redaction_level: str = REDACTION_LEVEL_STANDARD, *, assignment_scope: str | None = None, assignment_scope_params: dict[str, Any] | None = None) -> CustomerLeadCreateResult:
     phone = normalize_contact(request.phone)
     wechat = normalize_contact(request.wechat)
     await _ensure_user_in_scope(db, request.promoter_id, assignment_scope, assignment_scope_params)
     await ensure_contact_available(db, phone, wechat)
+    # auto_assign=true 时按分派配置在同一事务内选好归属红娘；选不到人（返回 None）则不写
+    # matchmaker_id，客源保持未分派。策略计算全部在服务端完成。
+    assigned_matchmaker_id = await resolve_assigned_matchmaker(db, auto_assign=request.auto_assign)
+    from app.services.profile import _calculate_age, _json_value  # 延迟导入避免循环依赖
     try:
-        insert_columns = ["name", "real_name", "phone", "wechat", "source", "intention_level", "remark", "promoter_id", "audit_status", "created_by"]
-        insert_payload = {**request.model_dump(), "phone": phone, "wechat": wechat, "created_by": account_id}
         columns = await _lead_columns(db)
-        # photo/birthday/gender 列可能还没迁移，先发版后迁移时从写入列里剔除，避免 Unknown column 500。
-        insert_columns += [column for column in ("photo", "birthday", "gender") if column in columns]
-        # 每个占位符都要带冒号：`(:{', '.join(cols)})` 只会给第一列生成绑定参数，
-        # 其余列名会被当成列引用，MySQL 按列默认值插入 —— 静默丢掉操作员填的值。
+        insert_columns = ["name", "phone", "wechat", "source", "intention_level", "remark", "promoter_id", "audit_status", "created_by"]
+        insert_payload = {**request.model_dump(exclude={"auto_assign"}), "phone": phone, "wechat": wechat, "created_by": account_id}
+        # photos 存 JSON 字符串；birth_date 有值时同步派生 raw age 列（供列表筛选与旧口径使用）。
+        if insert_payload.get("photos") is not None:
+            insert_payload["photos"] = _json_value(insert_payload["photos"])
+        if insert_payload.get("birth_date") is not None:
+            insert_payload["age"] = _calculate_age(insert_payload["birth_date"])
+        # 基础列恒写；gender / 资料列 / age 仅写库中已存在且有值的列（缺列静默降级）。
+        for col in ("gender", *_LEAD_PROFILE_COLUMNS, "age"):
+            if col in columns and insert_payload.get(col) is not None:
+                insert_columns.append(col)
+        if assigned_matchmaker_id:
+            insert_columns.append("matchmaker_id")
+            insert_payload["matchmaker_id"] = assigned_matchmaker_id
+            # 分派时间与归属同写：后台「分派日期」筛选只认 assigned_at，缺列时静默跳过。
+            if "assigned_at" in columns:
+                insert_columns.append("assigned_at")
+                insert_payload["assigned_at"] = datetime.utcnow()
         insert_sql = f"""INSERT INTO customer_lead
             ({', '.join(insert_columns)})
-            VALUES ({', '.join(f':{column}' for column in insert_columns)})"""
+            VALUES ({_named_placeholders(insert_columns)})"""
         result = await db.execute(text(insert_sql), insert_payload)
         lead_id = int(result.lastrowid)
         await db.execute(text("""INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id)
@@ -133,7 +208,8 @@ async def create_lead(db: AsyncSession, account_id: int, request: CustomerLeadCr
     except IntegrityError:
         await db.rollback()
         raise_duplicate_contact()
-    return await get_lead(db, lead_id, redaction_level)
+    lead = await get_lead(db, lead_id, redaction_level)
+    return CustomerLeadCreateResult(**lead.model_dump(), assigned=bool(assigned_matchmaker_id))
 
 
 def _merge_scope(
@@ -164,13 +240,53 @@ async def get_lead(
     columns = await _lead_columns(db)
     if "deleted_at" in columns:
         where.append("deleted_at IS NULL")
-    select_sql = LEAD_SELECT
-    if "gender" in columns:
-        select_sql = _apply_gender_column(select_sql)
+    select_sql = _lead_select_for(columns)
     row = (await db.execute(text(f"{select_sql} WHERE {' AND '.join(where)}"), params)).mappings().first()
     if not row:
         raise HTTPException(404, detail="客源线索不存在")
     return _lead(row, redaction_level)
+
+
+# 客源婚况（varchar 档位）→ users.is_married（int）编码：0未知 1未婚 2离异 3丧偶。
+# 只搬运能干净映射的取值（数字码或中文标签），无法识别时不写回（保持账号默认）。
+_LEAD_MARRIAGE_TO_CODE = {"未婚": 1, "离异": 2, "丧偶": 3}
+
+
+def _map_lead_marriage(value: str | None) -> int | None:
+    if value is None:
+        return None
+    text_value = str(value).strip()
+    if text_value.isdigit():
+        code = int(text_value)
+        return code if code in (1, 2, 3) else None
+    return _LEAD_MARRIAGE_TO_CODE.get(text_value)
+
+
+async def _table_columns(db: AsyncSession, table: str) -> frozenset[str]:
+    rows = await db.execute(text("""SELECT COLUMN_NAME FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t"""), {"t": table})
+    return frozenset(row[0] for row in rows.all())
+
+
+async def _upsert_profile_row(
+    db: AsyncSession, table: str, user_id: int, data: dict[str, Any], existing_cols: frozenset[str]
+) -> None:
+    """向 user_profile / user_auth 写一行资料（按 user_id 唯一键 upsert）。
+
+    只写非 None 且列真实存在的字段（缺列静默跳过，保证「先发版后迁移」不报错）。
+    表名为服务内部常量，不拼接用户输入。
+    """
+    cols = [c for c, v in data.items() if v is not None and c in existing_cols]
+    if not cols:
+        return
+    params: dict[str, Any] = {c: data[c] for c in cols}
+    params["user_id"] = user_id
+    col_sql = ", ".join(cols)
+    val_sql = ", ".join(f":{c}" for c in cols)
+    upd_sql = ", ".join(f"{c} = VALUES({c})" for c in cols)
+    await db.execute(text(
+        f"""INSERT INTO {table} (user_id, {col_sql}) VALUES (:user_id, {val_sql})
+            ON DUPLICATE KEY UPDATE {upd_sql}, updated_at = UTC_TIMESTAMP()"""), params)
 
 
 async def convert_lead(
@@ -218,6 +334,35 @@ async def convert_lead(
         })
         user_id = int(result.lastrowid)
         await ensure_default_user_role(db, user_id)
+        # 客源「本人资料」搬运到新账号（对标站建档即带资料）：user_profile / user_auth 走 upsert，
+        # users.birthday / is_married 属主表基础列直接补写。income（varchar 档位）与账号 decimal
+        # 口径不兼容、不搬运；缺列静默跳过。
+        from app.services.profile import _json_value  # 延迟导入避免循环依赖
+
+        profile_cols = await _table_columns(db, "user_profile")
+        auth_cols = await _table_columns(db, "user_auth")
+        await _upsert_profile_row(db, "user_profile", user_id, {
+            "height": lead.height, "weight": lead.weight, "hometown": lead.hometown,
+            "residence": lead.residence, "ethnicity": lead.ethnicity, "house": lead.house,
+            "car": lead.car, "smoking": lead.smoking, "drinking": lead.drinking,
+            "occupation": lead.occupation,
+            # 后台表单存 photos 数组，工作台线索可能只有单值 photo：两者都搬，别让只填了一个的线索入库后丢头像。
+            "photos": _json_value(lead.photos) if lead.photos else (_json_value([lead.photo]) if lead.photo else None),
+        }, profile_cols)
+        await _upsert_profile_row(db, "user_auth", user_id, {
+            "real_name": lead.real_name, "education": lead.education, "school": lead.school,
+            "company": lead.company, "job": lead.occupation,
+        }, auth_cols)
+        user_patch: dict[str, Any] = {}
+        birth = lead.birth_date or lead.birthday
+        if birth is not None:
+            user_patch["birthday"] = birth
+        mapped_marriage = _map_lead_marriage(lead.marriage)
+        if mapped_marriage is not None:
+            user_patch["is_married"] = mapped_marriage
+        if user_patch:
+            patch_assign = ", ".join(f"{k} = :{k}" for k in user_patch)
+            await db.execute(text(f"UPDATE users SET {patch_assign} WHERE id = :uid"), {**user_patch, "uid": user_id})
         await db.execute(text("""INSERT INTO matchmaker_member_review (user_id, status, reviewed_by)
             VALUES (:user_id, 'PENDING', NULL)
             ON DUPLICATE KEY UPDATE updated_at = UTC_TIMESTAMP()"""), {"user_id": user_id})
@@ -454,9 +599,7 @@ async def list_leads(
 
     clause = " AND ".join(where)
     order_sql = _LEAD_ORDER_SQL.get(order or "latest", _LEAD_ORDER_SQL["latest"])
-    select_sql = LEAD_SELECT
-    if "gender" in columns:
-        select_sql = _apply_gender_column(select_sql)
+    select_sql = _lead_select_for(columns)
     rows = await db.execute(text(f"{select_sql} WHERE {clause} ORDER BY {order_sql} LIMIT :limit OFFSET :offset"), params)
     count = await db.execute(text(f"SELECT COUNT(*) FROM customer_lead WHERE {clause}"), {k: v for k, v in params.items() if k not in ("limit", "offset")})
     total = int(count.scalar() or 0)
@@ -474,10 +617,18 @@ async def update_lead(
     scope_params: dict[str, Any] | None = None,
 ) -> CustomerLead:
     current = await get_lead(db, lead_id, redaction_level, scope=scope, scope_params=scope_params)
+    from app.services.profile import _calculate_age, _json_value  # 延迟导入避免循环依赖
+    columns = await _lead_columns(db)
     values = request.model_dump(exclude_unset=True)
-    # gender 列未迁移时从写入字段剔除，避免 Unknown column 500（先发版后迁移）。
-    if "gender" in values and "gender" not in await _lead_columns(db):
-        values.pop("gender")
+    # photos 存 JSON；birth_date 有值时同步派生 raw age 列。
+    if values.get("photos") is not None:
+        values["photos"] = _json_value(values["photos"])
+    if values.get("birth_date") is not None and "age" in columns:
+        values["age"] = _calculate_age(values["birth_date"])
+    # 缺列降级：库中不存在的 gender / 资料列 / age 从写入字段剔除，避免 Unknown column 500（先发版后迁移）。
+    for col in ("gender", *_LEAD_PROFILE_COLUMNS, "age"):
+        if col in values and col not in columns:
+            values.pop(col)
     # 掩码值不写回：表单预填的是脱敏后的展示值，原样落库会把真实微信号毁成 ***
     if is_masked_value(values.get("wechat")):
         values.pop("wechat")
@@ -511,6 +662,10 @@ _LEAD_PREF_COLUMNS = [
     "accept_long_distance", "accept_cross_province", "housing_requirement",
     "smoking_requirement", "drinking_requirement", "dating_goal", "meeting_pace",
     "children_intention", "extra_requirement",
+    # 后台会员管理同一套单选字符串口径（2026-10-27）；customer_lead_preference 需同步补列
+    # （迁移 20261031_01），否则 _upsert_lead_preference 会写不存在的列导致 PUT 500。
+    "income_range", "education_requirement", "marriage_requirement", "housing_expectation",
+    "smoking_expectation", "drinking_expectation", "marriage_timeline", "preferred_occupation",
 ]
 
 
@@ -647,11 +802,47 @@ async def assign_lead(
     assign_where = ["id = :id"]
     assign_params: dict[str, Any] = {**values, "id": lead_id}
     _merge_scope(assign_where, assign_params, scope, scope_params)
-    set_clause = ", ".join(f"{key} = :{key}" for key in values)
+    set_parts = [f"{key} = :{key}" for key in values]
+    # 归属变更同步刷新分派时间；显式清空归属时一并清空，避免「无归属却有分派时间」。
+    if "matchmaker_id" in values and "assigned_at" in await _lead_columns(db):
+        set_parts.append("assigned_at = CASE WHEN :matchmaker_id IS NULL THEN NULL ELSE UTC_TIMESTAMP() END")
+    set_clause = ", ".join(set_parts)
     await db.execute(text(f"UPDATE customer_lead SET {set_clause}, updated_at = UTC_TIMESTAMP() WHERE {' AND '.join(assign_where)}"), assign_params)
     await db.execute(text("INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id) VALUES (:actor, 'customer_lead.assign', 'customer_lead', :id)"), {"actor": account_id, "id": lead_id})
     await db.commit()
     return await get_lead(db, lead_id, redaction_level, scope=scope, scope_params=scope_params)
+
+
+async def auto_assign_lead(
+    db: AsyncSession,
+    account_id: int,
+    lead_id: int,
+    *,
+    force: bool = False,
+    redaction_level: str = REDACTION_LEVEL_STANDARD,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> CustomerLeadCreateResult:
+    """对已存在的客源按分派策略重算归属红娘。
+
+    默认仅对当前未分派的客源生效；force=true 即使已有归属也重算并覆盖。
+    选不到人时不改动现有归属，返回 assigned=false，让前端可提示。
+    """
+    lead = await get_lead(db, lead_id, redaction_level, scope=scope, scope_params=scope_params)
+    if lead.matchmaker_id is not None and not force:
+        return CustomerLeadCreateResult(**lead.model_dump(), assigned=True)
+    matchmaker_id = await resolve_assigned_matchmaker(db, auto_assign=True)
+    if not matchmaker_id:
+        return CustomerLeadCreateResult(**lead.model_dump(), assigned=False)
+    assign_where = ["id = :id"]
+    assign_params: dict[str, Any] = {"id": lead_id, "matchmaker_id": matchmaker_id}
+    _merge_scope(assign_where, assign_params, scope, scope_params)
+    assigned_at_sql = ", assigned_at = UTC_TIMESTAMP()" if "assigned_at" in await _lead_columns(db) else ""
+    await db.execute(text(f"UPDATE customer_lead SET matchmaker_id = :matchmaker_id{assigned_at_sql}, updated_at = UTC_TIMESTAMP() WHERE {' AND '.join(assign_where)}"), assign_params)
+    await db.execute(text("INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id) VALUES (:actor, 'customer_lead.auto_assign', 'customer_lead', :id)"), {"actor": account_id, "id": lead_id})
+    await db.commit()
+    updated = await get_lead(db, lead_id, redaction_level, scope=scope, scope_params=scope_params)
+    return CustomerLeadCreateResult(**updated.model_dump(), assigned=True)
 
 
 async def add_follow_up(
@@ -674,19 +865,132 @@ async def add_follow_up(
     return CustomerLeadFollowUp(**dict(row))
 
 
+_LEAD_FU_BASE_COLS = "id, lead_id, method, content, intention_level, next_follow_at, created_by, created_at"
+_LEAD_FU_MEDIA_COLS = ("images", "voice_url", "voice_duration_sec")
+
+
+def _lead_fu_media_select(cols: frozenset[str]) -> str:
+    """根据实际存在的附件列拼接 SELECT 片段（缺列降级，支持先发版后迁移）。"""
+    return "".join(f", {col}" for col in _LEAD_FU_MEDIA_COLS if col in cols)
+
+
+def _build_lead_follow_up(row: dict[str, Any]) -> CustomerLeadFollowUp:
+    """行 -> 响应模型。images 反序列化为 list，voice_duration_sec 转 int，缺列时走默认。"""
+    payload = dict(row)
+    if "images" in payload:
+        payload["images"] = _parse_follow_up_images(payload["images"])
+    if payload.get("voice_duration_sec") is not None:
+        payload["voice_duration_sec"] = int(payload["voice_duration_sec"])
+    return CustomerLeadFollowUp(**payload)
+
+
+def _sign_lead_follow_up(item: CustomerLeadFollowUp, viewer: int) -> CustomerLeadFollowUp:
+    """响应层重签：DB 存原始 URL，返回给当前管理员的附件 URL 附短期签名（TTL 300s）。"""
+    item.images = [
+        sign_media_url(url, category=MEDIA_CATEGORY_FOLLOW_UP, viewer=viewer) for url in item.images
+    ]
+    if item.voice_url:
+        item.voice_url = sign_media_url(item.voice_url, category=MEDIA_CATEGORY_FOLLOW_UP, viewer=viewer)
+    return item
+
+
+async def create_follow_up_with_media(
+    db: AsyncSession,
+    account_id: int,
+    lead_id: int,
+    method: str,
+    content: str,
+    intention_level: int | None,
+    next_follow_at: datetime | None,
+    images: list[UploadFile] | None,
+    voice: UploadFile | None,
+    voice_duration_sec: int | None,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> CustomerLeadFollowUp:
+    """新增客源跟进记录，支持文字 + 图片（转 webp，最多 9 张）+ 录音。
+
+    与会员侧 create_follow_up_with_media 完全同构：图片存
+    ``{upload_dir}/{lead_id}/follow-up-img-{uuid}.webp``，录音存
+    ``follow-up-voice-{uuid}.{ext}``；URL 形如 ``/storage/uploads/{lead_id}/...``
+    （命中 MEDIA_CATEGORY_FOLLOW_UP 的私有签名路径）。越权（线索不在数据范围内）
+    由 get_lead 抛 404，不落库。附件列缺失时静默降级为仅存文字（先发版后迁移）。
+    """
+    await get_lead(db, lead_id, scope=scope, scope_params=scope_params)
+    if method not in {"PHONE", "WECHAT", "VISIT", "OTHER"}:
+        raise HTTPException(422, detail="跟进方式必须为 PHONE/WECHAT/VISIT/OTHER")
+    normalized_content = (content or "").strip()
+    image_files = [item for item in (images or []) if item is not None and (item.filename or "").strip()]
+    has_voice = voice is not None and bool((voice.filename or "").strip()) and voice.size != 0
+    if not normalized_content and not image_files and not has_voice:
+        raise HTTPException(422, detail="跟进文字与图片/录音至少提供一项")
+    if len(image_files) > FOLLOW_UP_MAX_IMAGES:
+        raise HTTPException(422, detail=f"图片最多{FOLLOW_UP_MAX_IMAGES}张")
+
+    directory = Path(settings.upload_dir) / str(lead_id)
+    image_urls: list[str] = []
+    for image in image_files:
+        data = await _fu_read_limited(image, FOLLOW_UP_IMAGE_MAX_BYTES)
+        webp_data, _thumb = await asyncio.to_thread(_fu_image_outputs, data)
+        name = uuid.uuid4().hex
+        target = directory / f"follow-up-img-{name}.webp"
+        await _fu_write_bytes(target, webp_data)
+        image_urls.append(f"/storage/uploads/{lead_id}/{target.name}")
+
+    voice_url: str | None = None
+    if has_voice:
+        voice_data = await _fu_read_limited(voice, FOLLOW_UP_VOICE_MAX_BYTES)
+        suffix = _voice_suffix(voice)
+        # 时长以服务端解析为准，前端传值仅在容器无法识别时兜底。
+        voice_duration_sec = parse_audio_duration(voice_data) or voice_duration_sec
+        name = uuid.uuid4().hex
+        target = directory / f"follow-up-voice-{name}.{suffix}"
+        await _fu_write_bytes(target, voice_data)
+        voice_url = f"/storage/uploads/{lead_id}/{target.name}"
+
+    cols = await _table_columns(db, "customer_lead_follow_up")
+    insert_cols = ["lead_id", "method", "content", "intention_level", "next_follow_at", "created_by"]
+    params: dict[str, Any] = {
+        "lead_id": lead_id, "method": method, "content": normalized_content,
+        "intention_level": intention_level, "next_follow_at": next_follow_at, "created_by": account_id,
+    }
+    if set(_LEAD_FU_MEDIA_COLS) <= cols:
+        insert_cols += list(_LEAD_FU_MEDIA_COLS)
+        params["images"] = json.dumps(image_urls, ensure_ascii=False) if image_urls else None
+        params["voice_url"] = voice_url
+        params["voice_duration_sec"] = voice_duration_sec if (voice_url and voice_duration_sec) else None
+    col_sql = ", ".join(f"`{c}`" for c in insert_cols)
+    val_sql = ", ".join(f":{c}" for c in insert_cols)
+    result = await db.execute(text(f"INSERT INTO customer_lead_follow_up ({col_sql}) VALUES ({val_sql})"), params)
+    follow_id = int(result.lastrowid)
+    await db.execute(text("UPDATE customer_lead SET status = CASE WHEN status = 'NEW' THEN 'CONTACTED' ELSE status END, next_follow_at = :next_follow_at, updated_at = UTC_TIMESTAMP() WHERE id = :id"), {"next_follow_at": next_follow_at, "id": lead_id})
+    await db.execute(text("""INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id, after_json)
+        VALUES (:actor, 'customer_lead.follow_up.create_media', 'customer_lead_follow_up', :rid, :after)"""),
+        {"actor": account_id, "rid": follow_id, "after": json.dumps({"images": image_urls, "voice_url": voice_url}, ensure_ascii=False)})
+    await db.commit()
+    row = (await db.execute(text(f"SELECT {_LEAD_FU_BASE_COLS}{_lead_fu_media_select(cols)} FROM customer_lead_follow_up WHERE id = :id"), {"id": follow_id})).mappings().one()
+    return _sign_lead_follow_up(_build_lead_follow_up(dict(row)), account_id)
+
+
 async def list_follow_ups(
     db: AsyncSession,
     lead_id: int,
     page: int,
     page_size: int,
     *,
+    viewer: int | None = None,
     scope: str | None = None,
     scope_params: dict[str, Any] | None = None,
 ) -> list[CustomerLeadFollowUp]:
     await get_lead(db, lead_id, scope=scope, scope_params=scope_params)
-    rows = await db.execute(text("""SELECT id, lead_id, method, content, intention_level, next_follow_at, created_by, created_at
+    cols = await _table_columns(db, "customer_lead_follow_up")
+    rows = await db.execute(text(f"""SELECT {_LEAD_FU_BASE_COLS}{_lead_fu_media_select(cols)}
         FROM customer_lead_follow_up WHERE lead_id = :lead_id ORDER BY id DESC LIMIT :limit OFFSET :offset"""), {"lead_id": lead_id, "limit": page_size, "offset": (page - 1) * page_size})
-    return [CustomerLeadFollowUp(**dict(row)) for row in rows.mappings().all()]
+    items = [_build_lead_follow_up(dict(row)) for row in rows.mappings().all()]
+    if viewer is not None:
+        items = [_sign_lead_follow_up(item, viewer) for item in items]
+    return items
 
 
 async def lead_statistics(
@@ -915,7 +1219,8 @@ async def abandon_lead(
     abandon_where = ["id = :id"]
     abandon_params: dict[str, Any] = {"id": lead_id}
     _merge_scope(abandon_where, abandon_params, scope, scope_params)
-    await db.execute(text(f"UPDATE customer_lead SET status = 'LOST', matchmaker_id = NULL, next_follow_at = NULL WHERE {' AND '.join(abandon_where)}"), abandon_params)
+    abandon_assigned_sql = ", assigned_at = NULL" if "assigned_at" in await _lead_columns(db) else ""
+    await db.execute(text(f"UPDATE customer_lead SET status = 'LOST', matchmaker_id = NULL{abandon_assigned_sql}, next_follow_at = NULL WHERE {' AND '.join(abandon_where)}"), abandon_params)
     await db.execute(text("INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id) VALUES (:actor, 'customer_lead.abandon', 'customer_lead', :id)"), {"actor": account_id, "id": lead_id})
     await db.commit()
     row = (await db.execute(text("SELECT id, lead_id, reason, abandoned_by, abandoned_at, restored_by, restored_at, restore_reason FROM customer_lead_abandonment WHERE id = :id"), {"id": int(result.lastrowid)})).mappings().one()
@@ -1076,6 +1381,7 @@ async def _insert_leads(
     errors: list[str] = []
     await _ensure_user_in_scope(db, default_matchmaker_id, assignment_scope, assignment_scope_params)
     await _ensure_user_in_scope(db, default_promoter_id, assignment_scope, assignment_scope_params)
+    columns = await _lead_columns(db)
     for index, row in enumerate(rows, start=start_index):  # Excel 数据从第 2 行起
         # 业务口径：线索必须有有效手机号，否则联系不上人、也无法一键入库成会员。
         phone = normalize_contact(row.phone)
@@ -1106,19 +1412,22 @@ async def _insert_leads(
                 if duplicate.scalar():
                     skipped += 1
                     continue
-            result = await db.execute(text("""INSERT INTO customer_lead
-                (name, phone, wechat, source, intention_level, remark,
-                 matchmaker_id, promoter_id, audit_status, created_by)
-                VALUES (:name, :phone, :wechat, :source, :intention_level, :remark,
-                 :matchmaker_id, :promoter_id, :audit_status, :created_by)"""),
-                {
-                    "name": row.name, "phone": phone, "wechat": wechat,
-                    "source": (row.source or "").strip() or default_source,
-                    "intention_level": row.intention_level, "remark": row.remark,
-                    "matchmaker_id": default_matchmaker_id, "promoter_id": default_promoter_id,
-                    "audit_status": default_audit_status, "created_by": account_id,
-                },
-            )
+            insert_columns = ["name", "phone", "wechat", "source", "intention_level", "remark",
+                              "matchmaker_id", "promoter_id", "audit_status", "created_by"]
+            insert_payload: dict[str, Any] = {
+                "name": row.name, "phone": phone, "wechat": wechat,
+                "source": (row.source or "").strip() or default_source,
+                "intention_level": row.intention_level, "remark": row.remark,
+                "matchmaker_id": default_matchmaker_id, "promoter_id": default_promoter_id,
+                "audit_status": default_audit_status, "created_by": account_id,
+            }
+            # 导入即分派时补写分派时间，保证「分派日期」筛选覆盖导入产生的线索。
+            if default_matchmaker_id and "assigned_at" in columns:
+                insert_columns.append("assigned_at")
+                insert_payload["assigned_at"] = datetime.utcnow()
+            result = await db.execute(text(f"""INSERT INTO customer_lead
+                ({', '.join(insert_columns)})
+                VALUES ({_named_placeholders(insert_columns)})"""), insert_payload)
             lead_id = int(result.lastrowid)
             await db.execute(text("""INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id)
                 VALUES (:actor, 'customer_lead.import', 'customer_lead', :id)"""),

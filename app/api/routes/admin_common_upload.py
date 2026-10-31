@@ -1,7 +1,8 @@
 """后台通用文件上传：公众号安全验证文件（.txt/.html）。
 
 与 ``matchmaker_staff_admin.common_upload``（图片专用，非图片返回 415）并列，
-本接口只接受微信公众平台要求的校验文件，落盘目录与签名方式保持一致。
+本接口只接受微信公众平台要求的校验文件，落盘目录与图片上传一致（``common/``
+公开目录）：验证文件本身需要被微信服务器直接抓取，不能落私有 ``admin/``。
 """
 
 from pathlib import Path as FilePath
@@ -14,7 +15,6 @@ from app.api.dependencies import CurrentMatchmakerAdmin, declare_permission, get
 from app.core.config import settings
 from app.db.session import get_db
 from app.schemas.matchmaker_staff_admin import CommonUploadResponse
-from app.services.media_access import MEDIA_CATEGORY_ADMIN, sign_media_url
 from app.services.profile import _read_limited
 
 router = APIRouter(prefix="/admin")
@@ -47,19 +47,15 @@ async def common_upload_file(
     current.require("matchmaker.manage")
     content_type = verify_file_content_type(file.filename)
     data = await _read_limited(file, VERIFY_FILE_MAX_BYTES)
-    directory = FilePath(settings.upload_dir) / "admin"
+    directory = FilePath(settings.upload_dir) / "common"
     directory.mkdir(parents=True, exist_ok=True)
     name = uuid4().hex
     suffix = FilePath(file.filename or "").suffix.lower()
     target = directory / f"{name}{suffix}"
     target.write_bytes(data)
     return CommonUploadResponse(
-        # 与图片上传一致：后台资源仅后台签发链路，挂载层验签时校验账号状态。
-        url=sign_media_url(
-            f"/storage/uploads/admin/{name}{suffix}",
-            category=MEDIA_CATEGORY_ADMIN,
-            viewer=current.account.id,
-        ),
+        # 校验文件需被微信服务器免签名抓取，落公开 common/ 目录（直接返回原 URL）。
+        url=f"/storage/uploads/common/{name}{suffix}",
         content_type=content_type,
         size=len(data),
     )

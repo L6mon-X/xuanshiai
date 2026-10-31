@@ -57,14 +57,23 @@ class MemberAbandonmentItem(BaseModel):
     id: int
     user_id: int
     nickname: str | None = None
+    # 按次历史列表需要展示会员身份：手机、头像、编号（与会员列表同口径 G+6 位）。
+    phone: str | None = None
+    avatar: str | None = None
+    member_code: str | None = None
     reason: str
     abandon_type: str
     abandoned_by: int
     abandoned_at: datetime
+    # 「放弃人 / 捞取人」原来只有 admin 账号 ID，前端只能显示「-」；
+    # 服务层 JOIN matchmaker_admin_account + users 补出昵称（缺账号时回退用户名）。
+    abandoned_by_name: str | None = None
     restored_by: int | None = None
+    restored_by_name: str | None = None
     restored_at: datetime | None = None
     restore_reason: str | None = None
     assigned_matchmaker_id: int | None = None
+    assigned_matchmaker_name: str | None = None
 
 
 class MemberAbandonmentPage(BaseModel):

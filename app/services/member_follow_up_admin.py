@@ -24,6 +24,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.services.audio_duration import parse_audio_duration
 from app.services.media_access import MEDIA_CATEGORY_FOLLOW_UP, sign_media_url
 from app.schemas.member_follow_up_admin import (
     MemberCallRecordListPage,
@@ -182,6 +183,30 @@ def _method_label(method: str | None) -> str:
     return _METHOD_LABELS.get(str(method or "").upper(), "其他")
 
 
+async def _table_columns(db: AsyncSession, table: str) -> frozenset[str]:
+    """探测表当前存在的列，供「先发版后迁移」读写缺列降级。"""
+    rows = await db.execute(
+        text(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t"
+        ),
+        {"t": table},
+    )
+    return frozenset(row[0] for row in rows.all())
+
+
+def _normalize_call_images(raw: Any) -> list[str] | None:
+    """images 为 JSON 列，raw SQL 取回常为文本/字节；归一化为列表（缺列/NULL 返回 None）。"""
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = []
+    return raw if isinstance(raw, list) else None
+
+
 def _call_row(payload: dict[str, Any]) -> MemberCallRecordRow:
     """数据库行 -> 通话记录列表行。"""
     direction = str(payload.get("direction") or "OUTBOUND").upper()
@@ -199,6 +224,8 @@ def _call_row(payload: dict[str, Any]) -> MemberCallRecordRow:
         status_label=_CALL_STATUS_LABELS.get(status, "已完成"),
         duration_seconds=int(duration) if duration is not None else None,
         remark=payload.get("remark"),
+        images=_normalize_call_images(payload["images"]) if "images" in payload else None,
+        audio_url=payload.get("audio_url"),
         created_at=payload.get("created_at"),
     )
 
@@ -283,7 +310,7 @@ async def list_follow_ups(
 
 
 _CALL_LIST_BODY = """
-SELECT c.id, c.user_id, c.direction, c.status, c.duration_seconds, c.remark, c.created_at,
+SELECT c.id, c.user_id, c.direction, c.status, c.duration_seconds, c.remark, c.created_at,{media}
        u.nickname,
        CONCAT('G', LPAD(u.id, 6, '0')) AS member_code,
        COALESCE(acc.display_name, mk.nickname, 'admin') AS matchmaker_name
@@ -328,9 +355,12 @@ async def list_call_records(
         conditions.append("c.created_at < DATE_ADD(:end_date, INTERVAL 1 DAY)")
         params["end_date"] = end_date
     where = " AND ".join(conditions)
+    # 先发版后迁移：探测附件列，存在才 SELECT（否则旧库报未知列）。c.images 为 JSON，c.audio_url 为文本。
+    call_cols = await _table_columns(db, "member_call_record")
+    media = "".join(f" c.{col}," for col in ("images", "audio_url") if col in call_cols)
     rows = await db.execute(
         text(
-            f"{_CALL_LIST_BODY} WHERE {where}"
+            f"{_CALL_LIST_BODY.format(media=media)} WHERE {where}"
             " ORDER BY c.created_at DESC, c.id DESC LIMIT :limit OFFSET :offset"
         ),
         params,
@@ -679,7 +709,9 @@ def _fu_image_outputs(data: bytes) -> tuple[bytes, bytes]:
             return output.getvalue(), thumb_output.getvalue()
     except DecompressionBombError as exc:
         raise HTTPException(413, detail="图片像素过大") from exc
-    except (UnidentifiedImageError, OSError) as exc:
+    except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
+        # 损坏/截断图片：PIL verify() 对坏 CRC、异常 chunk 会抛 SyntaxError/ValueError（非 OSError 子类），
+        # 统一归一为「无法识别」415，避免退化小图/坏图上传穿透成 500。
         raise HTTPException(415, detail="图片内容无法识别") from exc
     except HTTPException:
         raise
@@ -839,6 +871,8 @@ async def create_follow_up_with_media(
     if has_voice:
         voice_data = await _fu_read_limited(voice, FOLLOW_UP_VOICE_MAX_BYTES)  # type: ignore[union-attr]
         suffix = _voice_suffix(voice)  # type: ignore[arg-type]
+        # 时长以服务端解析为准，前端传值仅在容器无法识别时兜底。
+        voice_duration_sec = parse_audio_duration(voice_data) or voice_duration_sec
         name = uuid.uuid4().hex
         target = directory / f"follow-up-voice-{name}.{suffix}"
         await _fu_write_bytes(target, voice_data)

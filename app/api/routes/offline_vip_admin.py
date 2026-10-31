@@ -10,6 +10,7 @@ from app.api.dependencies import CurrentMatchmakerAdmin, get_current_matchmaker_
 from app.db.session import get_db
 from app.schemas.offline_vip_admin import (
     OfflineVipCreate,
+    OfflineVipDeleteResponse,
     OfflineVipItem,
     OfflineVipMeetLogPage,
     OfflineVipOptions,
@@ -40,6 +41,9 @@ _SERVICE_STATUS_PATTERN = "^(active|expired|no_refund_risk)$"
 # 统计/排序维度
 _SORT_BY_PATTERN = "^(member_last_paid|member_history_paid|monthly_sales|yearly_sales|monthly_champion)$"
 
+# 搜索类型：与 keyword 配合收窄命中列（站4 列表的「搜索类型」下拉）。
+_SEARCH_BY_PATTERN = "^(all|nickname|phone|code|real_name)$"
+
 
 @router.get("", response_model=OfflineVipPage, summary="分页查询线下VIP会员")
 async def list_offline_vips(
@@ -52,6 +56,11 @@ async def list_offline_vips(
     sign_start: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="签约日期起（含）"),
     sign_end: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$", description="签约日期止（含）"),
     keyword: str | None = Query(None, max_length=64, description="会员昵称/手机/姓名/编号"),
+    search_by: str | None = Query(
+        None,
+        pattern=_SEARCH_BY_PATTERN,
+        description="搜索类型：all 综合（默认，昵称/手机/编号/姓名）/ nickname 昵称 / phone 手机 / code 会员编号 / real_name 姓名",
+    ),
     service_status: str | None = Query(None, pattern=_SERVICE_STATUS_PATTERN,
         description="服务状态：active 服务期内 / expired 已过期 / no_refund_risk 无退费风险"),
     sort_by: str | None = Query(None, pattern=_SORT_BY_PATTERN,
@@ -77,6 +86,7 @@ async def list_offline_vips(
         service_status,
         sort_by,
         column_sort,
+        search_by=search_by,
         scope=scope,
         scope_params=scope_params,
     )
@@ -147,3 +157,18 @@ async def offline_vip_meet_logs(
     current.require("matchmaker.member.read")
     scope, scope_params = _scope(current, _VIP_CORRELATION)
     return await service.list_meet_logs(db, vip_id, page, page_size, scope=scope, scope_params=scope_params)
+
+
+@router.delete("/{vip_id}", response_model=OfflineVipDeleteResponse, summary="删除线下VIP记录（软删除）")
+async def delete_offline_vip(
+    vip_id: int = Path(..., ge=1),
+    reason: str = Query("后台删除", min_length=1, max_length=255, description="删除理由（记入审计）"),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> OfflineVipDeleteResponse:
+    """线下VIP之前只有 GET/POST/PUT，没有删除入口；本接口补齐软删除（不物理删行）。"""
+    current.require("matchmaker.member.manage")
+    scope, scope_params = _scope(current, _VIP_CORRELATION)
+    return await service.delete_vip(
+        db, vip_id, current.account.id, reason, scope=scope, scope_params=scope_params
+    )

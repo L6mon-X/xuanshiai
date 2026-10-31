@@ -63,6 +63,8 @@ scripts/*
 # schema 契约与 baseline 导出器必须随仓库发布，否则 CI 无法执行
 !scripts/schema_contract.py
 !scripts/dump_baseline_schema.py
+# 后台公共上传目录迁移（P1 403 修复配套，生产需执行）
+!scripts/migrate_admin_public_media.py
 artifacts/
 
 # Local runtime logs

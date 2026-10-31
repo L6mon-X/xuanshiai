@@ -170,14 +170,20 @@ Authorization: Bearer <access_token>
 | `items[].id` | int | 是 | — | 记录 ID |
 | `items[].user_id` | int | 是 | — | 会员 `users.id` |
 | `items[].nickname` | string/null | 是 | 未设置 | 会员昵称 |
+| `items[].phone` | string/null | 是 | 未填写 | 会员手机号（与会员列表一致，原值返回） |
+| `items[].avatar` | string/null | 是 | 无头像 | 会员头像 |
+| `items[].member_code` | string | 是 | — | 会员编号（`G` + 6 位，与会员列表同口径） |
 | `items[].reason` | string | 是 | — | 弃海原因 |
 | `items[].abandon_type` | string | 是 | — | `manual` / `lead_sync` / `auto` |
 | `items[].abandoned_by` | int | 是 | — | 弃海操作人；`0` 表示迁移回填 |
+| `items[].abandoned_by_name` | string/null | 是 | 账号已删除 | 放弃人展示名（`matchmaker_admin_account` → `users.nickname`，缺账号时回退 `display_name` / `username`） |
 | `items[].abandoned_at` | datetime | 是 | — | 弃海时间 |
 | `items[].restored_by` | int/null | 是 | 未捞回 | 捞回操作人 |
+| `items[].restored_by_name` | string/null | 是 | 未捞回 | 捞取人展示名（口径同 `abandoned_by_name`） |
 | `items[].restored_at` | datetime/null | 是 | 未捞回 | 捞回时间 |
 | `items[].restore_reason` | string/null | 是 | 未填 | 捞回备注 |
 | `items[].assigned_matchmaker_id` | int/null | 是 | 捞回未分派 | 捞回时分派的服务红娘 |
+| `items[].assigned_matchmaker_name` | string/null | 是 | 未分派 | 捞回时所分派红娘的 `users.nickname` |
 | `page` / `page_size` / `total` / `has_more` | — | 是 | — | 分页字段 |
 
 #### 返回示例
@@ -189,14 +195,20 @@ Authorization: Bearer <access_token>
       "id": 7,
       "user_id": 1024,
       "nickname": "小满",
+      "phone": "13800000000",
+      "avatar": "/storage/uploads/avatars/a.webp",
+      "member_code": "G001024",
       "reason": "三个月未回复消息",
       "abandon_type": "manual",
       "abandoned_by": 3,
+      "abandoned_by_name": "王小美",
       "abandoned_at": "2026-10-18T09:30:00",
       "restored_by": 3,
+      "restored_by_name": "王小美",
       "restored_at": "2026-10-19T10:00:00",
       "restore_reason": "客户回心转意",
-      "assigned_matchmaker_id": 88
+      "assigned_matchmaker_id": 88,
+      "assigned_matchmaker_name": "李红线"
     }
   ],
   "page": 1,

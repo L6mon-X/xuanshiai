@@ -122,14 +122,18 @@ def _build(category: str, search: str | None, min_times: int | None, report_stat
         where.append(("u.id" if direction == "sent" else "t.id") + " = :member_id")
         params["member_id"] = member_id
     if search:
-        # 支持「按昵称搜」与「按编号搜」（编号为 G + 6 位左补零，也兼容纯数字）
-        where.append(
-            "(u.nickname LIKE CONCAT('%', :search, '%') "
-            "OR u.phone LIKE CONCAT('%', :search, '%') "
-            "OR LPAD(u.id, 6, '0') LIKE CONCAT('%', :search, '%') "
-            "OR CONCAT('G', LPAD(u.id, 6, '0')) LIKE CONCAT('%', :search, '%'))"
-        )
+        # 双方都参与匹配：只看发起方会导致「搜被浏览人昵称」永远 0 条。
         params["search"] = search
+        condition = (
+            "(u.nickname LIKE CONCAT('%', :search, '%') "
+            "OR t.nickname LIKE CONCAT('%', :search, '%') "
+            "OR u.phone LIKE CONCAT('%', :search, '%')"
+        )
+        if search.isdigit() and len(search) <= 6:
+            # 纯数字按 user_id 精确命中；LIKE '%1%' 会把近似全量都扫出来。
+            params["search_id"] = int(search)
+            condition += " OR u.id = :search_id OR t.id = :search_id"
+        where.append(condition + ")")
     clause = " AND ".join(where)
 
     if category == "browse":

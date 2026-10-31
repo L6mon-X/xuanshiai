@@ -60,10 +60,20 @@ _ABANDONED_SELECT = """SELECT u.id, u.nickname, u.phone, u.gender, u.status, u.c
     LEFT JOIN (SELECT user_id, MAX(created_at) last_follow_at, MAX(next_follow_at) next_follow_at
         FROM member_follow_up GROUP BY user_id) f ON f.user_id = u.id"""
 
-_ABANDONMENT_SELECT = """SELECT ab.id, ab.user_id, u.nickname, ab.reason, ab.abandon_type,
+_ABANDONMENT_SELECT = """SELECT ab.id, ab.user_id, u.nickname, u.phone, u.avatar,
+    CONCAT('G', LPAD(u.id, 6, '0')) AS member_code,
+    ab.reason, ab.abandon_type,
     ab.abandoned_by, ab.abandoned_at, ab.restored_by, ab.restored_at, ab.restore_reason,
-    ab.assigned_matchmaker_id
-    FROM member_abandonment ab JOIN users u ON u.id = ab.user_id"""
+    ab.assigned_matchmaker_id,
+    COALESCE(abu.nickname, aba.display_name, aba.username) AS abandoned_by_name,
+    COALESCE(rbu.nickname, rba.display_name, rba.username) AS restored_by_name,
+    amm.nickname AS assigned_matchmaker_name
+    FROM member_abandonment ab JOIN users u ON u.id = ab.user_id
+    LEFT JOIN matchmaker_admin_account aba ON aba.id = ab.abandoned_by
+    LEFT JOIN users abu ON abu.id = aba.matchmaker_user_id
+    LEFT JOIN matchmaker_admin_account rba ON rba.id = ab.restored_by
+    LEFT JOIN users rbu ON rbu.id = rba.matchmaker_user_id
+    LEFT JOIN users amm ON amm.id = ab.assigned_matchmaker_id"""
 
 
 def _abandoned_item(row: Any) -> AbandonedMemberItem:

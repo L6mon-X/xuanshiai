@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import json
+import secrets
+import uuid
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -18,7 +20,10 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas.matchmaker_admin import MatchmakerAdminAccount
+from app.schemas.matchmaker_admin_account import MatchmakerAdminAccountCreate
 from app.schemas.promoter_staff_admin import (
+    PromoterCommissionEntryCreate,
+    PromoterCommissionEntryCreateResult,
     PromoterCommissionEntryItem,
     PromoterCommissionEntryOptions,
     PromoterCommissionEntryPage,
@@ -38,6 +43,7 @@ from app.schemas.promoter_staff_admin import (
     PromoterUserCandidate,
 )
 from app.services.matchmaker_admin_auth import _issue_session
+from app.services.matchmaker_admin_account import create_account as create_admin_account
 from app.services import user_candidates
 
 _APPLY_TYPE = "promoter"
@@ -277,7 +283,8 @@ async def create_promoter(
     if existing.scalar():
         raise HTTPException(409, detail="该普通用户已是推广红娘或推广申请待审核")
 
-    name = str(user["nickname"] or f"推广红娘#{user_id}")
+    # 展示名优先取后台录入的 display_name（不回写 users.nickname，避免覆盖会员账号昵称）。
+    name = str(body.display_name or user["nickname"] or f"推广红娘#{user_id}")
     await db.execute(
         text(
             """INSERT INTO user_matchmaker_apply
@@ -360,27 +367,20 @@ async def update_promoter(
             "uid": user_id,
         },
     )
-    if body.display_name is not None or body.phone is not None:
-        user_assignments: list[str] = []
-        user_params: dict[str, object] = {"uid": user_id}
-        if body.display_name is not None:
-            user_assignments.append("nickname = :name")
-            user_params["name"] = body.display_name
-        if body.phone is not None:
-            user_assignments.append("phone = :phone")
-            user_params["phone"] = body.phone
+    if body.display_name is not None:
+        # 只改推广红娘展示名（user_matchmaker_apply.real_name），不动 users.nickname。
         await db.execute(
-            text(f"UPDATE users SET {', '.join(user_assignments)} WHERE id = :uid"),
-            user_params,
+            text(
+                "UPDATE user_matchmaker_apply SET real_name = :name, updated_at = UTC_TIMESTAMP() "
+                "WHERE user_id = :uid AND application_type = 'promoter'"
+            ),
+            {"name": body.display_name, "uid": user_id},
         )
-        if body.display_name is not None:
-            await db.execute(
-                text(
-                    "UPDATE user_matchmaker_apply SET real_name = :name "
-                    "WHERE user_id = :uid AND application_type = 'promoter'"
-                ),
-                {"name": body.display_name, "uid": user_id},
-            )
+    if body.phone is not None:
+        await db.execute(
+            text("UPDATE users SET phone = :phone WHERE id = :uid"),
+            {"phone": body.phone, "uid": user_id},
+        )
     await db.commit()
     return await get_promoter(db, user_id)
 
@@ -672,6 +672,122 @@ async def promoter_commission_entry_options(
     )
 
 
+async def create_commission_entry(
+    db: AsyncSession,
+    actor_account_id: int,
+    body: PromoterCommissionEntryCreate,
+) -> PromoterCommissionEntryCreateResult:
+    """后台手工录入一笔推广红娘分成：只写 commission_entry（PENDING/manual）+ 审计日志，不动余额账本。
+
+    与「服务红娘线上分成明细」手工录入同源，不写 account_ledger（不凭空增加可提现余额）；
+    记录落入本页 promoter 分成流水（beneficiary_type='promoter'）供展示与事后核对。
+    """
+    promoter = (
+        await db.execute(
+            text("""SELECT ma.user_id FROM user_matchmaker_apply ma
+                JOIN users u ON u.id = ma.user_id
+                WHERE ma.user_id = :id AND ma.application_type = 'promoter'"""),
+            {"id": body.promoter_user_id},
+        )
+    ).mappings().first()
+    if promoter is None:
+        raise HTTPException(400, detail="推广红娘账号不存在")
+
+    rule_name: str | None = None
+    rule_version: int | None = None
+    if body.rule_id is not None:
+        rule = (
+            await db.execute(
+                text("""SELECT id, name, version FROM commission_rule
+                    WHERE id = :id AND beneficiary_type = 'promoter' AND status = 1"""),
+                {"id": body.rule_id},
+            )
+        ).mappings().first()
+        if not rule:
+            raise HTTPException(400, detail="分成事件不存在或已停用")
+        rule_name = str(rule["name"])
+        rule_version = int(rule["version"]) if rule["version"] is not None else None
+
+    if body.consumer_user_id is not None:
+        consumer = await db.scalar(
+            text("SELECT id FROM users WHERE id = :id"), {"id": body.consumer_user_id}
+        )
+        if consumer is None:
+            raise HTTPException(400, detail="购买账号不存在")
+
+    amount = Decimal(str(body.amount)).quantize(Decimal("0.01"))
+    base_amount = (
+        Decimal(str(body.base_amount)) if body.base_amount is not None else amount
+    ).quantize(Decimal("0.01"))
+    key = f"promoter-manual-{uuid.uuid4().hex}"
+    result = await db.execute(
+        text("""INSERT INTO commission_entry
+            (order_id, beneficiary_type, beneficiary_id, rule_id, rule_version,
+             base_amount, amount, status, source, remark, idempotency_key)
+            VALUES (NULL, 'promoter', :beneficiary_id, :rule_id, :rule_version,
+             :base_amount, :amount, 'PENDING', 'manual', :remark, :key)"""),
+        {
+            "beneficiary_id": body.promoter_user_id,
+            "rule_id": body.rule_id,
+            "rule_version": rule_version,
+            "base_amount": f"{base_amount:.2f}",
+            "amount": f"{amount:.2f}",
+            "remark": body.remark,
+            "key": key,
+        },
+    )
+    entry_id = int(result.lastrowid)
+
+    await db.execute(
+        text("""INSERT INTO business_audit_log
+            (actor_user_id, action, resource_type, resource_id, after_json)
+            VALUES (:actor, 'finance.promoter_commission.create', 'commission_entry', :entry_id, :after_json)"""),
+        {
+            "actor": actor_account_id,
+            "entry_id": entry_id,
+            "after_json": json.dumps(
+                {
+                    "promoter_user_id": body.promoter_user_id,
+                    "consumer_user_id": body.consumer_user_id,
+                    "rule_id": body.rule_id,
+                    "rule_name": rule_name,
+                    "amount": f"{amount:.2f}",
+                    "remark": body.remark,
+                },
+                ensure_ascii=False,
+            ),
+        },
+    )
+    await db.commit()
+
+    row = (
+        await db.execute(
+            text("""SELECT ce.id, ce.created_at, ce.beneficiary_id, ce.rule_id, ce.base_amount,
+                ce.amount, ce.status, rule.name AS event_name,
+                u.nickname AS promoter_name, u.avatar AS promoter_avatar
+                FROM commission_entry ce
+                LEFT JOIN users u ON u.id = ce.beneficiary_id
+                LEFT JOIN commission_rule rule ON rule.id = ce.rule_id
+                WHERE ce.id = :id"""),
+            {"id": entry_id},
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(500, detail="分成录入回读失败")
+    entry = PromoterCommissionEntryItem(
+        id=int(row["id"]),
+        created_at=_dt(row["created_at"]),
+        promoter_id=int(row["beneficiary_id"]),
+        promoter_name=row.get("promoter_name"),
+        promoter_avatar=row.get("promoter_avatar"),
+        event_name=row.get("event_name"),
+        base_amount=_money(row.get("base_amount")),
+        amount=_money(row.get("amount")),
+        status=str(row.get("status") or "PENDING"),
+    )
+    return PromoterCommissionEntryCreateResult(entry=entry)
+
+
 # ─── 海报 / 免登 / 删除 ─────────────────────────────────────────
 
 
@@ -684,20 +800,14 @@ async def promoter_poster(db: AsyncSession, user_id: int) -> PromoterPosterRespo
     )
 
 
-async def promoter_platform_token(
-    db: AsyncSession, user_id: int
-) -> PromoterPlatformTokenResponse:
-    """为推广红娘签发免登 token（复用独立红娘后台账号体系）。
-
-    推广红娘工作台地址尚未定稿，jump_url 暂复用总店红娘工作台路径。
-    """
-    await get_promoter(db, user_id)
+async def _promoter_account_row(db: AsyncSession, user_id: int) -> dict[str, Any] | None:
+    """读推广红娘绑定的后台账号（不按 status 过滤，停用态需显式报错）。"""
     row = (
         (
             await db.execute(
                 text(
                     "SELECT id,username,display_name,matchmaker_user_id,data_scope,organization_id,status,last_login_at "
-                    "FROM matchmaker_admin_account WHERE matchmaker_user_id=:id AND status=1"
+                    "FROM matchmaker_admin_account WHERE matchmaker_user_id=:id ORDER BY id LIMIT 1"
                 ),
                 {"id": user_id},
             )
@@ -705,9 +815,61 @@ async def promoter_platform_token(
         .mappings()
         .first()
     )
-    if not row:
-        raise HTTPException(404, detail="推广红娘后台账号不存在")
-    account = MatchmakerAdminAccount(**dict(row))
+    return dict(row) if row else None
+
+
+async def _provision_promoter_account(
+    db: AsyncSession,
+    user_id: int,
+    detail: PromoterStaffDetail,
+    actor_account_id: int,
+) -> None:
+    """未绑定后台账号时按最小权限自动开通：随机密码 + SELF 数据范围 + 零权限。
+
+    免登 token 只能签发到存在的账号；开通过程写 ``admin_account.create`` 审计。
+    """
+    base = f"promoter{user_id}"
+    username = base
+    suffix = 1
+    while await db.scalar(
+        text("SELECT 1 FROM matchmaker_admin_account WHERE username = :u"),
+        {"u": username},
+    ):
+        suffix += 1
+        username = f"{base}_{suffix}"[:64]
+    await create_admin_account(
+        db,
+        MatchmakerAdminAccountCreate(
+            username=username,
+            password=secrets.token_urlsafe(24),
+            display_name=(detail.display_name or f"推广红娘#{user_id}")[:128],
+            matchmaker_user_id=user_id,
+            data_scope="SELF",
+            permissions=[],
+        ),
+        actor_account_id,
+    )
+
+
+async def promoter_platform_token(
+    db: AsyncSession, user_id: int, actor_account_id: int
+) -> PromoterPlatformTokenResponse:
+    """为推广红娘签发免登 token（复用独立红娘后台账号体系）。
+
+    未绑定后台账号时自动开通最小权限账号后再签发，避免免登入口 404；
+    账号已停用时返回 409，不在停用态上签发 token。
+    推广红娘工作台地址尚未定稿，jump_url 暂复用总店红娘工作台路径。
+    """
+    detail = await get_promoter(db, user_id)
+    row = await _promoter_account_row(db, user_id)
+    if row is None:
+        await _provision_promoter_account(db, user_id, detail, actor_account_id)
+        row = await _promoter_account_row(db, user_id)
+    if row is None:
+        raise HTTPException(500, detail="推广红娘后台账号开通失败")
+    if int(row["status"] or 0) != 1:
+        raise HTTPException(409, detail="推广红娘后台账号已停用，请先在后台账号管理启用")
+    account = MatchmakerAdminAccount(**row)
     issued = await _issue_session(db, account, None, "admin-impersonation")
     return PromoterPlatformTokenResponse(
         promoter_id=user_id,

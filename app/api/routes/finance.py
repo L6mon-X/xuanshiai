@@ -1,6 +1,6 @@
 """一期订单、分成、余额和提现接口。"""
 
-from fastapi import APIRouter, Body, Depends, Path, Query
+from fastapi import APIRouter, Body, Depends, Header, Path, Query
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,6 +21,8 @@ from app.schemas.finance import (
     CommissionEntryDetailPage,
     CommissionRuleCreate,
     CommissionRuleResponse,
+    MatchmakerCommissionEntryCreate,
+    MatchmakerCommissionEntryCreateResult,
     CreditGrantRequest,
     CreditGrantResult,
     CreditDeductRequest,
@@ -57,6 +59,7 @@ from app.services.finance import (
     list_user_commissions,
     admin_finance_report,
     admin_list_commission_entries,
+    admin_create_commission_entry,
     admin_list_commission_options,
     admin_list_store_commission_entries,
     admin_store_commission_options,
@@ -89,9 +92,21 @@ def _finance_actor(current: CurrentMatchmakerAdmin) -> CurrentUser:
     return CurrentUser(id=current.account.id, session_id=current.session_id, phone=None, status=1, realname_status=2)
 
 
-@router.post("/orders", response_model=PaymentOrderResponse, status_code=201, summary="创建待支付订单")
-async def order(body: FinanceOrderCreate = Body(...), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> PaymentOrderResponse:
-    return await create_order(db, current, body)
+@router.post("/orders", response_model=PaymentOrderResponse, status_code=201, summary="后台代用户创建会员订单")
+async def order(
+    body: FinanceOrderCreate = Body(...),
+    idempotency_key: str = Header(
+        ...,
+        alias="Idempotency-Key",
+        min_length=8,
+        max_length=128,
+    ),
+    admin: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> PaymentOrderResponse:
+    """仅后台可调用；只接受套餐编码，金额从套餐配置读取。"""
+    admin.require("finance.write")
+    return await create_order(db, body, idempotency_key)
 
 
 @router.get("/balance", response_model=AccountBalanceResponse, summary="查询我的余额")
@@ -243,6 +258,22 @@ async def admin_commission_entries(
     return await admin_list_commission_entries(
         db, page, page_size, matchmaker_id, rule_id, start_date, end_date, admin=admin
     )
+
+
+@admin_router.post(
+    "/commission-entries",
+    response_model=MatchmakerCommissionEntryCreateResult,
+    status_code=201,
+    summary="后台手工录入一笔服务红娘分成（不动余额账本）",
+)
+async def admin_create_commission_entry_route(
+    body: MatchmakerCommissionEntryCreate = Body(...),
+    admin: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MatchmakerCommissionEntryCreateResult:
+    """录入一笔服务红娘分成：只写 commission_entry（PENDING）+ 审计，不写 account_ledger、不动余额。"""
+    admin.require("finance.write")
+    return await admin_create_commission_entry(db, _finance_actor(admin), body)
 
 
 @admin_router.get("/commission-entries/options", response_model=CommissionEntryDetailOptions, summary="获取红娘线上分成明细筛选下拉选项")

@@ -36,6 +36,7 @@ from app.api.routes import (
     interest_tags_admin,
     promotion_order_admin,
     discovery,
+    emotion_lab,
     finance,
     health,
     identity,
@@ -70,6 +71,7 @@ from app.api.routes import (
     media,
     meeting,
     member_follow_up_admin,
+    member_love_users_admin,
     member_records_admin,
     member_vip_admin,
     offline_vip_admin,
@@ -121,6 +123,7 @@ api_router.include_router(certifications.router, tags=["认证审核"])
 api_router.include_router(membership.router, tags=["会员"])
 api_router.include_router(payments.router, tags=["支付"])
 api_router.include_router(points.router, tags=["积分"])
+api_router.include_router(emotion_lab.router, tags=["情感实验室"])
 api_router.include_router(paper_plane_unlock.router, tags=["社区"])
 api_router.include_router(paper_plane_contact_exchange.router, tags=["社区"])
 api_router.include_router(regions.router, tags=["地区"])
@@ -182,6 +185,7 @@ api_router.include_router(short_video_admin.packet_router, tags=["管理后台"]
 api_router.include_router(short_video_admin.homepage_router, tags=["管理后台"])
 api_router.include_router(member_follow_up_admin.router, tags=["管理后台"])
 api_router.include_router(offline_vip_admin.router, tags=["管理后台"])
+api_router.include_router(member_love_users_admin.router, tags=["管理后台"])
 api_router.include_router(reward_rule_admin.router, tags=["红娘后台"])
 api_router.include_router(apportion_config_admin.router, tags=["红娘后台"])
 api_router.include_router(commission_level_admin.router, tags=["红娘后台"])

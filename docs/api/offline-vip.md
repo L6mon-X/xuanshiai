@@ -90,7 +90,8 @@
 | `promoter_id` | query | int | 否 | — | `ge=1` | 推广红娘 |
 | `sign_start` | query | string | 否 | — | 正则 `^\d{4}-\d{2}-\d{2}$` | 签约日期起（含） |
 | `sign_end` | query | string | 否 | — | 正则 `^\d{4}-\d{2}-\d{2}$` | 签约日期止（含） |
-| `keyword` | query | string | 否 | — | `max_length=64` | 会员昵称 / 手机 / 姓名 / 编号 |
+| `keyword` | query | string | 否 | — | `max_length=64` | 会员昵称 / 手机 / 姓名 / 编号，命中范围由 `search_by` 收窄 |
+| `search_by` | query | string | 否 | `all` | `^(all|nickname|phone|code|real_name)$` | 搜索类型：`all` 综合（四列模糊，历史行为）/ `nickname` 昵称 / `phone` 手机 / `code` 会员编号（`G` + 6 位）/ `real_name` 实名（`user_auth.real_name`） |
 
 #### 请求示例
 
@@ -205,7 +206,8 @@ GET /api/v1/admin/offline-vips?sign_start=2026/01/01
 
 - 排序固定 `v.id DESC`；仅返回 `deleted_at IS NULL` 的记录。
 - `progress` 为空表示不限；前端 9 个子 Tab 的「全部」对应不传该参数。
-- `keyword` 同时匹配昵称、手机、会员编号、实名（`user_auth.real_name`）。
+- `keyword` 同时匹配昵称、手机、会员编号、实名（`user_auth.real_name`）；传 `search_by` 时只命中该列（未知取值退化为 `all`）。  
+- `search_by` 取值全部映射到服务端写死的 SQL 片段，不拼接用户输入；未传 `keyword` 时 `search_by` 不生效。  
 - `last_follow_at` 来自 `member_follow_up` 该会员最新一条记录时间；无跟进记录时为 `null`。
 - 「红娘」列优先展示服务红娘称呼，服务红娘为空时回退销售红娘。
 

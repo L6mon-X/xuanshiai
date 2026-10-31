@@ -73,6 +73,8 @@ def _item(row: dict) -> MatchmakerStaffItem:
         commission_amount=Decimal(str(row.get("commission_amount") or 0)),
         locked=bool(row.get("locked")),
         visible=bool(row.get("visible", 1)),
+        menu_permission_count=int(row.get("menu_permission_count") or 0),
+        menu_permission_configured=bool(row.get("menu_permission_configured")),
         description=row.get("description"),
         slogan=row.get("slogan"),
         sort=int(row.get("sort") or 0),
@@ -93,6 +95,7 @@ SELECT_STAFF = """SELECT u.id, u.avatar, u.nickname, u.phone, u.created_at, u.up
     o.id store_id, COALESCE(o.display_name, o.name) store_name,
     (SELECT COUNT(*) FROM matchmaker_service s WHERE s.matchmaker_id = u.id AND s.status = 2) success_count,
     (SELECT COUNT(*) FROM matchmaker_menu_permission mmp WHERE mmp.matchmaker_user_id = u.id) menu_permission_count,
+    (CASE WHEN {configured_state} THEN 1 ELSE 0 END) menu_permission_configured,
     (SELECT COALESCE(SUM(e.amount), 0) FROM commission_entry e WHERE e.beneficiary_type = 'service_matchmaker' AND e.beneficiary_id = u.id AND e.status <> 'REVERSED') commission_amount
     FROM users u JOIN user_matchmaker_apply ma ON ma.user_id = u.id AND ma.application_type = 'service_matchmaker' AND ma.status = 1
     LEFT JOIN matchmaker_profile p ON p.user_id = u.id
@@ -101,6 +104,35 @@ SELECT_STAFF = """SELECT u.id, u.avatar, u.nickname, u.phone, u.created_at, u.up
     LEFT JOIN organization_member om ON om.user_id = u.id AND om.role_code = 'store_matchmaker' AND om.status = 1
     LEFT JOIN organization o ON o.id = om.organization_id AND o.org_type = 'store'
     WHERE p.deleted_at IS NULL"""
+
+# F15：menu_permission_count=0 同时覆盖「新建未配置」与「手动清空」两种状态，
+# 靠 state 表（保存过菜单才有行）区分；存量已赋菜单但无 state 行的按「已配置」计。
+PERMISSION_STATE_TABLE = "matchmaker_menu_permission_state"
+
+_PERMISSION_CONFIGURED_SQL = (
+    "((SELECT COUNT(*) FROM matchmaker_menu_permission mmp2 WHERE mmp2.matchmaker_user_id = u.id) > 0"
+    " OR EXISTS (SELECT 1 FROM matchmaker_menu_permission_state st WHERE st.matchmaker_user_id = u.id))"
+)
+
+
+async def _has_permission_state_table(db: AsyncSession) -> bool:
+    """state 表是否存在：未执行迁移的旧库降级为「无条件未配置」，不让整页 500。"""
+    return bool(
+        (
+            await db.execute(
+                text(
+                    "SELECT 1 FROM information_schema.TABLES"
+                    " WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :name"
+                ),
+                {"name": PERMISSION_STATE_TABLE},
+            )
+        ).scalar()
+    )
+
+
+async def _staff_select(db: AsyncSession) -> str:
+    configured = _PERMISSION_CONFIGURED_SQL if await _has_permission_state_table(db) else "0"
+    return SELECT_STAFF.format(configured_state=configured)
 
 
 async def search_user_candidates(db: AsyncSession, keyword: str, limit: int = 10) -> list[MatchmakerUserCandidate]:
@@ -142,11 +174,12 @@ async def list_staff(
     scope = admin.scope_condition(organization_column="o.id", params=params, user_column="u.id")
     conditions.append(scope)
     where = " AND ".join(conditions)
+    select_staff = await _staff_select(db)
     rows = await db.execute(
-        text(f"{SELECT_STAFF} AND {where} ORDER BY u.id DESC LIMIT :limit OFFSET :offset"), params
+        text(f"{select_staff} AND {where} ORDER BY u.id DESC LIMIT :limit OFFSET :offset"), params
     )
     count = await db.execute(
-        text(f"SELECT COUNT(*) FROM ({SELECT_STAFF} AND {where}) x"),
+        text(f"SELECT COUNT(*) FROM ({select_staff} AND {where}) x"),
         {k: v for k, v in params.items() if k not in {"limit", "offset"}},
     )
     total = int(count.scalar() or 0)
@@ -188,8 +221,9 @@ async def get_staff(
 ) -> MatchmakerStaffDetail:
     if admin is not None:
         await _assert_staff_scope(db, matchmaker_id, admin)
+    select_staff = await _staff_select(db)
     row = (
-        (await db.execute(text(f"{SELECT_STAFF} AND u.id = :id"), {"id": matchmaker_id}))
+        (await db.execute(text(f"{select_staff} AND u.id = :id"), {"id": matchmaker_id}))
         .mappings()
         .first()
     )
@@ -519,8 +553,40 @@ async def permissions(db: AsyncSession, matchmaker_id: int) -> MatchmakerPermiss
         text("SELECT menu_id FROM matchmaker_menu_permission WHERE matchmaker_user_id=:id"),
         {"id": matchmaker_id},
     )
+    menu_ids = frozenset(int(r[0]) for r in rows.all())
     return MatchmakerPermissions(
-        matchmaker_id=matchmaker_id, menuIds=[int(r[0]) for r in rows.all()]
+        matchmaker_id=matchmaker_id,
+        menuIds=sorted(menu_ids),
+        configured=bool(menu_ids) or await _permission_configured(db, matchmaker_id),
+    )
+
+
+async def _permission_configured(db: AsyncSession, matchmaker_id: int) -> bool:
+    """是否保存过菜单权限（含保存为空）。state 表缺失时与列表同降级为 False。"""
+    if not await _has_permission_state_table(db):
+        return False
+    return bool(
+        (
+            await db.execute(
+                text(
+                    f"SELECT 1 FROM {PERMISSION_STATE_TABLE} WHERE matchmaker_user_id = :id"
+                ),
+                {"id": matchmaker_id},
+            )
+        ).scalar()
+    )
+
+
+async def _mark_permission_configured(db: AsyncSession, matchmaker_id: int) -> None:
+    """记录「该红娘的菜单权限已被人工保存过」，空菜单也算已配置（F15）。"""
+    if not await _has_permission_state_table(db):
+        return
+    await db.execute(
+        text(
+            f"INSERT INTO {PERMISSION_STATE_TABLE} (matchmaker_user_id) VALUES (:id)"
+            " ON DUPLICATE KEY UPDATE configured_at = UTC_TIMESTAMP()"
+        ),
+        {"id": matchmaker_id},
     )
 
 
@@ -545,6 +611,7 @@ async def save_permissions(
             ),
             {"user": matchmaker_id, "menu": menu_id},
         )
+    await _mark_permission_configured(db, matchmaker_id)
     await db.commit()
     return await permissions(db, matchmaker_id)
 

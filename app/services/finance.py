@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+import uuid
+from datetime import UTC, datetime
 from decimal import Decimal, ROUND_DOWN
 from typing import Any
 
@@ -37,6 +38,9 @@ from app.schemas.finance import (
     FinanceRefundRequest,
     FinanceDailyRow,
     MatchmakerOption,
+    MatchmakerCommissionEntryCreate,
+    MatchmakerCommissionEntryItem,
+    MatchmakerCommissionEntryCreateResult,
     PaymentOrderResponse,
     ProductCommissionConfigCreate,
     ProductCommissionConfigResponse,
@@ -127,20 +131,86 @@ async def create_rule(db: AsyncSession, admin: CurrentUser, request: CommissionR
     return _rule(result.mappings().one())
 
 
-async def create_order(db: AsyncSession, current: CurrentUser, request: FinanceOrderCreate) -> PaymentOrderResponse:
+async def create_order(
+    db: AsyncSession,
+    request: FinanceOrderCreate,
+    idempotency_key: str,
+) -> PaymentOrderResponse:
+    """后台代用户创建会员订单；价格只从套餐配置读取。
+
+    旧实现接受客户端 ``amount/product_name``，属于价格篡改面；本实现只接受
+    ``package_code``，金额/名称均由服务端查询 ``config_membership_package``。
+    """
     import secrets
 
-    order_no = f"XS{datetime.utcnow():%Y%m%d%H%M%S}{current.id:08d}{secrets.token_hex(4)}"
-    result = await db.execute(text("""INSERT INTO payment_order
-        (user_id, order_no, type, product_type, product_name, amount, status, expire_at)
-        VALUES (:user_id, :order_no, :type, :product_type, :name, :amount, 0, DATE_ADD(UTC_TIMESTAMP(), INTERVAL 30 MINUTE))"""), {
-        "user_id": current.id, "order_no": order_no, "type": request.product_type,
-        "product_type": request.product_type, "name": request.product_name, "amount": request.amount,
-    })
+    if not idempotency_key or not 8 <= len(idempotency_key) <= 128:
+        raise HTTPException(422, detail="Idempotency-Key 长度必须为 8-128")
+    user_exists = await db.scalar(
+        text("SELECT id FROM users WHERE id = :id AND status = 1"),
+        {"id": request.user_id},
+    )
+    if not user_exists:
+        raise HTTPException(404, detail="用户不存在或不可用")
+
+    existing = (
+        await db.execute(
+            text(
+                """SELECT id, order_no, user_id, product_type, product_name,
+                          amount, status, pay_time, created_at
+                   FROM payment_order
+                   WHERE user_id = :user_id AND type = 1
+                     AND idempotency_key = :idempotency_key
+                   LIMIT 1"""
+            ),
+            {"user_id": request.user_id, "idempotency_key": idempotency_key},
+        )
+    ).mappings().first()
+    if existing:
+        return _order(existing)
+
+    package = (
+        await db.execute(
+            text(
+                """SELECT id, code, name, price
+                   FROM config_membership_package
+                   WHERE code = :code AND is_active = 1
+                   LIMIT 1"""
+            ),
+            {"code": request.package_code},
+        )
+    ).mappings().first()
+    if not package:
+        raise HTTPException(404, detail="会员套餐不存在或已下架")
+
+    order_no = f"XS{datetime.now(UTC):%Y%m%d%H%M%S}{request.user_id:08d}{secrets.token_hex(4)}"
+    result = await db.execute(
+        text(
+            """INSERT INTO payment_order
+               (user_id, order_no, type, product_id, product_type, product_name,
+                amount, pay_type, status, expire_at, idempotency_key)
+               VALUES (:user_id, :order_no, 1, :product_id, 1, :name,
+                       :amount, 1, 0, DATE_ADD(UTC_TIMESTAMP(), INTERVAL 30 MINUTE),
+                       :idempotency_key)"""
+        ),
+        {
+            "user_id": request.user_id,
+            "order_no": order_no,
+            "product_id": package["id"],
+            "name": package["name"],
+            "amount": package["price"],
+            "idempotency_key": idempotency_key,
+        },
+    )
     order_id = int(result.lastrowid)
     await db.commit()
-    result = await db.execute(text("""SELECT id, order_no, user_id, product_type, product_name,
-        amount, status, pay_time, created_at FROM payment_order WHERE id = :id"""), {"id": order_id})
+    result = await db.execute(
+        text(
+            """SELECT id, order_no, user_id, product_type, product_name,
+                      amount, status, pay_time, created_at
+               FROM payment_order WHERE id = :id"""
+        ),
+        {"id": order_id},
+    )
     return _order(result.mappings().one())
 
 
@@ -954,6 +1024,11 @@ def _credit_category_of(source_type: str) -> str | None:
     return None
 
 
+# 积分变动备注列名为保留字 ``desc``，旧库可能未建该列 → 缺列时返回 NULL，列表不整页 500。
+_CREDIT_REASON_COLUMN_SQL = """SELECT 1 FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_points' AND COLUMN_NAME = 'desc'"""
+
+
 async def admin_list_credit_records(
     db: AsyncSession,
     page: int,
@@ -997,9 +1072,12 @@ async def admin_list_credit_records(
     clause = " AND ".join(where)
     base = """FROM user_points up JOIN users u ON u.id = up.user_id
         LEFT JOIN user_privacy pr ON pr.user_id = u.id"""
+    # reason 取自 user_points.desc（后台发放/扣减时填写的备注），缺列时置空。
+    reason_sql = "up.`desc`" if await db.scalar(text(_CREDIT_REASON_COLUMN_SQL)) else "NULL"
     rows = await db.execute(text(f"""SELECT up.id, up.user_id, u.nickname, u.avatar, u.phone,
         CASE WHEN up.amount > 0 THEN 'CREDIT' ELSE 'DEBIT' END AS direction,
-        ABS(up.amount) AS amount, 'AVAILABLE' AS state, up.source_type, up.operator_id, up.created_at
+        ABS(up.amount) AS amount, 'AVAILABLE' AS state, up.source_type, up.operator_id, up.created_at,
+        {reason_sql} AS reason
         {base} WHERE {clause} ORDER BY up.id DESC LIMIT :limit OFFSET :offset"""), params)
     count = await db.execute(text(f"SELECT COUNT(*) {base} WHERE {clause}"),
         {key: value for key, value in params.items() if key not in ("limit", "offset")})
@@ -1021,6 +1099,7 @@ async def admin_list_credit_records(
             source_type=source_type,
             action_source="管理员操作" if source_type == "admin_grant" else "系统",
             category=_credit_category_of(source_type),
+            reason=data.get("reason"),
             operator_id=data["operator_id"] if source_type == "admin_grant" else None,
             created_at=data["created_at"],
         ))
@@ -1054,7 +1133,7 @@ def _detail_item(row: dict) -> CommissionEntryDetailItem:
     payload["consumer_phone"] = row.get("consumer_phone")
     payload["consumer_avatar"] = row.get("consumer_avatar")
     payload["event_name"] = row.get("event_name") or row.get("product_name") or "其他事件"
-    payload["order_id"] = int(row["order_id"])
+    payload["order_id"] = int(row["order_id"]) if row.get("order_id") else 0
     payload["order_no"] = row.get("order_no")
     payload["consumer_amount"] = Decimal(str(row["base_amount"]))
     payload["commission_amount"] = Decimal(str(row["amount"]))
@@ -1129,6 +1208,114 @@ async def admin_list_commission_entries(
     )
 
 
+async def admin_create_commission_entry(
+    db: AsyncSession,
+    actor: CurrentUser,
+    body: MatchmakerCommissionEntryCreate,
+) -> MatchmakerCommissionEntryCreateResult:
+    """后台手工录入一笔服务红娘分成：只写 commission_entry（PENDING）+ 审计日志，不动余额账本。
+
+    与合伙人手工录入同源，但按 2026-10-28 决策不写 account_ledger（不凭空增加可提现余额）；
+    记录落入「红娘线上分成明细」页供展示与事后核对。
+    """
+    matchmaker = await db.scalar(
+        text("SELECT id FROM users WHERE id = :id"), {"id": body.matchmaker_user_id}
+    )
+    if matchmaker is None:
+        raise HTTPException(400, detail="服务红娘账号不存在")
+
+    rule_name: str | None = None
+    rule_version: int | None = None
+    if body.rule_id is not None:
+        rule = (
+            await db.execute(
+                text("""SELECT id, name, version FROM commission_rule
+                    WHERE id = :id AND beneficiary_type = 'service_matchmaker' AND status = 1"""),
+                {"id": body.rule_id},
+            )
+        ).mappings().first()
+        if not rule:
+            raise HTTPException(400, detail="分成事件不存在或已停用")
+        rule_name = str(rule["name"])
+        rule_version = int(rule["version"]) if rule["version"] is not None else None
+
+    if body.consumer_user_id is not None:
+        consumer = await db.scalar(
+            text("SELECT id FROM users WHERE id = :id"), {"id": body.consumer_user_id}
+        )
+        if consumer is None:
+            raise HTTPException(400, detail="购买账号不存在")
+
+    amount = Decimal(str(body.amount)).quantize(CENT)
+    base_amount = (Decimal(str(body.base_amount)) if body.base_amount is not None else amount).quantize(CENT)
+    key = f"matchmaker-manual-{uuid.uuid4().hex}"
+    result = await db.execute(
+        text("""INSERT INTO commission_entry
+            (order_id, beneficiary_type, beneficiary_id, rule_id, rule_version,
+             base_amount, amount, status, source, remark, idempotency_key)
+            VALUES (NULL, 'service_matchmaker', :beneficiary_id, :rule_id, :rule_version,
+             :base_amount, :amount, 'PENDING', 'manual', :remark, :key)"""),
+        {
+            "beneficiary_id": body.matchmaker_user_id,
+            "rule_id": body.rule_id,
+            "rule_version": rule_version,
+            "base_amount": f"{base_amount:.2f}",
+            "amount": f"{amount:.2f}",
+            "remark": body.remark,
+            "key": key,
+        },
+    )
+    entry_id = int(result.lastrowid)
+
+    await db.execute(
+        text("""INSERT INTO business_audit_log
+            (actor_user_id, action, resource_type, resource_id, after_json)
+            VALUES (:actor, 'finance.matchmaker_commission.create', 'commission_entry', :entry_id, :after_json)"""),
+        {
+            "actor": actor.id,
+            "entry_id": entry_id,
+            "after_json": json.dumps(
+                {
+                    "matchmaker_user_id": body.matchmaker_user_id,
+                    "consumer_user_id": body.consumer_user_id,
+                    "rule_id": body.rule_id,
+                    "rule_name": rule_name,
+                    "amount": f"{amount:.2f}",
+                    "remark": body.remark,
+                },
+                ensure_ascii=False,
+            ),
+        },
+    )
+    await db.commit()
+
+    row = (
+        await db.execute(
+            text("""SELECT ce.id, ce.created_at, ce.beneficiary_id, ce.rule_id, ce.base_amount,
+                ce.amount, ce.status, ce.source, ce.remark, u.nickname AS matchmaker_name
+                FROM commission_entry ce LEFT JOIN users u ON u.id = ce.beneficiary_id
+                WHERE ce.id = :id"""),
+            {"id": entry_id},
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(500, detail="分成录入回读失败")
+    entry = MatchmakerCommissionEntryItem(
+        id=int(row["id"]),
+        created_at=_dt(row["created_at"]),
+        matchmaker_id=int(row["beneficiary_id"]),
+        matchmaker_name=row.get("matchmaker_name"),
+        rule_id=int(row["rule_id"]) if row.get("rule_id") is not None else None,
+        rule_name=rule_name,
+        base_amount=f"{Decimal(str(row['base_amount'])):.2f}",
+        amount=f"{Decimal(str(row['amount'])):.2f}",
+        status=str(row["status"]),
+        source=str(row["source"]),
+        remark=row.get("remark"),
+    )
+    return MatchmakerCommissionEntryCreateResult(entry=entry)
+
+
 async def admin_list_commission_options(db: AsyncSession, *, admin: CurrentMatchmakerAdmin) -> CommissionEntryDetailOptions:
     """一次性返回筛选下拉：当前产生过分成的总店红娘列表 + 启用的分成规则列表"""
     params: dict[str, object] = {"kind": _DETAIL_BENEFICIARY_TYPE}
@@ -1176,7 +1363,7 @@ def _store_entry_item(row: dict) -> StoreCommissionEntryItem:
     payload["consumer_id"] = int(row["consumer_id"]) if row.get("consumer_id") else None
     payload["consumer_name"] = row.get("consumer_name")
     payload["event_name"] = row.get("event_name") or row.get("product_name") or "其他事件"
-    payload["order_id"] = int(row["order_id"])
+    payload["order_id"] = int(row["order_id"]) if row.get("order_id") else 0
     payload["order_no"] = row.get("order_no")
     payload["consumer_amount"] = Decimal(str(row["base_amount"]))
     payload["commission_amount"] = Decimal(str(row["amount"]))

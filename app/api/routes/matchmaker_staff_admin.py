@@ -30,7 +30,6 @@ from app.schemas.matchmaker_staff_admin import (
     StoreDictItem,
 )
 from app.services import matchmaker_staff_admin as service
-from app.services.media_access import MEDIA_CATEGORY_ADMIN, sign_media_url
 from app.services.profile import _image_outputs, _read_limited
 from uuid import uuid4
 from pathlib import Path as FilePath
@@ -272,20 +271,17 @@ async def common_upload(
         output, thumbnail = _image_outputs(data)
     except HTTPException:
         raise
-    directory = FilePath(settings.upload_dir) / "admin"
+    directory = FilePath(settings.upload_dir) / "common"
     directory.mkdir(parents=True, exist_ok=True)
     name = uuid4().hex
     target = directory / f"{name}.webp"
     target.write_bytes(output)
     (directory / f"{name}-thumb.webp").write_bytes(thumbnail)
     return CommonUploadResponse(
-        # 后台资源仅后台签发链路：URL 按当前管理员签发（kind=admin），挂载层
-        # 验签时校验该账号仍处于启用状态。
-        url=sign_media_url(
-            f"/storage/uploads/admin/{name}.webp",
-            category=MEDIA_CATEGORY_ADMIN,
-            viewer=current.account.id,
-        ),
+        # 头像/封面等公共图片：落 common/ 公开目录，页面任何上下文都能直连显示。
+        # admin/ 前缀是私有类（需短期签名），只留给二维码/电子签章/素材库等
+        # 确实不该公开的资源，混用会导致其它页面拿到的 URL 一律 403。
+        url=f"/storage/uploads/common/{name}.webp",
         content_type="image/webp",
         size=len(output),
     )

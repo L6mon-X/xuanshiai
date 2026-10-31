@@ -1,15 +1,19 @@
 """Customer lead management routes."""
 
-from fastapi import APIRouter, Depends, File, Form, Path, Query, Response, UploadFile
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Path, Query, Response, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import CurrentMatchmakerAdmin, declare_permission, get_current_matchmaker_admin, require_sensitive_operation
 from app.core.sensitive_fields import redaction_level_from_permissions
 from app.db.session import get_db
-from app.schemas.customer_lead_admin import CustomerLead, CustomerLeadAbandonment, CustomerLeadAbandonRequest, CustomerLeadBatchDeleteFailure, CustomerLeadBatchDeleteRequest, CustomerLeadBatchDeleteResult, CustomerLeadBatchImportRequest, CustomerLeadAssignment, CustomerLeadConvertRequest, CustomerLeadConvertResult, CustomerLeadCreate, CustomerLeadBatchImportResult, CustomerLeadFollowUp, CustomerLeadFollowUpCreate, CustomerLeadFollowUpRecordPage, CustomerLeadFollowBucket, MatchmakerFollowStat, CustomerLeadPromoterStat, CustomerLeadImportSummary, CustomerLeadOptions, CustomerLeadPage, CustomerLeadRestoreRequest, CustomerLeadStatistics, CustomerLeadUpdate, LeadPreferenceResponse
+from app.schemas.customer_lead_admin import CustomerLead, CustomerLeadAbandonment, CustomerLeadAbandonRequest, CustomerLeadBatchDeleteFailure, CustomerLeadBatchDeleteRequest, CustomerLeadBatchDeleteResult, CustomerLeadBatchImportRequest, CustomerLeadAssignment, CustomerLeadConvertRequest, CustomerLeadConvertResult, CustomerLeadCreate, CustomerLeadCreateResult, LeadAutoAssignRequest, CustomerLeadBatchImportResult, CustomerLeadFollowUp, CustomerLeadFollowUpCreate, CustomerLeadFollowUpRecordPage, CustomerLeadFollowBucket, MatchmakerFollowStat, CustomerLeadPromoterStat, CustomerLeadImportSummary, CustomerLeadOptions, CustomerLeadPage, CustomerLeadRestoreRequest, CustomerLeadStatistics, CustomerLeadUpdate, LeadPreferenceResponse
 from app.schemas.auth import PreferenceUpdateRequest
 from app.schemas.customer_lead_dict_admin import LeadDictCreate, LeadDictItem, LeadDictOrder, LeadDictUpdate
-from app.services.customer_lead_admin import abandon_lead, add_follow_up, assign_lead, batch_delete_leads, batch_import_leads, build_import_template, convert_lead, create_lead, delete_lead, get_lead, get_lead_preferences, import_leads_file, lead_options, lead_statistics, lead_follow_statistics, list_abandonments, list_follow_ups, list_follow_up_records, list_leads, matchmaker_follow_stats, promoter_acquisition_stats, restore_lead, update_lead, update_lead_preferences
+from app.schemas.lead_ai_extract import LeadExtractRequest, LeadExtractResult
+from app.services.lead_ai_extract import extract_lead_fields
+from app.services.customer_lead_admin import abandon_lead, add_follow_up, assign_lead, auto_assign_lead, batch_delete_leads, batch_import_leads, build_import_template, convert_lead, create_lead, create_follow_up_with_media, delete_lead, get_lead, get_lead_preferences, import_leads_file, lead_options, lead_statistics, lead_follow_statistics, list_abandonments, list_follow_ups, list_follow_up_records, list_leads, matchmaker_follow_stats, promoter_acquisition_stats, restore_lead, update_lead, update_lead_preferences
 from app.services import customer_lead_dict_admin as dict_service
 from app.services.sensitive_operations import (
     abort_sensitive_operation,
@@ -116,12 +120,27 @@ async def lead_list(
 
 
 @declare_permission("customer_lead.manage")
-@router.post("", response_model=CustomerLead, status_code=201, summary="录入客源线索")
-async def lead_create(body: CustomerLeadCreate, current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> CustomerLead:
+@router.post("", response_model=CustomerLeadCreateResult, status_code=201, summary="录入客源线索")
+async def lead_create(body: CustomerLeadCreate, current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> CustomerLeadCreateResult:
     current.require("customer_lead.manage")
     params: dict[str, object] = {}
     assignment_scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = users.id")
     return await create_lead(db, current.account.id, body, redaction_level_from_permissions(current.permissions), assignment_scope=assignment_scope, assignment_scope_params=params)
+
+
+@declare_permission("customer_lead.manage")
+@router.post("/ai-extract", response_model=LeadExtractResult, summary="AI 智能录入：文本抽取客源字段")
+async def lead_ai_extract(
+    body: LeadExtractRequest,
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+) -> LeadExtractResult:
+    """粘贴一段自由文本 → 回传结构化客源字段供表单预填（只读，不落库）。
+
+    红娘核对/补全后仍调 ``POST /admin/customer-leads`` 创建。静态路径，先于
+    ``/{lead_id}`` 系列注册。权限同客源录入 ``customer_lead.manage``。
+    """
+    current.require("customer_lead.manage")
+    return await extract_lead_fields(current.account.id, body)
 
 
 @declare_permission("customer_lead.manage")
@@ -357,7 +376,7 @@ async def lead_update(lead_id: int = Path(..., ge=1), body: CustomerLeadUpdate =
 async def follow_up_list(lead_id: int = Path(..., ge=1), page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=100), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> list[CustomerLeadFollowUp]:
     current.require("customer_lead.manage")
     scope, scope_params = _lead_scope(current)
-    return await list_follow_ups(db, lead_id, page, page_size, scope=scope, scope_params=scope_params)
+    return await list_follow_ups(db, lead_id, page, page_size, viewer=current.account.id, scope=scope, scope_params=scope_params)
 
 
 @declare_permission("customer_lead.manage")
@@ -400,11 +419,66 @@ async def follow_up_create(lead_id: int = Path(..., ge=1), body: CustomerLeadFol
 
 
 @declare_permission("customer_lead.manage")
+@router.post("/{lead_id}/follow-ups/media", response_model=CustomerLeadFollowUp, status_code=201, summary="新增线索跟进记录（文字+图片+录音）")
+async def follow_up_create_with_media(
+    lead_id: int = Path(..., ge=1),
+    method: str = Form(..., description="跟进方式 PHONE/WECHAT/VISIT/OTHER"),
+    content: str = Form("", description="跟进文字，≤2000 字；与图片/录音至少提供一项"),
+    intention_level: int | None = Form(None, ge=1, le=7, description="意向等级 1-7，可选"),
+    next_follow_at: str | None = Form(None, description="下次跟进时间 ISO 格式，可选"),
+    voice_duration_sec: int | None = Form(None, ge=0, le=3600, description="录音时长秒，可选"),
+    images: list[UploadFile] | None = File(None, description="跟进图片，JPG/PNG，最多9张，单张≤5MB"),
+    voice: UploadFile | None = File(None, description="跟进录音，mp3/wav/m4a/aac/ogg/amr/webm，≤20MB"),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> CustomerLeadFollowUp:
+    """客源跟进附件入口，与会员侧 /follow-ups/media 同构：文字 + 图片 + 录音一次提交。
+
+    图片转 webp 落盘、录音白名单校验，附件 URL 走私有签名（仅当前有效后台账号可取）。
+    """
+    current.require("customer_lead.manage")
+    if len(content) > 2000:
+        raise HTTPException(422, detail="跟进内容不能超过 2000 字")
+    parsed_next: datetime | None = None
+    if next_follow_at:
+        try:
+            parsed_next = datetime.fromisoformat(next_follow_at)
+        except ValueError:
+            raise HTTPException(422, detail="下次跟进时间格式不正确，应为 ISO 日期时间")
+    scope, scope_params = _lead_scope(current)
+    return await create_follow_up_with_media(
+        db, current.account.id, lead_id, method, content, intention_level, parsed_next,
+        images, voice, voice_duration_sec, scope=scope, scope_params=scope_params,
+    )
+
+
+@declare_permission("customer_lead.manage")
 @router.patch("/{lead_id}/assignment", response_model=CustomerLead, summary="分配客源线索")
 async def lead_assignment(lead_id: int = Path(..., ge=1), body: CustomerLeadAssignment = ..., current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)) -> CustomerLead:
     current.require("customer_lead.manage")
     scope, scope_params = _lead_scope(current)
     return await assign_lead(db, current.account.id, lead_id, body, redaction_level_from_permissions(current.permissions), scope=scope, scope_params=scope_params)
+
+
+@declare_permission("customer_lead.manage")
+@router.post("/{lead_id}/auto-assign", response_model=CustomerLeadCreateResult, summary="客源智能分派（按策略重算归属红娘）")
+async def lead_auto_assign(
+    lead_id: int = Path(..., ge=1),
+    body: LeadAutoAssignRequest = ...,
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> CustomerLeadCreateResult:
+    """对已存在的客源按分派配置 strategy 重算归属红娘（策略计算全在服务端）。
+
+    默认仅对未分派客源生效；force=true 覆盖已有归属。选不到人时不改动，返回 assigned=false。
+    """
+    current.require("customer_lead.manage")
+    scope, scope_params = _lead_scope(current)
+    return await auto_assign_lead(
+        db, current.account.id, lead_id, force=body.force,
+        redaction_level=redaction_level_from_permissions(current.permissions),
+        scope=scope, scope_params=scope_params,
+    )
 
 
 @declare_permission("customer_lead.manage")

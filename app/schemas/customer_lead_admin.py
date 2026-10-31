@@ -3,7 +3,7 @@
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas.auth import PreferenceResponse
 
@@ -25,12 +25,47 @@ def _strip_contact(value: object) -> object:
     return value
 
 
-class CustomerLeadCreate(BaseModel):
+class _LeadProfileFields(BaseModel):
+    """客源「本人资料」字段（对标站新建/详情表单）。
+
+    全部可选、向后兼容：Create/Response 默认 None；Update 靠 `exclude_unset` 做部分更新。
+    口径对齐账号本人资料（user_profile/user_auth/users）：枚举类存 varchar 原值
+    （档位字典见 platform_base_data），age/height/weight int，income 档位 varchar，
+    photos JSON；birth_date 存日期、age 由服务层派生。列不存在时服务层静默降级。
+    """
+
+    real_name: str | None = Field(default=None, max_length=64, description="真实姓名")
+    birth_date: date | None = Field(default=None, description="出生日期（age 由此派生）")
+    marriage: str | None = Field(default=None, max_length=32, description="婚姻状况")
+    occupation: str | None = Field(default=None, max_length=128, description="职业")
+    income: str | None = Field(default=None, max_length=32, description="年收入档位")
+    height: int | None = Field(default=None, ge=50, le=250, description="身高cm")
+    weight: int | None = Field(default=None, ge=20, le=300, description="体重kg")
+    education: str | None = Field(default=None, max_length=32, description="学历")
+    hometown: str | None = Field(default=None, max_length=128, description="家乡")
+    residence: str | None = Field(default=None, max_length=128, description="现居地")
+    house: str | None = Field(default=None, max_length=32, description="购房情况")
+    car: str | None = Field(default=None, max_length=32, description="购车情况")
+    smoking: str | None = Field(default=None, max_length=32, description="吸烟情况")
+    drinking: str | None = Field(default=None, max_length=32, description="饮酒情况")
+    ethnicity: str | None = Field(default=None, max_length=32, description="民族")
+    school: str | None = Field(default=None, max_length=128, description="毕业学校")
+    company: str | None = Field(default=None, max_length=128, description="工作单位")
+    photos: list[str] | None = Field(default=None, description="相册图片URL列表")
+
+
+class CustomerLeadCreate(_LeadProfileFields):
+    # 未知字段直接 422：录入接口一旦静默 ignore，前端字段名一变就变成
+    # 「201 成功但资料全 null」的假成功，只能靠反查数据库才能发现。
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=1, max_length=128)
     real_name: str | None = Field(default=None, max_length=64)
     phone: str | None = Field(default=None, pattern=r"^1[3-9]\d{9}$")
     wechat: str | None = Field(default=None, max_length=128)
     source: str = Field(min_length=1, max_length=64)
+    # photo/birthday 是 2026-10-29 为红娘工作台卡片补的单值列，与 photos/birth_date 同义；
+    # 两套都收（后台表单发 photos/birth_date，工作台读 photo/birthday），读取侧由服务层回退。
     photo: str | None = Field(default=None, max_length=512)
     birthday: date | None = None
     intention_level: Literal[1, 2, 3, 4, 5, 6, 7] = 1
@@ -38,6 +73,10 @@ class CustomerLeadCreate(BaseModel):
     remark: str | None = Field(default=None, max_length=2000)
     promoter_id: int | None = Field(default=None, ge=1, description="推广红娘用户ID")
     audit_status: LeadAuditStatus = "active"
+    auto_assign: bool = Field(
+        default=False,
+        description="true=创建即按分派配置(strategy)自动归属红娘；false=待分派。选不到人时保持未分派，响应 assigned=false",
+    )
 
     @field_validator("phone", "wechat", mode="before")
     @classmethod
@@ -52,7 +91,7 @@ class CustomerLeadCreate(BaseModel):
         return self
 
 
-class CustomerLeadUpdate(BaseModel):
+class CustomerLeadUpdate(_LeadProfileFields):
     name: str | None = Field(default=None, min_length=1, max_length=128)
     real_name: str | None = Field(default=None, max_length=64)
     phone: str | None = Field(default=None, pattern=r"^1[3-9]\d{9}$")
@@ -68,6 +107,14 @@ class CustomerLeadUpdate(BaseModel):
     next_follow_at: datetime | None = None
     promoter_id: int | None = Field(default=None, ge=1)
     audit_status: LeadAuditStatus | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_retired_tags(cls, data: object) -> object:
+        """客源标签已下线（2026-10-27）：显式报 422，而不是静默丢弃造成「假成功」。"""
+        if isinstance(data, dict) and data.get("tags") not in (None, [], {}):
+            raise ValueError("客源标签功能已下线，不支持提交 tags")
+        return data
 
     @model_validator(mode="before")
     @classmethod
@@ -90,25 +137,9 @@ class CustomerLeadUpdate(BaseModel):
         # 显式传 phone=null/"" 会被归一化成 None：那等于把线索改成联系不上人的死数据。
         if "phone" in self.model_fields_set and not self.phone:
             raise ValueError("手机号不能清空，只能改成有效的 11 位手机号")
-        if all(
-            value is None
-            for value in (
-                self.name,
-                self.real_name,
-                self.phone,
-                self.wechat,
-                self.source,
-                self.photo,
-                self.gender,
-                self.birthday,
-                self.intention_level,
-                self.status,
-                self.remark,
-                self.next_follow_at,
-                self.promoter_id,
-                self.audit_status,
-            )
-        ):
+        # 部分更新：任意字段（含新增资料字段）显式给出非 None 值即可；
+        # 仅提交空白联系方式（归一化后为 None）等价于没有修改项 → 422。
+        if all(value is None for value in self.model_dump().values()):
             raise ValueError("至少提供一个需要修改的字段")
         return self
 
@@ -140,9 +171,14 @@ class CustomerLeadFollowUp(BaseModel):
     next_follow_at: datetime | None
     created_by: int
     created_at: datetime
+    # 2026-10-29 补（客源跟进附件，对齐会员侧 member_follow_up）：
+    # 图片 URL 列表 + 录音地址 + 录音时长；旧库未迁移/无附件时缺列降级为空。
+    images: list[str] = []
+    voice_url: str | None = None
+    voice_duration_sec: int | None = None
 
 
-class CustomerLead(BaseModel):
+class CustomerLead(_LeadProfileFields):
     id: int
     name: str
     real_name: str | None = None
@@ -153,6 +189,8 @@ class CustomerLead(BaseModel):
     birthday: date | None = None
     intention_level: Literal[1, 2, 3, 4, 5, 6, 7]
     gender: LeadGender = 0
+    # age 只读：由服务层从 birth_date 派生（无 birth_date 时回退 raw age 列），不接受写入。
+    age: int | None = Field(default=None, description="年龄（由出生日期派生，只读）")
     status: LeadStatus
     audit_status: LeadAuditStatus = "active"
     matchmaker_id: int | None
@@ -173,6 +211,24 @@ class CustomerLeadConvertRequest(BaseModel):
     organization_id: int | None = Field(default=None, ge=1)
     gender: Literal[1, 2] | None = None
     remark: str | None = Field(default=None, max_length=500)
+
+
+class CustomerLeadCreateResult(CustomerLead):
+    """录入 / 智能分派专用响应：在读模型基础上附带本次是否成功分派。
+
+    仅建单与 auto-assign 端点返回，列表/详情仍用精简的 CustomerLead，避免所有读取
+    响应都多出 assigned 字段。assigned=true 表示本次已写入 matchmaker_id；
+    false 表示按策略未选到红娘（含 strategy=none/未配置/停用/池为空），保持未分派。
+    """
+
+    assigned: bool
+
+
+class LeadAutoAssignRequest(BaseModel):
+    """单条重算请求。force=false 时仅对当前未分派的客源生效；
+    force=true 覆盖已有归属，按策略重新选红娘。"""
+
+    force: bool = Field(default=False, description="true=即使已有归属也按策略重算并覆盖")
 
 
 class CustomerLeadPage(BaseModel):

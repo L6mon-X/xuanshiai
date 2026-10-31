@@ -95,6 +95,17 @@ _MATCH_RECORD_BASE = (
     " WHERE status = 1 GROUP BY user_id) ra ON ra.user_id = a.from_user_id"
 )
 
+# 列表专用：在共用 base 上再补 1:1 LEFT JOIN（双方实名认证、归属红娘昵称）。
+# 均为 1:1，不放大行数；统计/COUNT 仍走不带这些 JOIN 的 base，保持口径与性能。
+_MATCH_RECORD_LIST_FROM = (
+    _MATCH_RECORD_BASE
+    + " LEFT JOIN user_auth uaf ON uaf.user_id = a.from_user_id"
+    " LEFT JOIN user_auth uat ON uat.user_id = a.to_user_id"
+    " LEFT JOIN users mm ON mm.id = ra.matchmaker_id"
+    " LEFT JOIN user_profile fp ON fp.user_id = a.from_user_id"
+    " LEFT JOIN user_profile tp ON tp.user_id = a.to_user_id"
+)
+
 # 顶部统计卡的筛选口径。status: 0 待处理 / 1 成功 / 2 失败 / 3 已关闭。
 # 「待牵线」与「牵线中」按是否已归属服务红娘拆分。
 _STATUS_GROUP_SQL: dict[str, str] = {
@@ -105,15 +116,57 @@ _STATUS_GROUP_SQL: dict[str, str] = {
     "closed": "a.status = 3",
 }
 
+# 搜索方式（search_type）：值为服务端白名单内的固定 SQL 片段，不拼接用户输入；
+# 未传或未知取值退化为 smart（双方昵称/手机/会员编号），而非静默返回全量。
+_MATCH_SEARCH_TYPE_SQL: dict[str, str] = {
+    "smart": "(fu.nickname LIKE :kw OR tu.nickname LIKE :kw OR fu.phone LIKE :kw OR tu.phone LIKE :kw"
+    " OR CONCAT('G', LPAD(fu.id, 6, '0')) LIKE :kw OR CONCAT('G', LPAD(tu.id, 6, '0')) LIKE :kw)",
+    "nickname": "(fu.nickname LIKE :kw OR tu.nickname LIKE :kw)",
+    "phone": "(fu.phone LIKE :kw OR tu.phone LIKE :kw)",
+    "from": "(fu.nickname LIKE :kw OR fu.phone LIKE :kw OR CONCAT('G', LPAD(fu.id, 6, '0')) LIKE :kw)",
+    "to": "(tu.nickname LIKE :kw OR tu.phone LIKE :kw OR CONCAT('G', LPAD(tu.id, 6, '0')) LIKE :kw)",
+    "code": "(CONCAT('G', LPAD(fu.id, 6, '0')) LIKE :kw OR CONCAT('G', LPAD(tu.id, 6, '0')) LIKE :kw)",
+}
+
+
+def _apply_match_search(
+    where: list[str], params: dict[str, object], search: str | None, search_type: str | None
+) -> None:
+    """按 search_type 拼接搜索谓词；纯数字额外按双方 user_id 精确命中。
+
+    直接调用（非 FastAPI 注入）时未传的查询参数会是 `Query` 占位对象，
+    这里统一按「非字符串即未传入」处理，避免 `Query.isdigit` 之类错误。
+    """
+    query = search if isinstance(search, str) and search else None
+    if not query:
+        return
+    kind = search_type if isinstance(search_type, str) else None
+    sql = _MATCH_SEARCH_TYPE_SQL.get(kind or "smart", _MATCH_SEARCH_TYPE_SQL["smart"])
+    params["kw"] = f"%{query}%"
+    if query.isdigit():
+        params["kw_id"] = int(query)
+        where.append(f"({sql} OR a.from_user_id = :kw_id OR a.to_user_id = :kw_id)")
+    else:
+        where.append(sql)
+
 
 @router.get("/match-records", response_model=MatchRecordPage, summary="管理员查询牵线记录")
 async def match_records(
     page: int = Query(1, ge=1, le=1000),
     page_size: int = Query(20, ge=1, le=100),
     search: str | None = Query(None, max_length=64),
+    keyword: str | None = Query(None, max_length=64, description="search 的兼容别名（任传其一）"),
+    search_type: str | None = Query(
+        None,
+        pattern="^(smart|nickname|phone|from|to|code)$",
+        description="搜索方式：smart 综合 / nickname 双方昵称 / phone 双方手机 / from 发起方 / to 被牵线方 / code 会员编号",
+    ),
     date_from: str | None = Query(None, max_length=10, description="牵线时间起 YYYY-MM-DD（含）"),
     date_to: str | None = Query(None, max_length=10, description="牵线时间止 YYYY-MM-DD（含）"),
     matchmaker_id: int | None = Query(None, ge=1, description="按发起方会员归属的服务红娘筛选"),
+    operator_id: int | None = Query(
+        None, ge=1, description="按操作人（服务红娘）筛选；matchmaker_id 的语义别名，任传其一"
+    ),
     status_group: str | None = Query(
         None,
         pattern="^(pending|matching|success|fail|closed)$",
@@ -124,9 +177,7 @@ async def match_records(
 ) -> MatchRecordPage:
     where = ["1=1"]
     params: dict[str, object] = {"limit": page_size, "offset": (page - 1) * page_size}
-    if search:
-        where.append("(fu.nickname LIKE CONCAT('%', :search, '%') OR tu.nickname LIKE CONCAT('%', :search, '%') OR fu.phone LIKE CONCAT('%', :search, '%') OR tu.phone LIKE CONCAT('%', :search, '%'))")
-        params["search"] = search
+    _apply_match_search(where, params, search or keyword, search_type)
     if date_from:
         where.append("a.created_at >= :date_from")
         params["date_from"] = date_from
@@ -134,6 +185,9 @@ async def match_records(
         # 结束日按「含当日」处理，补到次日 00:00 前
         where.append("a.created_at < DATE_ADD(:date_to, INTERVAL 1 DAY)")
         params["date_to"] = date_to
+    if matchmaker_id is None and isinstance(operator_id, int):
+        # 前端「操作人」列走 operator 命名；与 matchmaker_id 同义，不另存列。
+        matchmaker_id = operator_id
     if matchmaker_id is not None:
         # 归属红娘取自 resource_assignment 的生效记录（派生表 ra，见下方 base）
         where.append("ra.matchmaker_id = :matchmaker_id")
@@ -143,36 +197,55 @@ async def match_records(
     # 牵线记录会把双方昵称与手机号一并下发，按「发起方（from）会员归属」收口。
     where.append(current.scope_exists_clause(params, correlation="scope_assignment.user_id = a.from_user_id"))
     clause = " AND ".join(where)
-    base = _MATCH_RECORD_BASE
+    # 列表在共用 base 上补 1:1 LEFT JOIN（双方实名认证 uaf/uat、归属红娘昵称 mm），
+    # 派生列全部真值、无新建表；旧库缺关联时 LEFT JOIN 自然降级为 NULL，不拖垮整页。
+    # COUNT/统计仍走不带这些 JOIN 的 base，保持口径与性能。
     rows = await db.execute(text(f"""SELECT a.id, a.from_user_id, a.to_user_id, a.status, a.created_at, a.responded_at,
         fu.nickname AS from_nickname, tu.nickname AS to_nickname,
-        ra.matchmaker_id
-        {base} WHERE {clause} ORDER BY a.created_at DESC, a.id DESC LIMIT :limit OFFSET :offset"""), params)
-    total = int((await db.execute(text(f"SELECT COUNT(*) {base} WHERE {clause}"), {k: v for k, v in params.items() if k not in ("limit", "offset")})).scalar() or 0)
+        ra.matchmaker_id,
+        fu.gender AS from_gender, tu.gender AS to_gender,
+        TIMESTAMPDIFF(YEAR, fu.birthday, UTC_DATE()) AS from_age,
+        TIMESTAMPDIFF(YEAR, tu.birthday, UTC_DATE()) AS to_age,
+        COALESCE(uaf.realname_status = 2, 0) AS from_is_verified, COALESCE(uat.realname_status = 2, 0) AS to_is_verified,
+        COALESCE(fu.is_single_pledge = 1, 0) AS from_has_promise, COALESCE(tu.is_single_pledge = 1, 0) AS to_has_promise,
+        mm.nickname AS matchmaker_name,
+        COALESCE(fu.avatar, JSON_UNQUOTE(JSON_EXTRACT(fp.photos, '$[0]'))) AS from_avatar,
+        COALESCE(tu.avatar, JSON_UNQUOTE(JSON_EXTRACT(tp.photos, '$[0]'))) AS to_avatar,
+        CONCAT('G', LPAD(fu.id, 6, '0')) AS from_member_code,
+        CONCAT('G', LPAD(tu.id, 6, '0')) AS to_member_code
+        {_MATCH_RECORD_LIST_FROM} WHERE {clause} ORDER BY a.created_at DESC, a.id DESC LIMIT :limit OFFSET :offset"""), params)
+    total = int((await db.execute(text(f"SELECT COUNT(*) {_MATCH_RECORD_BASE} WHERE {clause}"), {k: v for k, v in params.items() if k not in ("limit", "offset")})).scalar() or 0)
     return MatchRecordPage(items=[MatchRecordItem(**dict(row)) for row in rows.mappings().all()], page=page, page_size=page_size, total=total, has_more=page * page_size < total)
 
 
 @router.get("/match-records/statistics", response_model=MatchRecordStatistics, summary="牵线记录顶部统计卡")
 async def match_record_statistics(
     search: str | None = Query(None, max_length=64),
+    keyword: str | None = Query(None, max_length=64, description="search 的兼容别名（任传其一）"),
+    search_type: str | None = Query(
+        None,
+        pattern="^(smart|nickname|phone|from|to|code)$",
+        description="搜索方式，与列表同口径",
+    ),
     date_from: str | None = Query(None, max_length=10),
     date_to: str | None = Query(None, max_length=10),
     matchmaker_id: int | None = Query(None, ge=1),
+    operator_id: int | None = Query(None, ge=1, description="按操作人（服务红娘）筛选；matchmaker_id 的语义别名"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> MatchRecordStatistics:
     """统计卡与列表共用筛选条件，点击任一卡片即以 status_group 重新拉列表。"""
     where = ["1=1"]
     params: dict[str, object] = {}
-    if search:
-        where.append("(fu.nickname LIKE CONCAT('%', :search, '%') OR tu.nickname LIKE CONCAT('%', :search, '%') OR fu.phone LIKE CONCAT('%', :search, '%') OR tu.phone LIKE CONCAT('%', :search, '%'))")
-        params["search"] = search
+    _apply_match_search(where, params, search or keyword, search_type)
     if date_from:
         where.append("a.created_at >= :date_from")
         params["date_from"] = date_from
     if date_to:
         where.append("a.created_at < DATE_ADD(:date_to, INTERVAL 1 DAY)")
         params["date_to"] = date_to
+    if matchmaker_id is None and isinstance(operator_id, int):
+        matchmaker_id = operator_id
     if matchmaker_id is not None:
         where.append("ra.matchmaker_id = :matchmaker_id")
         params["matchmaker_id"] = matchmaker_id
@@ -279,6 +352,59 @@ async def create_match_record(
     )
     await db.commit()
     return MatchRecordResponse(id=record_id, from_user_id=body.from_love_user_id, to_user_id=body.to_love_user_id, status=body.line_status, created_at=body.create_time, responded_at=body.complete_time)
+
+
+@router.delete(
+    "/match-records/{record_id}",
+    response_model=MemberDeleteResult,
+    summary="删除单条牵线记录（物理删除，幂等 + 二次确认）",
+)
+async def match_record_delete(
+    record_id: int = Path(..., ge=1),
+    reason: str = Query("后台删除", min_length=1, max_length=255, description="删除理由（记入审计）"),
+    idempotency_key: str = Depends(require_sensitive_operation),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> MemberDeleteResult:
+    """对标站牵线记录行「删除」按钮。
+
+    match_apply 无 deleted_at 列，故为物理删除（仅删该牵线行，不动 user_match 关注关系，
+    与 PATCH 标记失败/关闭互不干涉）。敏感写范式：Idempotency-Key 头 + confirm=true 查询参 + 作用域收口。
+    """
+    current.require("matchmaker.member.manage")
+    reservation, replayed = await begin_sensitive_operation(
+        db,
+        actor_id=current.account.id,
+        operation="matchmaker.match_record.delete",
+        idempotency_key=idempotency_key,
+        payload={"record_id": record_id, "reason": reason},
+    )
+    if replayed is not None:
+        return MemberDeleteResult(**replayed)
+    params: dict[str, object] = {"record_id": record_id}
+    scope = current.scope_exists_clause(params, correlation="scope_assignment.user_id = a.from_user_id")
+    try:
+        row = (await db.execute(text(
+            f"SELECT a.id FROM match_apply a WHERE a.id = :record_id AND ({scope}) FOR UPDATE"
+        ), params)).mappings().first()
+        if row is None:
+            await abort_sensitive_operation(db, reservation)
+            raise HTTPException(404, detail="牵线记录不存在或无权限")
+        await db.execute(text("DELETE FROM match_apply WHERE id = :record_id"), {"record_id": record_id})
+        await db.execute(text(
+            "INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id, reason)"
+            " VALUES (:actor, 'match_record.delete', 'match_apply', :id, :reason)"),
+            {"actor": current.account.id, "id": record_id, "reason": reason[:255]},
+        )
+        await db.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        await abort_sensitive_operation(db, reservation)
+        raise
+    result = MemberDeleteResult(deleted=[record_id])
+    await finish_sensitive_operation(db, reservation, result.model_dump(mode="json"))
+    return result
 
 
 def _normalize_tags(raw: object) -> object:

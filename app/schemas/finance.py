@@ -65,9 +65,18 @@ class ProductCommissionConfigResponse(BaseModel):
 
 
 class FinanceOrderCreate(BaseModel):
-    product_type: int = Field(ge=1, le=32)
-    product_name: str = Field(min_length=1, max_length=128)
-    amount: Decimal = Field(gt=0, le=1000000, decimal_places=2)
+    """后台代用户创建会员订单。
+
+    价格/商品名不再接受客户端输入，只接受套餐编码，由服务端从
+    ``config_membership_package`` 读取。
+    """
+
+    user_id: int = Field(ge=1, description="下单用户 ID")
+    package_code: str = Field(
+        min_length=1,
+        max_length=64,
+        description="config_membership_package.code，服务端据此取价",
+    )
 
 
 class PaymentOrderResponse(BaseModel):
@@ -91,6 +100,40 @@ class CommissionEntryResponse(BaseModel):
     amount: Decimal
     status: str
     created_at: datetime
+
+
+class MatchmakerCommissionEntryCreate(BaseModel):
+    """后台手工录入一笔服务红娘分成。
+
+    口径（与合伙人人手工录入同源，2026-10-28 决策）：只写 commission_entry + 审计日志，
+    **不动余额账本**（不写 account_ledger，不凭空增加可提现余额）；默认 PENDING，
+    供红娘线上分成明细页展示与事后核对。
+    """
+
+    matchmaker_user_id: int = Field(ge=1, description="服务红娘 user id")
+    consumer_user_id: int | None = Field(default=None, ge=1, description="关联消费会员 user id（可选，仅留档）")
+    rule_id: int | None = Field(default=None, ge=1, description="分成事件（commission_rule.id，beneficiary_type=service_matchmaker）")
+    amount: Decimal = Field(gt=0, le=1000000, decimal_places=2, description="分成金额(元)")
+    base_amount: Decimal | None = Field(default=None, ge=0, le=100000000, decimal_places=2, description="计费基数，缺省同 amount")
+    remark: str | None = Field(default=None, max_length=255)
+
+
+class MatchmakerCommissionEntryItem(BaseModel):
+    id: int
+    created_at: datetime | None = None
+    matchmaker_id: int
+    matchmaker_name: str | None = None
+    rule_id: int | None = None
+    rule_name: str | None = None
+    base_amount: str = "0.00"
+    amount: str = "0.00"
+    status: str = "PENDING"
+    source: str = "manual"
+    remark: str | None = None
+
+
+class MatchmakerCommissionEntryCreateResult(BaseModel):
+    entry: MatchmakerCommissionEntryItem
 
 
 class FinanceReportRow(BaseModel):
@@ -448,6 +491,7 @@ class CreditRecordItem(BaseModel):
     source_type: str = Field(description="流水来源类型，如 admin_grant（后台发放/扣减）；C 端既有行为 system")
     action_source: str = Field(description="操作来源文案，管理员操作为『管理员操作』")
     category: str | None = Field(default=None, description="积分类别编码；未归类时为 null")
+    reason: str | None = Field(default=None, description="积分变动备注（user_points.desc）；旧库无该列或未填时为 null")
     operator_id: int | None = Field(default=None, description="操作人 users.id；非人工操作时为 null")
     created_at: datetime = Field(description="流水发生时间")
 

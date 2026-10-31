@@ -17,6 +17,7 @@ from app.schemas.offline_vip_admin import (
     CONTRACT_STATUS_LABELS,
     PROGRESS_LABELS,
     OfflineVipCreate,
+    OfflineVipDeleteResponse,
     OfflineVipItem,
     OfflineVipMeetLogItem,
     OfflineVipMeetLogPage,
@@ -56,6 +57,19 @@ _KEYWORD_SQL = (
     " OR EXISTS (SELECT 1 FROM user_auth au WHERE au.user_id = u.id"
     "            AND au.real_name LIKE CONCAT('%', :keyword, '%')))"
 )
+
+# 搜索类型（search_by）：值全部服务端写死，不拼用户输入；
+# 未传或未知取值退化为 all（昵称/手机/编号/实名四路模糊），与历史行为一致。
+_SEARCH_BY_SQL: dict[str, str] = {
+    "all": _KEYWORD_SQL,
+    "nickname": "u.nickname LIKE CONCAT('%', :keyword, '%')",
+    "phone": "u.phone LIKE CONCAT('%', :keyword, '%')",
+    "code": "CONCAT('G', LPAD(u.id, 6, '0')) LIKE CONCAT('%', :keyword, '%')",
+    "real_name": (
+        "EXISTS (SELECT 1 FROM user_auth au WHERE au.user_id = u.id"
+        " AND au.real_name LIKE CONCAT('%', :keyword, '%'))"
+    ),
+}
 
 # 套餐类型默认兜底选项（库中尚无历史套餐时展示）
 _DEFAULT_PACKAGES = ["基础服务套餐", "标准服务套餐", "尊享服务套餐", "私人定制套餐"]
@@ -223,6 +237,7 @@ async def list_vips(
     sort_by: str | None = None,
     column_sort: str | None = None,
     *,
+    search_by: str | None = None,
     scope: str | None = None,
     scope_params: dict[str, Any] | None = None,
 ) -> OfflineVipPage:
@@ -249,7 +264,7 @@ async def list_vips(
         conditions.append("v.sign_date <= :sign_end")
         params["sign_end"] = sign_end
     if keyword:
-        conditions.append(_KEYWORD_SQL)
+        conditions.append(_SEARCH_BY_SQL.get(search_by or "all", _KEYWORD_SQL))
         params["keyword"] = keyword
     if service_status in _SERVICE_STATUS_SQL:
         conditions.append(_SERVICE_STATUS_SQL[service_status])
@@ -520,6 +535,38 @@ async def _fetch_row(
     if not row:
         raise HTTPException(404, detail="线下VIP记录不存在")
     return dict(row)
+
+
+async def delete_vip(
+    db: AsyncSession,
+    vip_id: int,
+    account_id: int,
+    reason: str,
+    *,
+    scope: str | None = None,
+    scope_params: dict[str, Any] | None = None,
+) -> OfflineVipDeleteResponse:
+    """删除线下VIP记录：只做软删除（``deleted_at``）+ 审计，不物理删行。
+
+    越权 / 已删除统一 404（读校验与写路径都带作用域谓词，D-16）。
+    """
+    await _fetch_row(db, vip_id, scope, scope_params)
+    where = ["id = :id", "deleted_at IS NULL"]
+    params: dict[str, Any] = {"id": vip_id}
+    _apply_scope(where, params, scope, scope_params)
+    await db.execute(
+        text(f"UPDATE offline_vip SET deleted_at = UTC_TIMESTAMP() WHERE {' AND '.join(where)}"),
+        params,
+    )
+    await db.execute(
+        text(
+            "INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id, reason)"
+            " VALUES (:actor, 'offline_vip.delete', 'offline_vip', :id, :reason)"
+        ),
+        {"actor": account_id, "id": vip_id, "reason": reason},
+    )
+    await db.commit()
+    return OfflineVipDeleteResponse(id=vip_id, deleted=True, reason=reason)
 
 
 async def get_vip(

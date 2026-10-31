@@ -52,6 +52,9 @@ class MatchmakerStaffItem(BaseModel):
     locked: bool = False
     visible: bool = True
     menu_permission_count: int = 0
+    # F15：区分「新建默认全部菜单」与「手动清空为无权限」。两者 count 都是 0，
+    # 只有保存过菜单（state 表有行）才算已配置，前端据此决定是「全部」还是「无权限」。
+    menu_permission_configured: bool = False
     description: str | None = None
     slogan: str | None = None
     sort: int = 0
@@ -177,6 +180,8 @@ class AdminMenuNode(BaseModel):
 class MatchmakerPermissions(BaseModel):
     matchmaker_id: int
     menu_ids: list[int] = Field(validation_alias="menuIds", serialization_alias="menuIds")
+    # F15：false 表示从未保存过（沿用「全部菜单」默认），true 表示按 menu_ids 精确授权。
+    configured: bool = False
 
     model_config = ConfigDict(populate_by_name=True)
 

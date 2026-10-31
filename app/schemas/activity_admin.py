@@ -3,18 +3,33 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+
+# 时间字段兼容前端驼峰入参：``startDate`` / ``endDate`` 与历史 ``start_time`` /
+# ``startTime`` 同时可用；驼峰优先，避免前端同时下发时被缺省值遮蔽。
+_START_TIME_ALIASES = AliasChoices("startDate", "startTime", "start_time", "start_date")
+_END_TIME_ALIASES = AliasChoices("endDate", "endTime", "end_time", "end_date")
+_SIGNUP_DEADLINE_ALIASES = AliasChoices("signupDeadline", "signup_deadline")
 
 
 class ActivityAdminCreate(BaseModel):
+    # 驼峰 / 下划线均可反序列化（历史调用方按字段名构造模型不受影响）。
+    model_config = ConfigDict(populate_by_name=True)
+
     title: str = Field(min_length=1, max_length=128)
     cover: str | None = Field(default=None, max_length=255)
     type: str | None = Field(default=None, max_length=64)
     city: str | None = Field(default=None, max_length=64)
     address: str | None = Field(default=None, max_length=255)
-    start_time: datetime
-    end_time: datetime
-    signup_deadline: datetime | None = None
+    start_time: datetime = Field(
+        validation_alias=_START_TIME_ALIASES, serialization_alias="start_time"
+    )
+    end_time: datetime = Field(
+        validation_alias=_END_TIME_ALIASES, serialization_alias="end_time"
+    )
+    signup_deadline: datetime | None = Field(
+        default=None, validation_alias=_SIGNUP_DEADLINE_ALIASES
+    )
     max_people: int = Field(default=0, ge=0, le=100000)
     price: float = Field(default=0, ge=0, le=1000000)
     description: str | None = Field(default=None, max_length=10000)
@@ -55,14 +70,22 @@ class ActivityAdminCreate(BaseModel):
 
 
 class ActivityAdminUpdate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     title: str | None = Field(default=None, min_length=1, max_length=128)
     cover: str | None = Field(default=None, max_length=255)
     type: str | None = Field(default=None, max_length=64)
     city: str | None = Field(default=None, max_length=64)
     address: str | None = Field(default=None, max_length=255)
-    start_time: datetime | None = None
-    end_time: datetime | None = None
-    signup_deadline: datetime | None = None
+    start_time: datetime | None = Field(
+        default=None, validation_alias=_START_TIME_ALIASES, serialization_alias="start_time"
+    )
+    end_time: datetime | None = Field(
+        default=None, validation_alias=_END_TIME_ALIASES, serialization_alias="end_time"
+    )
+    signup_deadline: datetime | None = Field(
+        default=None, validation_alias=_SIGNUP_DEADLINE_ALIASES
+    )
     max_people: int | None = Field(default=None, ge=0, le=100000)
     price: float | None = Field(default=None, ge=0, le=1000000)
     description: str | None = Field(default=None, max_length=10000)

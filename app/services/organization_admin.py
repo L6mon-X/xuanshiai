@@ -30,9 +30,19 @@ STORE_SELECT = """SELECT o.id, o.code, o.name, o.display_name, o.region_code,
     o.link_url, o.sort_order, o.qr_code, o.logo, o.address, o.commission_mode, o.commission_value, o.intro,
     o.status, o.auto_redirect, o.created_at, o.updated_at,
     (SELECT COUNT(*) FROM organization_member om WHERE om.organization_id = o.id AND om.status = 1) member_count,
-    (SELECT COUNT(*) FROM organization_member om WHERE om.organization_id = o.id AND om.status = 1
-        AND om.role_code IN ('store_manager', 'store_matchmaker')) matchmaker_count
+    (SELECT COUNT(DISTINCT om.user_id) FROM organization_member om
+        JOIN user_matchmaker_apply ma ON ma.user_id = om.user_id
+          AND ma.application_type = 'service_matchmaker' AND ma.status = 1
+        JOIN user_role r ON r.user_id = om.user_id
+          AND r.role_code = 'service_matchmaker' AND r.status IN (1, 2)
+        LEFT JOIN matchmaker_profile p ON p.user_id = om.user_id
+        WHERE om.organization_id = o.id AND om.status = 1
+          AND om.role_code IN ('store_manager', 'store_matchmaker')
+          AND p.deleted_at IS NULL) matchmaker_count
     FROM organization o"""
+# ``matchmaker_count`` 与「红娘管理」列表（``matchmaker_staff_admin.list_staff``）同口径：
+# 必须是「在店 + 服务红娘在职 + 角色启用 + 档案未删」的人，不再是 organization_member
+# 行数，否则报表统计会高于分店红娘列表（0 人却显示 3 人）。
 
 
 def _store_item(row) -> StoreAdminItem:
@@ -163,17 +173,30 @@ async def update_store_status(db: AsyncSession, store_id: int, status: int, reas
     return await get_store_admin(db, store_id, admin=admin)
 
 
-async def list_store_members(db: AsyncSession, store_id: int, page: int, page_size: int, *, admin: CurrentMatchmakerAdmin) -> tuple[list[StoreMemberAdminItem], int]:
+async def list_store_members(
+    db: AsyncSession, store_id: int, page: int, page_size: int, *, admin: CurrentMatchmakerAdmin,
+    role_code: str | None = None, status: int | None = None,
+) -> tuple[list[StoreMemberAdminItem], int]:
+    """分店成员列表。``role_code`` / ``status`` 可选；传 status=1 + role_code=store_matchmaker
+    即与门店列表的 ``matchmaker_count`` 同口径。"""
     await get_store_admin(db, store_id, admin=admin)
-    params = {"store_id": store_id, "limit": page_size, "offset": (page - 1) * page_size}
-    rows = await db.execute(text("""SELECT om.id, om.organization_id, om.user_id,
+    params: dict[str, object] = {"store_id": store_id, "limit": page_size, "offset": (page - 1) * page_size}
+    where = ["om.organization_id = :store_id"]
+    if role_code:
+        where.append("om.role_code = :role_code")
+        params["role_code"] = role_code
+    if status is not None:
+        where.append("om.status = :status")
+        params["status"] = status
+    clause = " AND ".join(where)
+    rows = await db.execute(text(f"""SELECT om.id, om.organization_id, om.user_id,
         u.nickname, u.phone, om.role_code, om.status, om.started_at, om.ended_at
         FROM organization_member om LEFT JOIN users u ON u.id = om.user_id
-        WHERE om.organization_id = :store_id ORDER BY om.id DESC
+        WHERE {clause} ORDER BY om.id DESC
         LIMIT :limit OFFSET :offset"""), params)
     total = int((await db.execute(text(
-        "SELECT COUNT(*) FROM organization_member WHERE organization_id = :store_id"
-    ), {"store_id": store_id})).scalar() or 0)
+        f"SELECT COUNT(*) FROM organization_member om WHERE {clause}"
+    ), {key: value for key, value in params.items() if key not in ("limit", "offset")})).scalar() or 0)
     items = [StoreMemberAdminItem(**{**dict(row), "phone_masked": _mask(row["phone"])}) for row in rows.mappings().all()]
     return items, total
 

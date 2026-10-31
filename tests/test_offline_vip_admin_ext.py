@@ -35,7 +35,7 @@ def test_all_offline_vip_routes_registered() -> None:
     assert set(paths[f"{BASE}"].keys()) == {"get", "post"}
     assert "get" in paths[f"{BASE}/statistics"]
     assert "get" in paths[f"{BASE}/options"]
-    assert set(paths[f"{BASE}/{{vip_id}}"].keys()) == {"get", "put"}
+    assert set(paths[f"{BASE}/{{vip_id}}"].keys()) == {"get", "put", "delete"}
     assert "get" in paths[f"{BASE}/{{vip_id}}/meet-logs"]
 
 

@@ -83,8 +83,22 @@ async def store_status(store_id: int = Path(..., ge=1), body: StoreStatusUpdate 
 
 
 @router.get("/stores/{store_id}/members", response_model=StoreMemberAdminPage)
-async def store_members(store_id: int = Path(..., ge=1), page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin), db: AsyncSession = Depends(get_db)):
-    items, total = await list_store_members(db, store_id, page, page_size, admin=current)
+async def store_members(
+    store_id: int = Path(..., ge=1),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    role_code: str | None = Query(
+        None,
+        max_length=32,
+        description="按成员角色筛选（store_manager 店长 / store_matchmaker 分店红娘）；不传为全部",
+    ),
+    status: int | None = Query(None, ge=1, le=3, description="按成员状态筛选：1 在职 / 其他 已结束"),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    items, total = await list_store_members(
+        db, store_id, page, page_size, admin=current, role_code=role_code, status=status
+    )
     return StoreMemberAdminPage(items=items, page=page, page_size=page_size, total=total, has_more=page * page_size < total)
 
 

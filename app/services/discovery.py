@@ -25,7 +25,6 @@ from app.core.profile_tags import (
 from app.core.redis import consume_daily, consume_daily_unique, get_daily_used, mark_daily_member, refund_daily
 from app.services.membership import (
     active_membership_exists_for_column_sql,
-    get_active_membership_row,
     has_active_membership,
 )
 from app.services.matchmaker_workspace import (
@@ -48,6 +47,7 @@ from app.schemas.discovery import (
     FavoriteReceivedPage,
     FavoriteResponse,
     FilterOptionsResponse,
+    DiscoveryCardPreviewResponse,
     PublicProfileResponse,
     RelationUserSummary,
     SavedFilterResponse,
@@ -72,8 +72,9 @@ from app.services.candidate_visibility import (
     VisibilityScene,
 )
 from app.services.notifications import emit_notification
-from app.services.profile import _calculate_age, _json_dict, _json_list, _json_object, get_profile
-from app.services.quotas import consume_extra, resolve_browse_limit
+from app.services.profile import _calculate_age, _get_media, _json_dict, _json_list, _json_object, get_profile
+from app.services.quotas import consume_extra, resolve_apply_limit, resolve_browse_limit, resolve_superlike_limit
+from app.services.regions import region_display
 from app.services.admin_config import get_runtime_value
 from app.services.restrictions import ensure_user_allowed
 from app.services.runtime_config import (
@@ -93,12 +94,19 @@ LEGACY_MATCH_ALGORITHM_VERSION = "legacy-rule-v1"
 
 
 CARD_SELECT = """
-    SELECT u.id AS user_id, u.nickname, u.avatar, u.gender, u.birthday, u.is_married,
+    SELECT u.id AS user_id, u.nickname, u.avatar, u.gender,
+           COALESCE((SELECT um.thumbnail_url FROM user_media um
+                     WHERE um.user_id = u.id AND um.media_type = 'avatar' AND um.deleted_at IS NULL
+                     ORDER BY um.id DESC LIMIT 1), u.avatar) AS avatar_thumb,
+           u.birthday, u.is_married,
            u.is_single_pledge, p.height, p.education_level, p.occupation, p.income,
+           p.weight, p.zodiac,
+           p.hometown_province_code, p.hometown_city_code, p.hometown_district_code,
            p.residence_province_code, p.residence_city_code, p.residence_district_code,
            (p.residence_city_code IS NOT NULL AND p.residence_city_code =
              (SELECT vp2.residence_city_code FROM user_profile vp2 WHERE vp2.user_id = :viewer_id)) AS same_city,
            p.mbti, p.interest_tags, p.personality_tags, p.tags,
+           p.self_intro, p.qa_answers,
            cp.age_min AS candidate_age_min, cp.age_max AS candidate_age_max,
            cp.height_min AS candidate_height_min, cp.height_max AS candidate_height_max,
            cp.education_min AS candidate_education_min, cp.income_min AS candidate_income_min,
@@ -124,7 +132,11 @@ CARD_SELECT = """
                      AND (b.start_at IS NULL OR b.start_at <= UTC_TIMESTAMP())
                      AND (b.end_at IS NULL OR b.end_at > UTC_TIMESTAMP())) AS is_boosted,
            EXISTS (SELECT 1 FROM user_favorite f
-                   WHERE f.user_id = :viewer_id AND f.target_user_id = u.id AND f.type = 2) AS is_favorite
+                   WHERE f.user_id = :viewer_id AND f.target_user_id = u.id AND f.type = 2) AS is_favorite,
+           -- 「喜欢」与「收藏」分表语义：type=1 是红心/喜欢（与 /relations/likes 同源），
+           -- type=2 是旧收藏，仅保留兼容。走 uk_pair_type(user_id,target_user_id,type) 索引。
+           EXISTS (SELECT 1 FROM user_favorite f
+                   WHERE f.user_id = :viewer_id AND f.target_user_id = u.id AND f.type = 1) AS is_liked
 """
 
 
@@ -327,6 +339,31 @@ def _candidate_score(viewer: dict[str, Any], candidate: dict[str, Any]) -> tuple
     return round(min(100.0, points), 2), "、".join(reasons[:3]) or "资料匹配"
 
 
+def _card_qa_answers(value: Any) -> list[dict[str, str]]:
+    """卡片只下发已作答的公开问答，最多 3 条；格式与详情页 qa_answers 一致。"""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        answer = str(item.get("answer") or "").strip()
+        if answer == "":
+            continue
+        question = str(item.get("question") or "").strip()
+        result.append({"question": question or "关于我", "answer": answer})
+        if len(result) >= 3:
+            break
+    return result
+
+
 def _card(row: dict[str, Any], score: float, reason: str, detail_locked: bool = False) -> DiscoveryCard:
     certification_tags: list[str] = []
     if row.get("realname_status") == 2:
@@ -348,6 +385,24 @@ def _card(row: dict[str, Any], score: float, reason: str, detail_locked: bool = 
         is_married=row.get("is_married") if not detail_locked else None,
         online_status=0 if row.get("hide_online_status") else int(row.get("online_status") or 0),
         mbti=row.get("mbti") if not detail_locked else None,
+        weight=row.get("weight") if not detail_locked else None,
+        hometown_display=region_display(
+            row.get("hometown_province_code"),
+            row.get("hometown_city_code"),
+            row.get("hometown_district_code"),
+        )
+        if not detail_locked
+        else None,
+        residence_display=region_display(
+            row.get("residence_province_code"),
+            row.get("residence_city_code"),
+            row.get("residence_district_code"),
+        )
+        if not detail_locked
+        else None,
+        zodiac=(row.get("zodiac") or None) if not detail_locked else None,
+        self_intro=(row.get("self_intro") or None) if not detail_locked else None,
+        qa_answers=_card_qa_answers(row.get("qa_answers")) if not detail_locked else [],
         personal_tags=display_personal_tags(_json_list(row.get("interest_tags")) + _json_list(row.get("personality_tags")), _stored_custom_tags(row)) if not detail_locked else [],
         interest_tags=personal_tags(_json_list(row.get("interest_tags")), _stored_custom_tags(row))[:5] if not detail_locked else [],
         certification_tags=certification_tags,
@@ -356,6 +411,7 @@ def _card(row: dict[str, Any], score: float, reason: str, detail_locked: bool = 
         algorithm_version=LEGACY_MATCH_ALGORITHM_VERSION,
         match_score_source=LEGACY_MATCH_ALGORITHM_VERSION,
         is_favorite=bool(row.get("is_favorite")),
+        is_liked=bool(row.get("is_liked")),
         is_vip=bool(row.get("is_vip")),
         is_pure_free=not bool(row.get("is_vip")) and not bool(row.get("is_boosted")),
         is_boosted=bool(row.get("is_boosted")),
@@ -828,12 +884,15 @@ async def _public_preference(db: AsyncSession, user_id: int) -> dict[str, Any] |
         except json.JSONDecodeError:
             codes = []
     data["preferred_city_codes"] = codes if isinstance(codes, list) else []
+    province_name = ""
     try:
         from app.services.regions import region_name
 
         data["preferred_region_text"] = "、".join(
             name for name in (region_name(str(code)) for code in data["preferred_city_codes"]) if name
         )
+        province_code = data.get("preferred_province_code")
+        province_name = region_name(str(province_code)) if province_code else ""
     except Exception:  # pragma: no cover - 区划数据异常不应影响详情页
         logger.exception("Failed to resolve preference region names")
         data["preferred_region_text"] = ""
@@ -855,7 +914,12 @@ async def _public_preference(db: AsyncSession, user_id: int) -> dict[str, Any] |
     data["drinking_text"] = data.get("drinking_expectation") or _ENUM_TEXT["drinking"].get(
         _as_int(data.get("drinking_requirement")), ""
     )
-    data["expected_area"] = data.get("preferred_region_text", "")
+    # 结婚时间/期望职业：C 端存中文文本，服务端同时给 *_text 便于前端不维护映射。
+    data["marriage_timeline_text"] = data.get("marriage_timeline") or ""
+    data["preferred_occupation_text"] = data.get("preferred_occupation") or ""
+    # 期望地区：省名 + 城市名；只选省时也有值（此前只拼城市，导致整行不显示）。
+    area_parts = [part for part in (province_name, data.get("preferred_region_text", "")) if part]
+    data["expected_area"] = " ".join(area_parts)
     # 期待标签（relationship_expectation）不在 user_partner_preference 里，
     # 详情页已由 tag_selections 单独渲染，这里给空数组保证前端契约稳定。
     data["extras"] = []
@@ -922,6 +986,49 @@ async def view_profile(db: AsyncSession, viewer_id: int, target_id: int) -> Publ
     preference = await _public_preference(db, target_id) if full else None
     await db.commit()
     return PublicProfileResponse(user_id=target_id, card=card, profile=profile, is_vip_viewer=vip, browse_quota_remaining=quota, can_apply=viewer["completion_score"] >= 100, preference=preference)
+
+
+async def preview_card(db: AsyncSession, viewer_id: int, target_id: int) -> DiscoveryCardPreviewResponse:
+    """首页卡片预览（``GET /users/{user_id}/card-preview``）。
+
+    只服务首页的背景/相册/9 格补字段。可见性口径与 ``view_profile`` 完全一致
+    （同一个 ``_ensure_target`` + ``_target_rows`` 谓词），差异只有三点：
+
+    1. **不扣浏览额度**：不调用 ``_consume_browse``（否则打开首页就可能 429）；
+    2. **不留痕**：不调用 ``_record_browse``（否则对方「谁看过我」会出现首页预取）；
+    3. **不返回 profile**：只给公开卡字段 + 背景 + 首图，不是绕过计费看资料的通道。
+    """
+    if not await platform_browse_open(db):
+        raise HTTPException(403, detail=await platform_maintenance_message(db))
+    if viewer_id == target_id:
+        raise HTTPException(422, detail="不能浏览自己的名片")
+    skip = _skip_discovery_gates()
+    await _ensure_target(db, viewer_id, target_id, skip_completion_gate=skip)
+    rows = await _target_rows(db, viewer_id, [target_id], skip_completion_gate=skip)
+    row = rows.get(target_id)
+    if not row:
+        raise HTTPException(404, detail="用户不存在或当前不可见")
+    viewer = await _viewer_context(db, viewer_id)
+    score, reason = _candidate_score(viewer, row)
+    vip = await _is_vip(db, viewer_id)
+    detail_locked = bool(row.get("only_vip_can_see_detail")) and not vip
+    media = await _get_media(db, target_id, approved_only=True)
+    backgrounds = [
+        item["file_url"] for item in media if item.get("media_type") == "background" and item.get("file_url")
+    ]
+    photos = [item["file_url"] for item in media if item.get("media_type") == "photo" and item.get("file_url")][:1]
+    income = row.get("income")
+    # 口径与 profile.get_profile 一致（"1.5w"）；锁定态不下发，避免与卡片 income=None 矛盾。
+    income_display = (
+        f"{float(income) / 10000:.1f}".rstrip("0").rstrip(".") + "w" if income is not None and not detail_locked else None
+    )
+    return DiscoveryCardPreviewResponse(
+        user_id=target_id,
+        card=_card(row, score, reason, detail_locked=detail_locked),
+        background_wall=backgrounds[0] if backgrounds else None,
+        photos=photos,
+        income_display=income_display,
+    )
 
 
 async def _target_rows(
@@ -1138,6 +1245,9 @@ async def list_received_favorites(db: AsyncSession, viewer_id: int, page: int, p
         LEFT JOIN user_profile_completion c ON c.user_id = u.id
         WHERE f.target_user_id = :user_id AND f.type = 2{visible}"""), params)).scalar() or 0)
     result = await db.execute(text(f"""SELECT f.id, f.user_id, u.nickname, u.avatar, u.birthday,
+        COALESCE((SELECT um.thumbnail_url FROM user_media um
+                  WHERE um.user_id = u.id AND um.media_type = 'avatar' AND um.deleted_at IS NULL
+                  ORDER BY um.id DESC LIMIT 1), u.avatar) AS avatar_thumb,
         p.residence_city_code, f.created_at
         FROM user_favorite f JOIN users u ON u.id = f.user_id
         LEFT JOIN user_profile p ON p.user_id = u.id
@@ -1148,7 +1258,7 @@ async def list_received_favorites(db: AsyncSession, viewer_id: int, page: int, p
     items = [
         FavoriteReceivedItem(
             id=int(row["id"]),
-            user=RelationUserSummary(user_id=int(row["user_id"]), nickname=row["nickname"], avatar=row["avatar"], age=_calculate_age(row["birthday"]) if row["birthday"] else None, city_code=row["residence_city_code"]),
+            user=RelationUserSummary(user_id=int(row["user_id"]), nickname=row["nickname"], avatar=row["avatar"], avatar_thumb=row["avatar_thumb"], age=_calculate_age(row["birthday"]) if row["birthday"] else None, city_code=row["residence_city_code"]),
             relation="received",
             created_at=row["created_at"],
         )
@@ -1172,34 +1282,13 @@ async def _notify(db: AsyncSession, user_id: int, notification_type: str, title:
 
 
 async def _consume_apply_quota(db: AsyncSession, viewer_id: int, vip: bool) -> bool:
-    key = await _quota_key("apply", viewer_id)
-    # 权限配置(卡片4) line.times > 0 时为全局统一每日上限，覆盖 VIP/免费两套旧限额
-    line_perm = await match_line_permissions(db)
-    unified = line_perm.get("apply_daily")
-    if unified and int(unified) > 0:
-        if not await consume_daily(key, int(unified)):
-            if await consume_extra(db, viewer_id, "apply", "积分兑换申请次数"):
-                return False
-            raise HTTPException(429, detail="今日认识申请次数已用完")
-        return True
-    free_limit = int(await get_runtime_value(db, "platform_permissions", "free_apply_daily_limit", settings.apply_daily_free_limit))
-    vip_limit = int(await get_runtime_value(db, "platform_permissions", "vip_apply_daily_limit", settings.apply_daily_vip_limit))
-    limit = vip_limit if vip else free_limit
-    if vip:
-        membership = await get_active_membership_row(db, viewer_id)
-        if membership is None:
-            limit = free_limit
-            rights = None
-        else:
-            rights = membership["rights"]
-        if isinstance(rights, str):
-            try:
-                rights = json.loads(rights)
-            except json.JSONDecodeError:
-                rights = {}
-        if isinstance(rights, dict):
-            limit = free_limit + int(rights.get("apply_bonus") or 0)
+    """扣一次申请额度。
 
+    上限统一由 ``quotas.resolve_apply_limit`` 给出（与 ``/users/me/quotas`` 同源），
+    本函数只负责扣减与积分加次兜底，不再自己解析配置。
+    """
+    key = await _quota_key("apply", viewer_id)
+    limit = await resolve_apply_limit(db, viewer_id, is_vip=vip)
     if not await consume_daily(key, limit):
         if await consume_extra(db, viewer_id, "apply", "积分兑换申请次数"):
             return False
@@ -1303,8 +1392,16 @@ async def list_applications(db: AsyncSession, viewer_id: int, incoming: bool, pa
         LEFT JOIN user_profile_completion tc ON tc.user_id = tu.id
         WHERE a.{field} = :user_id{visible}"""), params)).scalar() or 0)
     result = await db.execute(text(f"""SELECT a.id, a.from_user_id, a.to_user_id, a.message, a.status, a.expire_at, a.created_at,
-        fu.nickname AS from_nickname, fu.avatar AS from_avatar, fu.birthday AS from_birthday, fp.residence_city_code AS from_city_code,
-        tu.nickname AS to_nickname, tu.avatar AS to_avatar, tu.birthday AS to_birthday, tp.residence_city_code AS to_city_code
+        fu.nickname AS from_nickname, fu.avatar AS from_avatar,
+        COALESCE((SELECT um.thumbnail_url FROM user_media um
+                  WHERE um.user_id = fu.id AND um.media_type = 'avatar' AND um.deleted_at IS NULL
+                  ORDER BY um.id DESC LIMIT 1), fu.avatar) AS from_avatar_thumb,
+        fu.birthday AS from_birthday, fp.residence_city_code AS from_city_code,
+        tu.nickname AS to_nickname, tu.avatar AS to_avatar,
+        COALESCE((SELECT um.thumbnail_url FROM user_media um
+                  WHERE um.user_id = tu.id AND um.media_type = 'avatar' AND um.deleted_at IS NULL
+                  ORDER BY um.id DESC LIMIT 1), tu.avatar) AS to_avatar_thumb,
+        tu.birthday AS to_birthday, tp.residence_city_code AS to_city_code
         FROM match_apply a
         JOIN users fu ON fu.id = a.from_user_id
         LEFT JOIN user_profile fp ON fp.user_id = fu.id
@@ -1323,8 +1420,10 @@ async def list_applications(db: AsyncSession, viewer_id: int, incoming: bool, pa
         # 因此先取出 ID 再构造嵌套对象，避免 pop 之后顶层字段缺失导致校验失败。
         from_user_id = data.pop("from_user_id")
         to_user_id = data.pop("to_user_id")
-        data["from_user"] = RelationUserSummary(user_id=from_user_id, nickname=data.pop("from_nickname"), avatar=data.pop("from_avatar"), age=_calculate_age(data.pop("from_birthday")) if data.get("from_birthday") else None, city_code=data.pop("from_city_code"))
-        data["to_user"] = RelationUserSummary(user_id=to_user_id, nickname=data.pop("to_nickname"), avatar=data.pop("to_avatar"), age=_calculate_age(data.pop("to_birthday")) if data.get("to_birthday") else None, city_code=data.pop("to_city_code"))
+        # avatar_thumb 用 pop(..., None) 而非直接取键：它是纯展示字段，缺列时按
+        # 「无缩略图」处理（客户端回退 avatar）比整页 500 更合理。
+        data["from_user"] = RelationUserSummary(user_id=from_user_id, nickname=data.pop("from_nickname"), avatar=data.pop("from_avatar"), avatar_thumb=data.pop("from_avatar_thumb", None), age=_calculate_age(data.pop("from_birthday")) if data.get("from_birthday") else None, city_code=data.pop("from_city_code"))
+        data["to_user"] = RelationUserSummary(user_id=to_user_id, nickname=data.pop("to_nickname"), avatar=data.pop("to_avatar"), avatar_thumb=data.pop("to_avatar_thumb", None), age=_calculate_age(data.pop("to_birthday")) if data.get("to_birthday") else None, city_code=data.pop("to_city_code"))
         data["from_user_id"] = from_user_id
         data["to_user_id"] = to_user_id
         items.append(ApplicationResponse(**data))
@@ -1461,11 +1560,11 @@ async def create_superlike(db: AsyncSession, viewer_id: int, target_id: int, ide
     existing_row = existing.mappings().first()
     if existing_row:
         vip = await _is_vip(db, viewer_id)
-        limit = int(await get_runtime_value(db, "platform_permissions", "vip_superlike_daily_limit" if vip else "free_superlike_daily_limit", settings.superlike_daily_vip_limit if vip else settings.superlike_daily_free_limit))
+        limit = await resolve_superlike_limit(db, viewer_id, is_vip=vip)
         used = await get_daily_used(await _quota_key("superlike", viewer_id))
         return SuperLikeResponse(target_user_id=target_id, remaining_today=max(0, limit - used), created_at=existing_row["created_at"])
     vip = await _is_vip(db, viewer_id)
-    limit = int(await get_runtime_value(db, "platform_permissions", "vip_superlike_daily_limit" if vip else "free_superlike_daily_limit", settings.superlike_daily_vip_limit if vip else settings.superlike_daily_free_limit))
+    limit = await resolve_superlike_limit(db, viewer_id, is_vip=vip)
     key = await _quota_key("superlike", viewer_id)
     if not await consume_daily(key, limit):
         if await consume_extra(db, viewer_id, "superlike", "积分兑换爆灯次数", target_id):
@@ -1516,7 +1615,11 @@ async def list_superlikes(db: AsyncSession, viewer_id: int, direction: str, page
         LEFT JOIN user_profile_completion c ON c.user_id = u.id
         WHERE {where}"""), params)).scalar() or 0)
     result = await db.execute(text(f"""SELECT b.id, b.order_no, b.created_at, b.status,
-        u.id AS other_id, u.nickname, u.avatar, u.birthday, p.residence_city_code,
+        u.id AS other_id, u.nickname, u.avatar,
+        COALESCE((SELECT um.thumbnail_url FROM user_media um
+                  WHERE um.user_id = u.id AND um.media_type = 'avatar' AND um.deleted_at IS NULL
+                  ORDER BY um.id DESC LIMIT 1), u.avatar) AS avatar_thumb,
+        u.birthday, p.residence_city_code,
         EXISTS (SELECT 1 FROM user_match m WHERE m.user_id = :user_id AND m.target_user_id = u.id AND m.status IN (1, 2)) AS matched
         FROM user_boost b JOIN users u ON u.id = {other_field}
         LEFT JOIN user_profile p ON p.user_id = u.id
@@ -1526,7 +1629,7 @@ async def list_superlikes(db: AsyncSession, viewer_id: int, direction: str, page
     items = [
         SuperLikeItem(
             id=int(row["id"]),
-            user=RelationUserSummary(user_id=int(row["other_id"]), nickname=row["nickname"], avatar=row["avatar"], age=_calculate_age(row["birthday"]) if row["birthday"] else None, city_code=row["residence_city_code"]),
+            user=RelationUserSummary(user_id=int(row["other_id"]), nickname=row["nickname"], avatar=row["avatar"], avatar_thumb=row["avatar_thumb"], age=_calculate_age(row["birthday"]) if row["birthday"] else None, city_code=row["residence_city_code"]),
             direction=direction,
             status=int(row["status"] or 1),
             created_at=row["created_at"],
