@@ -7,6 +7,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 import base64
 import json
@@ -64,6 +65,10 @@ from app.schemas.matchmaker_workspace import (
     PromotionCode,
     WorkspaceAbandonRequest,
     WorkspaceAssignRequest,
+    WorkspaceCommissionEntry,
+    WorkspaceCommissionEntryPage,
+    WorkspaceOfflineIncome,
+    WorkspaceOfflineIncomePage,
     WorkspaceGoodNewsCreated,
     WorkspaceGoodNewsCreate,
     WorkspaceGoodNewsItem,
@@ -117,6 +122,8 @@ class WorkspaceActor:
     display_name: str
     level: str
     organization_id: int | None
+    # 与红娘主页头像同一列（users.avatar），欢迎卡不能另搞一套头像口径。
+    avatar: str | None = None
 
     @property
     def scope(self) -> str:
@@ -208,7 +215,7 @@ async def require_workspace_for_user(db: AsyncSession, user_id: int) -> Workspac
         await db.execute(
             text(
                 """SELECT COALESCE(p.display_name, u.nickname, '服务红娘') AS display_name,
-                    COALESCE(p.level, 'NORMAL') AS level, p.organization_id
+                    COALESCE(p.level, 'NORMAL') AS level, p.organization_id, u.avatar
                 FROM users u
                 LEFT JOIN matchmaker_workspace_profile p ON p.user_id = u.id AND p.status = 1
                 WHERE u.id = :user_id"""
@@ -216,11 +223,13 @@ async def require_workspace_for_user(db: AsyncSession, user_id: int) -> Workspac
             {"user_id": user_id},
         )
     ).mappings().one()
+    values = dict(row)
     return WorkspaceActor(
         user_id=user_id,
-        display_name=str(row["display_name"]),
-        level=str(row["level"]),
-        organization_id=int(row["organization_id"]) if row["organization_id"] else None,
+        display_name=str(values["display_name"]),
+        level=str(values["level"]),
+        organization_id=int(values["organization_id"]) if values["organization_id"] else None,
+        avatar=str(values["avatar"]) if values.get("avatar") else None,
     )
 
 
@@ -309,6 +318,7 @@ async def update_workspace_profile(
         display_name=request.display_name,
         level=actor.level,
         organization_id=actor.organization_id,
+        avatar=actor.avatar,
     )
     return await get_workspace_profile(db, updated)
 
@@ -483,6 +493,27 @@ async def update_workspace_homepage(
     return await get_workspace_homepage(db, actor)
 
 
+def workspace_role_name(actor: WorkspaceActor) -> str:
+    """工作台身份徽标：与后台「红娘管理」的角色下拉同一口径。
+
+    ``SUPER`` 不挂门店 = 总店超级红娘（平台范围）；``SUPER`` 挂门店只在本店范围内生效；
+    其余仍按普通服务红娘展示，和 ``_scope_predicate`` 给出的数据范围一一对应。
+    """
+    if actor.level != "SUPER":
+        return "服务红娘"
+    return "门店超级红娘" if actor.organization_id is not None else "总店超级红娘"
+
+
+def workspace_identity(actor: WorkspaceActor) -> MatchmakerWorkspaceIdentity:
+    """身份徽标单独成接口：我的账号页只要名称与角色，不必跑一遍首页的八个统计。"""
+    return MatchmakerWorkspaceIdentity(
+        greeting="你好",
+        name=actor.display_name,
+        avatar=actor.avatar,
+        role_name=workspace_role_name(actor),
+    )
+
+
 async def workspace_dashboard(
     db: AsyncSession, actor: WorkspaceActor
 ) -> MatchmakerWorkspaceDashboard:
@@ -573,6 +604,14 @@ async def workspace_dashboard(
         ),
         {"user_id": actor.user_id},
     )
+    # 线下业绩与后台「工作汇报 / 组织报表」同口径：本人作为销售红娘的线下 VIP 已收款订单。
+    offline_income = await db.scalar(
+        text(
+            """SELECT COALESCE(SUM(amount), 0) FROM payment_order
+            WHERE matchmaker_id = :user_id AND status = 1 AND product_type = 'offline_vip'"""
+        ),
+        {"user_id": actor.user_id},
+    )
     metrics = [
         WorkspaceMetric(
             key="pending_review",
@@ -592,7 +631,7 @@ async def workspace_dashboard(
         WorkspaceMetric(
             key="offline_performance",
             label="线下业绩",
-            value="0",
+            value=_money_text(offline_income),
             action="财务明细",
             value_prefix="￥",
         ),
@@ -602,10 +641,128 @@ async def workspace_dashboard(
         WorkspaceMetric(key="pending_meeting", label="待见面", value=str(pending_meeting_count), action="约见申请"),
     ]
     return MatchmakerWorkspaceDashboard(
-        identity=MatchmakerWorkspaceIdentity(
-            greeting="你好", name=actor.display_name, role_name="超级服务红娘" if actor.level == "SUPER" else "服务红娘"
-        ),
+        identity=workspace_identity(actor),
         store_metrics=metrics,
+    )
+
+
+def _money_text(value: object) -> str:
+    return f"{Decimal(str(value if value is not None else 0)):.2f}"
+
+
+async def list_workspace_commission_entries(
+    db: AsyncSession, actor: WorkspaceActor, page: int, page_size: int
+) -> WorkspaceCommissionEntryPage:
+    """本人线上分成明细：会员名与分成事件由订单、规则回带，口径与后台「总店红娘-分成明细」一致。"""
+    params: dict[str, object] = {
+        "user_id": actor.user_id,
+        "limit": page_size,
+        "offset": (page - 1) * page_size,
+    }
+    clause = "ce.beneficiary_type = 'service_matchmaker' AND ce.beneficiary_id = :user_id"
+    base = """FROM commission_entry ce
+        LEFT JOIN payment_order po ON po.id = ce.order_id
+        LEFT JOIN users c ON c.id = po.user_id
+        LEFT JOIN commission_rule rule ON rule.id = ce.rule_id"""
+    rows = await db.execute(
+        text(
+            f"""SELECT ce.id, ce.created_at, ce.status, ce.base_amount, ce.amount,
+            po.order_no, po.user_id AS consumer_id, po.product_name,
+            c.nickname AS consumer_name, c.avatar AS consumer_avatar,
+            COALESCE(rule.name, po.product_name) AS event_name
+            {base} WHERE {clause} ORDER BY ce.created_at DESC, ce.id DESC
+            LIMIT :limit OFFSET :offset"""
+        ),
+        params,
+    )
+    count_params = {key: value for key, value in params.items() if key not in {"limit", "offset"}}
+    total = int(await db.scalar(text(f"SELECT COUNT(*) {base} WHERE {clause}"), count_params) or 0)
+    # 冲正行不进合计：与工作台概览 online_commission 同一算法，避免两处金额对不上。
+    total_amount = await db.scalar(
+        text(f"SELECT COALESCE(SUM(ce.amount), 0) {base} WHERE {clause} AND ce.status <> 'REVERSED'"),
+        count_params,
+    )
+    items: list[WorkspaceCommissionEntry] = []
+    for row in rows.mappings().all():
+        consumer_id = int(row["consumer_id"] or 0)
+        consumer_name = row["consumer_name"] or (f"会员#{consumer_id}" if consumer_id > 0 else "未知会员")
+        event_name = row["event_name"] or "服务分成"
+        items.append(
+            WorkspaceCommissionEntry(
+                id=int(row["id"]),
+                created_at=row["created_at"],
+                consumer_id=consumer_id,
+                consumer_name=str(consumer_name),
+                consumer_avatar=str(row["consumer_avatar"]) if row["consumer_avatar"] else None,
+                event_name=str(event_name),
+                order_no=str(row["order_no"]) if row["order_no"] else None,
+                base_amount=_money_text(row["base_amount"]),
+                amount=_money_text(row["amount"]),
+                status=str(row["status"]),
+            )
+        )
+    return WorkspaceCommissionEntryPage(
+        items=items,
+        page=page,
+        page_size=page_size,
+        total=total,
+        has_more=_page(total, page, page_size),
+        total_amount=_money_text(total_amount),
+    )
+
+
+async def list_workspace_offline_income(
+    db: AsyncSession, actor: WorkspaceActor, page: int, page_size: int
+) -> WorkspaceOfflineIncomePage:
+    """本人线下业绩明细：线下 VIP 已收款订单，口径与后台工作汇报的 offline_income 一致。"""
+    params: dict[str, object] = {
+        "user_id": actor.user_id,
+        "limit": page_size,
+        "offset": (page - 1) * page_size,
+    }
+    clause = "po.matchmaker_id = :user_id AND po.status = 1 AND po.product_type = 'offline_vip'"
+    base = """FROM payment_order po
+        LEFT JOIN users c ON c.id = po.user_id"""
+    rows = await db.execute(
+        text(
+            f"""SELECT po.id, COALESCE(po.pay_time, po.created_at) AS paid_at, po.order_no,
+            po.product_name, po.amount, po.user_id AS consumer_id,
+            c.nickname AS consumer_name, c.avatar AS consumer_avatar
+            {base} WHERE {clause} ORDER BY paid_at DESC, po.id DESC
+            LIMIT :limit OFFSET :offset"""
+        ),
+        params,
+    )
+    count_params = {key: value for key, value in params.items() if key not in {"limit", "offset"}}
+    total = int(await db.scalar(text(f"SELECT COUNT(*) {base} WHERE {clause}"), count_params) or 0)
+    # 只统计已收款订单，与概览 offline_performance 同一算法。
+    total_amount = await db.scalar(
+        text(f"SELECT COALESCE(SUM(po.amount), 0) {base} WHERE {clause}"), count_params
+    )
+    items: list[WorkspaceOfflineIncome] = []
+    for row in rows.mappings().all():
+        consumer_id = int(row["consumer_id"] or 0)
+        consumer_name = row["consumer_name"] or (f"会员#{consumer_id}" if consumer_id > 0 else "未知会员")
+        item_name = row["product_name"] or "线下VIP服务"
+        items.append(
+            WorkspaceOfflineIncome(
+                id=int(row["id"]),
+                paid_at=row["paid_at"],
+                consumer_id=consumer_id,
+                consumer_name=str(consumer_name),
+                consumer_avatar=str(row["consumer_avatar"]) if row["consumer_avatar"] else None,
+                item_name=str(item_name),
+                order_no=str(row["order_no"]) if row["order_no"] else None,
+                amount=_money_text(row["amount"]),
+            )
+        )
+    return WorkspaceOfflineIncomePage(
+        items=items,
+        page=page,
+        page_size=page_size,
+        total=total,
+        has_more=_page(total, page, page_size),
+        total_amount=_money_text(total_amount),
     )
 
 
@@ -777,12 +934,20 @@ _LEAD_SELECT = """SELECT l.id, l.name, l.real_name, l.phone, l.wechat, l.source,
     l.next_follow_at, l.created_at, l.updated_at, l.remark, l.matchmaker_id, l.converted_user_id,
     l.photo, l.gender, l.birthday,
     COALESCE(p.display_name, u.nickname) AS matchmaker_name,
-    lf.last_follow_up_at
+    COALESCE(cp.display_name, cu.nickname) AS creator_name,
+    lf.last_follow_up_at,
+    ab.reason AS abandon_reason,
+    ab.abandoned_at AS abandoned_at
     FROM customer_lead l
     LEFT JOIN matchmaker_workspace_profile p ON p.user_id = l.matchmaker_id AND p.status = 1
     LEFT JOIN users u ON u.id = l.matchmaker_id
+    LEFT JOIN matchmaker_workspace_profile cp ON cp.user_id = l.created_by AND cp.status = 1
+    LEFT JOIN users cu ON cu.id = l.created_by
     LEFT JOIN (SELECT lead_id, MAX(created_at) AS last_follow_up_at
-        FROM customer_lead_follow_up GROUP BY lead_id) lf ON lf.lead_id = l.id"""
+        FROM customer_lead_follow_up GROUP BY lead_id) lf ON lf.lead_id = l.id
+    LEFT JOIN (SELECT lead_id, MAX(id) AS active_abandonment_id
+        FROM customer_lead_abandonment WHERE restored_at IS NULL GROUP BY lead_id) aa ON aa.lead_id = l.id
+    LEFT JOIN customer_lead_abandonment ab ON ab.id = aa.active_abandonment_id"""
 
 
 def _lead_from_row(row: object) -> WorkspaceLead:
@@ -1047,14 +1212,17 @@ async def restore_workspace_lead(
         ),
         {"actor_id": actor.user_id, "reason": request.reason, "abandonment_id": active},
     )
+    # 捞取即换人：谁捞回归谁，created_by 一并改写成捞取人；原登记人仍留在弃海流水 abandoned_by 与审计日志里。
     await db.execute(
         text(
             """UPDATE customer_lead SET status = 'NEW', matchmaker_id = :matchmaker_id,
-            organization_id = :organization_id, updated_at = UTC_TIMESTAMP() WHERE id = :lead_id"""
+            created_by = :actor_id, organization_id = :organization_id,
+            updated_at = UTC_TIMESTAMP() WHERE id = :lead_id"""
         ),
         {
             "lead_id": lead_id,
             "matchmaker_id": actor.user_id,
+            "actor_id": actor.user_id,
             "organization_id": actor.organization_id,
         },
     )

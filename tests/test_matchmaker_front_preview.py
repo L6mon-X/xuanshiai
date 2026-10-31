@@ -70,7 +70,7 @@ class FakeDB:
         return None
 
 
-def actor_db(**overrides):
+def actor_db(avatar: str | None = "/storage/uploads/avatar-test.png"):
     """默认让「工作台已开通」这条链路走通，按需覆盖单个查询结果。"""
 
     def handler(sql: str, params: dict | None) -> object:
@@ -79,9 +79,17 @@ def actor_db(**overrides):
         if WORKSPACE_PROFILE in sql and "SELECT level, organization_id" in sql:
             return [{"level": "NORMAL", "organization_id": None}]
         if "COALESCE(p.display_name, u.nickname" in sql:
-            return [{"display_name": "芸希老师", "level": "NORMAL", "organization_id": None}]
+            return [
+                {
+                    "display_name": "芸希老师",
+                    "level": "NORMAL",
+                    "organization_id": None,
+                    "avatar": avatar,
+                }
+            ]
         return overrides.get(sql, None)
 
+    overrides: dict[str, object] = {}
     return FakeDB(handler)
 
 
@@ -92,7 +100,16 @@ def test_require_workspace_for_user_reads_target_user_not_session() -> None:
     assert actor.user_id == 22
     assert actor.display_name == "芸希老师"
     assert actor.scope == "SELF"
+    # 欢迎卡头像取 users.avatar，与红娘主页同一列。
+    assert actor.avatar == "/storage/uploads/avatar-test.png"
     assert db.params_for(ROLE_OK) == {"user_id": 22, "role_code": "service_matchmaker"}
+
+
+def test_require_workspace_for_user_tolerates_missing_avatar() -> None:
+    db = actor_db(None)
+    actor = run(matchmaker_workspace.require_workspace_for_user(db, 22))
+
+    assert actor.avatar is None
 
 
 def test_member_require_workspace_still_uses_session_user_id() -> None:
@@ -124,6 +141,7 @@ def test_front_preview_checks_staff_scope_before_any_business_query() -> None:
     assert preview.workspace_level == "NORMAL"
     assert preview.workspace_scope == "SELF"
     assert preview.dashboard.identity.name == "芸希老师"
+    assert preview.dashboard.identity.avatar == "/storage/uploads/avatar-test.png"
     assert [metric.key for metric in preview.dashboard.store_metrics] == [
         "pending_review",
         "served_members",

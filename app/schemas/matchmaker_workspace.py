@@ -43,6 +43,12 @@ class MatchmakerHomepageCase(BaseModel):
     images: list[str] = Field(default_factory=list, max_length=3)
 
 
+class MatchmakerHomepageCaseInput(MatchmakerHomepageCase):
+    """保存口径：案例说明 50 字以内。读取仍用宽松模型，改口径之前入库的长案例要能读出来。"""
+
+    description: str = Field(min_length=1, max_length=50)
+
+
 class MatchmakerHomepage(BaseModel):
     """红娘本人可见的主页编辑资料；字段与公开主页同源，落库在入驻申请表。"""
 
@@ -60,7 +66,7 @@ class MatchmakerHomepageUpdate(BaseModel):
     slogan: str | None = Field(default=None, max_length=64)
     specialties: list[str] | None = Field(default=None, max_length=5)
     introduction: str | None = Field(default=None, min_length=10, max_length=2000)
-    success_cases: list[MatchmakerHomepageCase] | None = Field(default=None, max_length=3)
+    success_cases: list[MatchmakerHomepageCaseInput] | None = Field(default=None, max_length=3)
 
     @field_validator("nickname", "introduction")
     @classmethod
@@ -93,8 +99,8 @@ class MatchmakerHomepageUpdate(BaseModel):
     @field_validator("success_cases")
     @classmethod
     def validate_success_cases(
-        cls, value: list[MatchmakerHomepageCase] | None
-    ) -> list[MatchmakerHomepageCase] | None:
+        cls, value: list[MatchmakerHomepageCaseInput] | None
+    ) -> list[MatchmakerHomepageCaseInput] | None:
         if value is None:
             return None
         return [
@@ -118,6 +124,7 @@ class MatchmakerWorkspaceIdentity(BaseModel):
     greeting: str
     name: str
     role_name: str
+    avatar: str | None = None
 
 
 class MatchmakerWorkspaceDashboard(BaseModel):
@@ -204,8 +211,13 @@ class WorkspaceLead(BaseModel):
     updated_at: datetime
     matchmaker_id: int | None = None
     matchmaker_name: str | None = None
+    # 录入人 = customer_lead.created_by 对应的红娘；弃海池被捞取时改写为捞取人（谁捞回归谁）。
+    creator_name: str | None = None
     remark: str | None = None
     last_follow_up_at: datetime | None = None
+    # 弃海原因与时点取自当前生效的弃海记录（restored_at IS NULL）；未弃海为 null。
+    abandon_reason: str | None = None
+    abandoned_at: datetime | None = None
     converted_user_id: int | None = None
     photo: str | None = None
     gender: int | None = None
@@ -449,6 +461,54 @@ class WorkspaceIntroductionPage(BaseModel):
     page_size: int
     total: int
     has_more: bool
+
+
+class WorkspaceCommissionEntry(BaseModel):
+    """红娘本人的一笔线上分成：消费会员与分成事件由订单、规则回带。"""
+
+    id: int
+    created_at: datetime
+    consumer_id: int
+    consumer_name: str
+    consumer_avatar: str | None
+    event_name: str
+    order_no: str | None
+    base_amount: str
+    amount: str
+    status: Literal["PENDING", "AVAILABLE", "FROZEN", "REVERSED"]
+
+
+class WorkspaceCommissionEntryPage(BaseModel):
+    items: list[WorkspaceCommissionEntry]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
+    # 与工作台概览 online_commission 同口径：本人全部分成之和，已剔除冲正行。
+    total_amount: str
+
+
+class WorkspaceOfflineIncome(BaseModel):
+    """红娘本人的一笔线下业绩：线下 VIP 已收款订单，会员信息按订单回带。"""
+
+    id: int
+    paid_at: datetime
+    consumer_id: int
+    consumer_name: str
+    consumer_avatar: str | None
+    item_name: str
+    order_no: str | None
+    amount: str
+
+
+class WorkspaceOfflineIncomePage(BaseModel):
+    items: list[WorkspaceOfflineIncome]
+    page: int
+    page_size: int
+    total: int
+    has_more: bool
+    # 与工作台概览 offline_performance 同口径：本人全部线下业绩之和。
+    total_amount: str
 
 
 class WorkspaceMeetingRecordSummary(BaseModel):

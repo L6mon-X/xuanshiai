@@ -5,7 +5,8 @@
   擅长领域与成功案例写 application_details；不新增表或列。
 - application_details 同时承载审核资料，保存主页只覆盖 specialties/success_cases，
   wechat、expected_price 等原样保留。
-- 校验沿用入驻口径：擅长领域 ≤5 且不重复，成功案例 ≤3（描述 1-1000、图 ≤3），介绍 10-2000，签名 ≤64。
+- 校验沿用入驻口径：擅长领域 ≤5 且不重复，成功案例 ≤3（描述 1-50、图 ≤3），介绍 10-2000，签名 ≤64。
+  50 字是 2026-10-28 收敛的保存口径；读取模型仍放到 1000，改口径之前入库的长案例要能读出来。
 - 后台红娘编辑改 description/slogan 时同步写申请表，公开主页与后台不再两套口径。
 全部用 StubDB 按 SQL 文本分派，不依赖 MySQL。
 """
@@ -21,6 +22,7 @@ from pydantic import ValidationError
 from app.schemas.matchmaker_staff_admin import MatchmakerStaffUpdate
 from app.schemas.matchmaker_workspace import (
     MatchmakerHomepageCase,
+    MatchmakerHomepageCaseInput,
     MatchmakerHomepageUpdate,
 )
 from app.services.matchmaker import MatchmakerCard, _card
@@ -153,7 +155,7 @@ async def test_homepage_save_keeps_review_only_fields_in_application_details() -
         MatchmakerHomepageUpdate(
             specialties=["高知青年", "关系澄清"],
             success_cases=[
-                MatchmakerHomepageCase(description="  节奏复盘后确认长期方向  ", images=[" /static/a.webp ", ""])
+                MatchmakerHomepageCaseInput(description="  节奏复盘后确认长期方向  ", images=[" /static/a.webp ", ""])
             ],
         ),
     )
@@ -184,12 +186,19 @@ def test_homepage_validation_follows_the_application_rules() -> None:
         MatchmakerHomepageUpdate(introduction="   ")
     with pytest.raises(ValidationError):
         MatchmakerHomepageUpdate(
-            success_cases=[MatchmakerHomepageCase(description="案例") for _ in range(4)]
+            success_cases=[MatchmakerHomepageCaseInput(description="案例") for _ in range(4)]
         )
     with pytest.raises(ValidationError):
         MatchmakerHomepageUpdate(
-            success_cases=[MatchmakerHomepageCase(description="案例", images=["1", "2", "3", "4"])]
+            success_cases=[MatchmakerHomepageCaseInput(description="案例", images=["1", "2", "3", "4"])]
         )
+    with pytest.raises(ValidationError):
+        MatchmakerHomepageUpdate(success_cases=[MatchmakerHomepageCaseInput(description="案" * 51)])
+    assert MatchmakerHomepageUpdate(
+        success_cases=[MatchmakerHomepageCaseInput(description="案" * 50)]
+    ).success_cases is not None
+    # 读取模型保持宽松：改成 50 字之前入库的长案例仍要能读出来，不能因为收敛口径把主页读成 500。
+    assert MatchmakerHomepageCase(description="案" * 800).description
     with pytest.raises(ValidationError):
         MatchmakerHomepageUpdate(slogan="签名超过六十四字" + "一" * 60)
     assert MatchmakerHomepageUpdate(slogan="认真牵线，对每一次遇见负责").slogan == "认真牵线，对每一次遇见负责"

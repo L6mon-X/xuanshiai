@@ -562,6 +562,12 @@ class MatchmakerSuccessCase(BaseModel):
     images: list[str] = Field(default_factory=list, max_length=3)
 
 
+class MatchmakerSuccessCaseInput(MatchmakerSuccessCase):
+    """提交口径：案例说明 50 字以内；读取仍用宽松模型，历史长案例要能读出来。"""
+
+    description: str = Field(min_length=1, max_length=50)
+
+
 class MatchmakerApplicationDetails(BaseModel):
     """审核资料；仅返回给申请人本人或管理员，不用于公开红娘资料。"""
 
@@ -580,13 +586,19 @@ class MatchmakerApplicationDetails(BaseModel):
         return cleaned
 
 
+class MatchmakerApplicationDetailsInput(MatchmakerApplicationDetails):
+    success_cases: list[MatchmakerSuccessCaseInput] = Field(default_factory=list, max_length=3)
+
+
 class MatchmakerApplicationCreate(BaseModel):
     application_type: Literal["promoter", "partner", "service_matchmaker"]
     real_name: str = Field(min_length=2, max_length=64)
     phone: str = Field(pattern=r"^1[3-9]\d{9}$")
     intro: str = Field(min_length=10, max_length=2000)
     cert_images: list[str] = Field(default_factory=list, max_length=6)
-    application_details: MatchmakerApplicationDetails = Field(default_factory=MatchmakerApplicationDetails)
+    application_details: MatchmakerApplicationDetailsInput = Field(
+        default_factory=MatchmakerApplicationDetailsInput
+    )
 
     @model_validator(mode="before")
     @classmethod

@@ -8,12 +8,19 @@ from app.schemas.customer_lead_admin import CustomerLeadCreate, CustomerLeadUpda
 from app.schemas.matchmaker_workspace import (
     MatchmakerWorkspaceProfileUpdate,
     PromoterLeadCreate,
+    WorkspaceLead,
     WorkspaceLeadCreate,
     WorkspaceLeadUpdate,
     WorkspaceMemberReviewUpdate,
 )
 from app.services.customer_lead_contact import normalize_contact
-from app.services.matchmaker_workspace import WorkspaceActor, require_review_authority
+from app.services.matchmaker_workspace import (
+    WorkspaceActor,
+    _LEAD_SELECT,
+    require_review_authority,
+    workspace_identity,
+    workspace_role_name,
+)
 
 
 client = TestClient(app)
@@ -24,9 +31,12 @@ def test_workspace_routes_are_registered_and_require_normal_user_authentication(
     expected = {
         "/api/v1/matchmaker/management-center/access",
         "/api/v1/matchmaker/management-center/dashboard",
+        "/api/v1/matchmaker/workbench/identity",
         "/api/v1/matchmaker/workbench/members",
         "/api/v1/matchmaker/workbench/introductions",
         "/api/v1/matchmaker/workbench/meeting-requests",
+        "/api/v1/matchmaker/workbench/commission-entries",
+        "/api/v1/matchmaker/workbench/offline-income",
         "/api/v1/matchmaker/workbench/members/{member_id}/contact",
         "/api/v1/matchmaker/partner-center",
         "/api/v1/matchmaker/promoter-center",
@@ -35,6 +45,21 @@ def test_workspace_routes_are_registered_and_require_normal_user_authentication(
     assert expected <= set(paths)
     assert client.get("/api/v1/matchmaker/management-center/access").status_code == 401
     assert paths["/api/v1/matchmaker/workbench/members"]["get"].get("security")
+
+
+def test_workspace_role_name_follows_level_and_store_binding() -> None:
+    """角色徽标与数据范围同一口径：不挂门店的超级红娘是总店，挂门店的只在本店生效。"""
+    headquarters = WorkspaceActor(user_id=2, display_name="红娘测试账号", level="SUPER", organization_id=None)
+    store_super = WorkspaceActor(user_id=3, display_name="蛋希老师", level="SUPER", organization_id=1)
+    ordinary = WorkspaceActor(user_id=21, display_name="钱多多", level="NORMAL", organization_id=1)
+
+    assert workspace_role_name(headquarters) == "总店超级红娘"
+    assert workspace_role_name(store_super) == "门店超级红娘"
+    assert workspace_role_name(ordinary) == "服务红娘"
+    identity = workspace_identity(headquarters)
+    assert identity.role_name == "总店超级红娘"
+    assert identity.name == "红娘测试账号"
+    assert identity.avatar is None
 
 
 def test_public_profile_review_is_limited_to_headquarters_matchmakers() -> None:
@@ -98,3 +123,39 @@ def test_normalize_contact_treats_blank_as_missing() -> None:
     assert normalize_contact("   ") is None
     assert normalize_contact(None) is None
     assert normalize_contact(13800000000) == "13800000000"
+
+
+def test_workspace_lead_carries_the_active_abandonment_and_stays_optional() -> None:
+    """弃海池卡片要显示原因，所以列表/详情必须带出**当前生效**那条弃海记录。
+
+    恢复过的客源会留下多条历史记录，取 restored_at IS NULL 的那条；两个字段都是可选，
+    旧调用方与弃海动作自身的响应（操作前快照）都不会因此报错。
+    """
+    base = {
+        "id": 23, "name": "周先生", "phone": "13800000000", "wechat": None, "source": "线下活动",
+        "intention_level": 1, "status": "LOST", "next_follow_at": None,
+        "created_at": "2026-10-01T09:00:00", "updated_at": "2026-10-28T10:02:49",
+    }
+    assert WorkspaceLead(**base).abandon_reason is None
+    assert WorkspaceLead(**base).abandoned_at is None
+    abandoned = WorkspaceLead(**{**base, "abandon_reason": "多次联系不上", "abandoned_at": "2026-10-28T18:02:49"})
+    assert abandoned.abandon_reason == "多次联系不上"
+    assert abandoned.abandoned_at is not None
+    assert "WHERE restored_at IS NULL" in _LEAD_SELECT
+    assert "ab.reason AS abandon_reason" in _LEAD_SELECT
+    assert "ab.abandoned_at AS abandoned_at" in _LEAD_SELECT
+
+
+def test_workspace_lead_names_the_recorder_and_stays_optional() -> None:
+    """卡片要显示「录入人」，所以按 created_by 现拼红娘显示名（工作台档案优先，回落昵称）。"""
+    base = {
+        "id": 24, "name": "孙先生", "phone": "13800000000", "wechat": None, "source": "朋友介绍",
+        "intention_level": 2, "status": "NEW", "next_follow_at": None,
+        "created_at": "2026-10-20T09:00:00", "updated_at": "2026-10-20T09:00:00",
+    }
+    assert WorkspaceLead(**base).creator_name is None
+    assert WorkspaceLead(**{**base, "creator_name": "林老师"}).creator_name == "林老师"
+    assert "COALESCE(cp.display_name, cu.nickname) AS creator_name" in _LEAD_SELECT
+    assert "cp.user_id = l.created_by AND cp.status = 1" in _LEAD_SELECT
+    # 录入人是只读归属，不在可编辑字段里——改派走分派接口，换录入人只有捞取。
+    assert "creator_name" not in WorkspaceLeadUpdate.model_fields

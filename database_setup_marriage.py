@@ -580,6 +580,11 @@ class DatabaseManager:
         - 旧库已有的 active_phone / active_wechat 生成列定义不含 deleted_at，
           需检测并重建为「软删除也置 NULL」，才能让删除后的客源不再占用联系方式；
         - 新建 customer_lead_source 字典表并幂等播种常见来源（INSERT IGNORE）。
+
+        同时镜像 migrations/customer_lead_gaps/20261029_01_lead_profile_columns_up.sql：
+        customer_lead 补 real_name / photo / birthday。三列在 2026-10-24 快照 035efa9
+        只加进了 app/db/business_schema.py 的建表语句，旧库既没有列也没有补列入口，
+        而后台与红娘工作台的客源查询无条件 SELECT 它们，于是列表接口报 1054 → 500。
         """
         try:
             cursor.execute("SHOW TABLES LIKE 'customer_lead'")
@@ -589,6 +594,9 @@ class DatabaseManager:
                 "gender": "tinyint NOT NULL DEFAULT 0 COMMENT '性别 0未知 1男 2女（A13）'",
                 "deleted_at": "datetime DEFAULT NULL COMMENT '软删除时间；空为有效'",
                 "deleted_by": "bigint unsigned DEFAULT NULL COMMENT '删除操作人 matchmaker_admin_account.id'",
+                "real_name": "varchar(64) DEFAULT NULL COMMENT '客源真实姓名（选填）'",
+                "photo": "varchar(512) DEFAULT NULL COMMENT '客源照片URL'",
+                "birthday": "date DEFAULT NULL",
             }))
             self._ensure_optional_index(cursor, "customer_lead", "idx_customer_lead_deleted", "(`deleted_at`)")
             # 生成列旧定义不引用 deleted_at，软删除后仍会占用联系方式唯一键；

@@ -20,6 +20,7 @@ from app.schemas.matchmaker_workspace import (
     MatchmakerHomepageUpdate,
     MatchmakerWorkspaceAccess,
     MatchmakerWorkspaceDashboard,
+    MatchmakerWorkspaceIdentity,
     MatchmakerWorkspaceProfile,
     MatchmakerWorkspaceProfileUpdate,
     PartnerCenterSnapshot,
@@ -29,6 +30,8 @@ from app.schemas.matchmaker_workspace import (
     PromotionCode,
     WorkspaceAbandonRequest,
     WorkspaceAssignRequest,
+    WorkspaceCommissionEntryPage,
+    WorkspaceOfflineIncomePage,
     WorkspaceLead,
     WorkspaceLeadConvertRequest,
     WorkspaceLeadConvertResult,
@@ -94,6 +97,8 @@ from app.services.matchmaker_workspace import (
     list_member_matchmakers,
     list_partner_join_requests,
     list_workspace_colleagues,
+    list_workspace_commission_entries,
+    list_workspace_offline_income,
     list_workspace_introductions,
     list_workspace_lead_follow_ups,
     list_workspace_meeting_requests,
@@ -123,6 +128,7 @@ from app.services.matchmaker_workspace import (
     update_workspace_profile,
     upload_lead_photo,
     upload_workspace_photo,
+    workspace_identity,
     workspace_access,
     workspace_dashboard,
 )
@@ -155,6 +161,13 @@ async def management_center_dashboard(
     current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)
 ) -> MatchmakerWorkspaceDashboard:
     return await workspace_dashboard(db, await require_workspace(db, current))
+
+
+@router.get("/workbench/identity", response_model=MatchmakerWorkspaceIdentity, summary="查询当前红娘的工作台身份")
+async def workbench_identity(
+    current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+) -> MatchmakerWorkspaceIdentity:
+    return workspace_identity(await require_workspace(db, current))
 
 
 @router.get("/workbench/profile", response_model=MatchmakerWorkspaceProfile, summary="查询红娘展示资料")
@@ -309,6 +322,34 @@ async def workbench_members(
     db: AsyncSession = Depends(get_db),
 ) -> WorkspaceMemberPage:
     return await list_workspace_members(db, await require_workspace(db, current), page, page_size, review_status, search)
+
+
+@router.get(
+    "/workbench/commission-entries",
+    response_model=WorkspaceCommissionEntryPage,
+    summary="查询我的分成明细（含消费会员与分成事件）",
+)
+async def workbench_commission_entries(
+    page: int = Query(1, ge=1, le=1000),
+    page_size: int = Query(20, ge=1, le=100),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WorkspaceCommissionEntryPage:
+    return await list_workspace_commission_entries(db, await require_workspace(db, current), page, page_size)
+
+
+@router.get(
+    "/workbench/offline-income",
+    response_model=WorkspaceOfflineIncomePage,
+    summary="查询我的线下业绩明细（线下 VIP 已收款订单）",
+)
+async def workbench_offline_income(
+    page: int = Query(1, ge=1, le=1000),
+    page_size: int = Query(20, ge=1, le=100),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WorkspaceOfflineIncomePage:
+    return await list_workspace_offline_income(db, await require_workspace(db, current), page, page_size)
 
 
 @router.get("/workbench/introductions", response_model=WorkspaceIntroductionPage, summary="查询工作范围内牵线记录")
