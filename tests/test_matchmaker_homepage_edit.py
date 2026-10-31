@@ -66,6 +66,11 @@ class StubResult:
     def all(self) -> list[dict[str, object]]:
         return self._rows
 
+    def scalar(self) -> object:
+        if not self._rows:
+            return None
+        return next(iter(self._rows[0].values()))
+
 
 class StubDB:
     def __init__(self, apply_row: dict[str, object] | None = APPLIED, **staff_row: object) -> None:
@@ -83,6 +88,10 @@ class StubDB:
             return StubResult([] if self.apply_row is None else [dict(self.apply_row)])
         if "FROM users u JOIN user_matchmaker_apply ma" in statement or "SELECT u.id, u.avatar" in statement:
             return StubResult([self.staff_row])
+        if "information_schema.TABLES" in statement:
+            # 上游起 get_staff 会先探测 matchmaker_menu_permission_state 是否存在（旧库降级），
+            # 桩按「不存在」回空行，不影响本用例断言的同步写入。
+            return StubResult()
         raise AssertionError(f"未预期的语句：{statement}")
 
     async def scalar(self, sql: object, params: dict | None = None) -> object:
