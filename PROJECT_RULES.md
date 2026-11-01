@@ -390,6 +390,25 @@ Breaking Change 必须提供版本迁移方案，不能只在代码中直接替�
 
 9. **生成最终改动总结**（按第五部分模板）。
 
+### 7.1 测试文件与 CI 登记（强制）
+
+> 事实基线（2026-11-01 核对）：`tests/` 顶层 273 个测试文件，`backend-ci.yml` 已登记 63 个、未登记 210 个。CI 采用「按改动域分组的白名单」，共 6 个 job：`unit`、`ai-unit`、`admin-scope-unit`、`ai-profile-session-unit`、`ai-continuous-unit`、`ai-continuous-integration`。**不是全量执行，也不应改成全量执行**。
+
+**结论先行：不是 `tests/` 下所有文件都要登记；凡是「本次新增或修改」的测试文件，必须登记。**
+
+1. **新增测试文件必须登记，且两处都要改**：对应 job 的 Ruff 步骤列表 + pytest 步骤列表。只登记 pytest 不登记 Ruff，F821 这类运行期错误仍会逃过门禁；只登记 Ruff 不登记 pytest，等于没跑。两处不一致时以「都会执行」为准，不要挑一个。
+2. **修改既有测试文件时同批补登记**：如果该文件原本不在任何 job 的列表内，本次改动必须一并挂进对应 job，否则就是「写了测试但从未执行」。历史上已出现多个此类文件长期零执行记录。
+3. **登记前必须先本地跑通**：白名单等于「主干必绿」的承诺。已知失败、依赖未就绪或受外部环境影响的文件不得挂进去，否则每次 push 必红；应先修好，或在文件内用 `skipif` 标明前置条件。
+4. **按测试性质选 job，不按改动目录凑**：纯内存/假库的单元契约进对应 unit job；需要真实 MySQL / Redis / 第三方凭证的进 `tests/integration/**`（由 `ai-continuous-integration` job 显式列出）或明确排除，不得塞进 unit job 拖长超时。
+5. **未登记的历史文件按改动域逐步收编**，不搞「一次性全量登记」：单 job 超时 20 分钟，全量不可行；一次收编一批，收编前先确认该批在干净基线上全绿。
+6. **改动收尾自检**：跑下面的差集检查，本次新增（`??`）或修改（`M`）的测试文件不得出现在未登记清单里。
+
+```bash
+python -c "import re,glob,os;yml=open('.github/workflows/backend-ci.yml',encoding='utf-8').read();listed=set(re.findall(r'tests/[A-Za-z0-9_./-]+\.py',yml));top=[p.replace(os.sep,'/') for p in glob.glob('tests/test_*.py')];miss=sorted(set(top)-listed);print('未登记:',len(miss))"
+```
+
+> 该检查只覆盖 `tests/test_*.py` 顶层文件；`tests/integration/**` 由 integration job 维护，不适用本条。
+
 
 ## 八、特别约束（Codex / Claude Code 执行层）
 
@@ -422,6 +441,7 @@ Breaking Change 必须提供版本迁移方案，不能只在代码中直接替�
 | v1.3 | 2026-08-01 | 强化接口文档统一模板与完成自检清单，强制要求请求体、返回参数、每个参数意义和使用方法/业务规则 |
 | v1.4 | 2026-09-05 | 收窄完整契约和技术评估的触发范围，统一自主执行、批准、验证和完成边界 |
 | v1.5 | 2026-10-27 | 新增执行层工具调用约定：只读检索一律用文件工具、Shell 禁止多命令拼接、遵守工作区边界 |
+| v1.6 | 2026-11-01 | 新增 7.1「测试文件与 CI 登记」：新增/修改测试必须 Ruff+pytest 双处登记、登记前须跑通、按测试性质选 job、收尾做差集自检 |
 
 
 ---

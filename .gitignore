@@ -77,3 +77,7 @@ uvicorn.out.log
 
 # 属地解析数据资产：IP 库约 11MB（商用版 266MB），随部署下发并记录 sha256，不进仓库
 data/region/*.xdb
+
+# docx 流水线中间产物与临时脚本目录（可随时重生成，不入版本控制）
+output/
+.dsh-tmp/
