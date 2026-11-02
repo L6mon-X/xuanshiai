@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.schemas.auth import ProfileResponse
+from app.schemas.auth import MbtiType, ProfileResponse
 
 
 class DiscoveryFilters(BaseModel):
@@ -18,6 +18,9 @@ class DiscoveryFilters(BaseModel):
     city_code: str | None = Field(default=None, max_length=32)
     district_code: str | None = Field(default=None, max_length=32)
     marriage_status: int | None = Field(default=None, ge=1, le=3)
+    mbti: list[MbtiType] | None = Field(
+        default=None, max_length=16, description="MBTI 人格类型多选；空列表等价于不筛选"
+    )
     education_min: int | None = Field(default=None, ge=1, le=8)
     height_min: int | None = Field(default=None, ge=100, le=250)
     height_max: int | None = Field(default=None, ge=100, le=250)
@@ -122,6 +125,9 @@ class FilterOptionsResponse(BaseModel):
     marriage_statuses: list[dict[str, int | str]]
     education_levels: list[dict[str, int | str]]
     cities: list[str]
+    mbti_types: list[dict[str, str]] = Field(
+        default_factory=list, description="MBTI 筛选维度；value 用于 filters.mbti"
+    )
 
 
 class SavedFilterResponse(BaseModel):

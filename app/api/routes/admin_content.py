@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.dependencies import CurrentMatchmakerAdmin, declare_permission, get_current_matchmaker_admin
 from app.db.session import get_db
 from app.schemas.admin_content import ContentItem, ContentItemCreate, ContentItemPage, ContentItemUpdate
-from app.services.admin_content import create_item, delete_item, list_items, update_item
+from app.services.admin_content import create_item, delete_item, get_item, list_items, update_item
 
 router = APIRouter(prefix="/admin/content")
 
@@ -31,6 +31,8 @@ async def content_list(
     gender: str | None = Query(None, max_length=16, description="【仅 free_form】性别，取自 extra.gender：1 男 / 2 女"),
     landing_id: str | None = Query(None, max_length=32, description="【仅 free_form】落地页 ID，取自 extra.landing_id"),
     source: str | None = Query(None, max_length=64, description="【仅 free_form】客户来源，取自 extra.source，精确匹配"),
+    broadcast_id: str | None = Query(None, max_length=20, description="【仅 sms_send_record】发送明细所属群发任务 ID，取自 extra.broadcast_id"),
+    qrcode_id: str | None = Query(None, max_length=20, description="【仅 fan_qrcode_stat】统计所属二维码 ID，取自 extra.qrcode_id"),
     current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
     db: AsyncSession = Depends(get_db),
 ) -> ContentItemPage:
@@ -47,8 +49,22 @@ async def content_list(
         "gender": gender,
         "landing_id": landing_id,
         "source": source,
+        "broadcast_id": broadcast_id,
+        "qrcode_id": qrcode_id,
     }
     return await list_items(db, domain, page, page_size, keyword, status, extra_filters, search_type)
+
+
+@declare_permission("platform.config.read")
+@router.get("/{domain}/{item_id}", response_model=ContentItem, summary="查询内容项详情")
+async def content_detail(
+    domain: str = Path(..., min_length=2, max_length=64),
+    item_id: int = Path(..., ge=1),
+    current: CurrentMatchmakerAdmin = Depends(get_current_matchmaker_admin),
+    db: AsyncSession = Depends(get_db),
+) -> ContentItem:
+    current.require("platform.config.read")
+    return await get_item(db, domain, item_id)
 
 
 @declare_permission("platform.config.write")

@@ -192,6 +192,35 @@ def test_callback_pays_and_grants_membership_when_valid() -> None:
     assert "business_audit_log" not in sql
 
 
+def test_test_pay_disabled_when_real_gateway_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.schemas.payments import TestPaymentRequest
+    from app.services import payments
+
+    monkeypatch.setattr(settings, "environment", "development")
+    monkeypatch.setattr(settings, "wechat_pay_mode", "real")
+    db = StubDB()
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            payments.complete_test_payment(db, 7, TestPaymentRequest(order_no=ORDER_NO))
+        )
+    assert exc.value.status_code == 403
+    assert db.statements == [], "真实支付启用后不得进入测试支付履约"
+
+
+def test_test_pay_still_allowed_with_mock_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.schemas.payments import TestPaymentRequest
+    from app.services import payments
+
+    monkeypatch.setattr(settings, "environment", "development")
+    monkeypatch.setattr(settings, "wechat_pay_mode", "mock")
+    db = StubDB()
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            payments.complete_test_payment(db, 7, TestPaymentRequest(order_no=ORDER_NO))
+        )
+    assert exc.value.status_code == 404, "mock 模式应继续查询订单而不是被 403 拦截"
+
+
 def test_real_mode_requires_amount_when_signature_valid(monkeypatch: pytest.MonkeyPatch) -> None:
     from pydantic import SecretStr
 

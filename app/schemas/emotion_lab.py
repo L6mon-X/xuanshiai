@@ -53,3 +53,25 @@ class EmotionLabProfileSourceResponse(BaseModel):
         alias="confirmedAt",
         description="本次确认时间；资料内容未变化时返回上次变更时间（幂等）",
     )
+
+
+class EmotionLabMatchItem(BaseModel):
+    """「合拍的人」条目：算法与首页卡片同源（discovery._candidate_score）。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    user_id: int = Field(alias="userId", description="候选人 user_id")
+    nickname: str | None = Field(default=None, description="昵称；空表示未设置")
+    avatar: str | None = Field(default=None, description="头像 URL；空表示未上传")
+    mbti: MbtiType | None = Field(default=None, description="候选人 MBTI；空表示资料未填")
+    match_percent: int = Field(alias="matchPercent", ge=0, le=100, description="合拍度百分比")
+    match_reason: str = Field(alias="matchReason", description="合拍理由，可直接展示")
+
+
+class EmotionLabMatchesResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    items: list[EmotionLabMatchItem] = Field(default_factory=list)
+    hint: str | None = Field(
+        default=None, description="无法给出结果时的可展示提示（如尚未完成 MBTI 测试）"
+    )

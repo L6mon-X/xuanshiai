@@ -1133,7 +1133,18 @@ async def delete_comment(db: AsyncSession, user_id: int, comment_id: int) -> Non
     row = result.mappings().first()
     if not row:
         raise HTTPException(404, detail="评论不存在或无权删除")
-    await db.execute(text("UPDATE community_comment SET deleted_at = UTC_TIMESTAMP() WHERE id = :comment_id"), {"comment_id": comment_id})
+    # 级联软删：只删父评论会留下「孤儿回复」，而列表查询刻意保留「有子回复的
+    # 已删父节点」，表现就是「删了评论、刷新后又回来，连同它的回复」。子树用
+    # root_id 收敛（create_comment 会给嵌套回复写 root_id），再用 parent_id 兜底
+    # 兼容 root_id 为空的历史数据。
+    await db.execute(
+        text(
+            """UPDATE community_comment SET deleted_at = UTC_TIMESTAMP()
+            WHERE deleted_at IS NULL
+              AND (id = :comment_id OR root_id = :comment_id OR parent_id = :comment_id)"""
+        ),
+        {"comment_id": comment_id},
+    )
     # 与 create_comment 一致采用重算，避免增量式计数漂移
     await db.execute(
         text(

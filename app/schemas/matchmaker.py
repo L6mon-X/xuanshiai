@@ -75,8 +75,22 @@ class MatchmakerServiceProductResponse(BaseModel):
 
 class MatchmakerServiceOrderCreate(BaseModel):
     product_id: int = Field(ge=1)
-    matchmaker_id: int = Field(ge=1)
+    # 私人定制套餐是「平台服务」而非「指定某位红娘」，页面没有选人控件；
+    # 因此 matchmaker_id 允许缺省，由服务端在可用服务红娘池中分配。
+    # 指定红娘的下单路径行为不变（传值即按原逻辑校验身份与互动关系）。
+    matchmaker_id: int | None = Field(
+        default=None, ge=1, description="指定服务红娘；缺省时由服务端自动分配"
+    )
+    assignment_mode: Literal["auto", "designated"] = Field(
+        default="auto", description="auto=缺省自动分配；designated=必须指定 matchmaker_id"
+    )
     requirement: str = Field(min_length=10, max_length=2000)
+
+    @model_validator(mode="after")
+    def _validate_assignment(self):
+        if self.assignment_mode == "designated" and self.matchmaker_id is None:
+            raise ValueError("assignment_mode=designated 时必须指定 matchmaker_id")
+        return self
 
 
 class MatchmakerServiceOrderResponse(BaseModel):

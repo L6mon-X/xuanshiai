@@ -3,6 +3,7 @@
 from fastapi import APIRouter
 
 from app.api.routes import (
+    ai_capabilities,
     ai_compatibility,
     ai_consents,
     ai_recommend,
@@ -22,6 +23,7 @@ from app.api.routes import (
     admin_common_upload,
     admin_content,
     admin_cms,
+    admin_user_feedback,
     ai_avatar,
     auth,
     ai,
@@ -93,6 +95,7 @@ from app.api.routes import (
     partner_admin,
     partner_level_admin,
     social,
+    support,
     users,
     user_cancellation_admin as user_cancellation_router,
     admin_ticket as admin_ticket_router,
@@ -119,6 +122,7 @@ api_router.include_router(ai_advisor.router, tags=["AIAdvisor"])
 api_router.include_router(ai_avatar.router, tags=["AI 分身"])
 api_router.include_router(ai_avatar.memory_router, tags=["AI 分身"])
 api_router.include_router(users.router, tags=["账号与认证"])
+api_router.include_router(support.router, tags=["客服与反馈"])
 api_router.include_router(certifications.router, tags=["认证审核"])
 api_router.include_router(membership.router, tags=["会员"])
 api_router.include_router(payments.router, tags=["支付"])
@@ -198,6 +202,7 @@ api_router.include_router(meeting.admin_router, tags=["管理后台"])
 api_router.include_router(promotion_order_admin.router, tags=["管理后台"])
 api_router.include_router(user_cancellation_router.router, tags=["管理后台"])
 api_router.include_router(admin_ticket_router.router, tags=["管理后台"])
+api_router.include_router(admin_user_feedback.router, tags=["管理后台"])
 api_router.include_router(finance.admin_router, tags=["管理后台"])
 # A4/A5/A7/A8/A10：后台运营工具（素材库 / 二维码 / 话术库 / 相亲卡 / 互动内容 / 联盟活动）
 api_router.include_router(admin_material_admin.router, tags=["管理后台"])
@@ -220,6 +225,7 @@ api_router.include_router(organization.partner_router, tags=["组织与归属"])
 api_router.include_router(finance.router, tags=["财务与结算"])
 api_router.include_router(ai_tasks.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_consents.router, prefix="/ai", tags=["AI"])
+api_router.include_router(ai_capabilities.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_profile.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_profile_card.router, prefix="/ai", tags=["AI"])
 api_router.include_router(ai_search.router, prefix="/ai", tags=["AI"])

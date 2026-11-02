@@ -26,6 +26,7 @@ from app.core.security import (
 )
 from app.schemas.auth import (
     BindPhoneRequest,
+    ChangePhoneRequest,
     PhoneLoginRequest,
     RealNameRequest,
     RefreshRequest,
@@ -312,6 +313,29 @@ async def create_session(
             "user_id": user_id}
 
 
+# users.source（会员登记来源：后台添加/红娘录入/批量导入/自己注册/落地页/父母登记/线索入库/…）
+# 属 20261011 补列项。注册是核心入口，迁移未执行的环境探测不到该列时静默不写，
+# 不能让一句 Unknown column 把新用户挡在门外。
+SOURCE_SELF_REGISTER = "自己注册"
+
+
+async def _users_columns(db: AsyncSession) -> frozenset[str]:
+    rows = await db.execute(text("""SELECT COLUMN_NAME FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users'"""))
+    return frozenset(row[0] for row in rows.all())
+
+
+def _render_user_insert(columns: list[str], values: list[str]) -> str:
+    """渲染 users 表的 INSERT：取值位与列必须一一对应，且每项自带冒号（或是 SQL 字面量）。
+
+    长度断言防的是 2026-10-31 客源录入事故：把冒号写在 ``', '.join()`` 外面只会给首列
+    加占位符，其余列退化成同表裸列名引用，MySQL 不报错但写入 NULL/列默认值。
+    """
+    if len(columns) != len(values):
+        raise ValueError(f"users INSERT 列数({len(columns)})与取值位数({len(values)})不一致")
+    return f"INSERT INTO users ({', '.join(columns)}) VALUES ({', '.join(values)})"
+
+
 async def get_or_create_user_by_phone(db: AsyncSession, phone: str, ip: str | None) -> int:
     result = await db.execute(text("SELECT id, status FROM users WHERE phone = :phone FOR UPDATE"), {"phone": phone})
     row = result.mappings().first()
@@ -323,9 +347,18 @@ async def get_or_create_user_by_phone(db: AsyncSession, phone: str, ip: str | No
         return user_id
     if not await platform_registration_open(db):
         raise HTTPException(403, detail="平台当前暂停新用户注册，请联系红娘开通后再试")
+    # 取值位逐项自带冒号（或写成 SQL 字面量）：把冒号留在 join 外面只会给首列加占位符，
+    # 其余列退化成裸列名引用，MySQL 不报错但写入的是 NULL/列默认值。
+    columns = ["phone", "phone_verified_at", "register_ip"]
+    values = [":phone", "UTC_TIMESTAMP()", ":ip"]
+    payload: dict[str, Any] = {"phone": phone, "ip": ip}
+    if "source" in await _users_columns(db):
+        columns.append("source")
+        values.append(":source")
+        payload["source"] = SOURCE_SELF_REGISTER
     result = await db.execute(
-        text("INSERT INTO users (phone, phone_verified_at, register_ip) VALUES (:phone, UTC_TIMESTAMP(), :ip)"),
-        {"phone": phone, "ip": ip},
+        text(_render_user_insert(columns, values)),
+        payload,
     )
     user_id = result.lastrowid
     await ensure_default_user_role(db, user_id)
@@ -384,7 +417,20 @@ async def login_wechat(db: AsyncSession, request: WechatLoginRequest, ip: str | 
         else:
             if not await platform_registration_open(db):
                 raise HTTPException(403, detail="平台当前暂停新用户注册，请联系红娘开通后再试")
-            result = await db.execute(text("INSERT INTO users (openid, unionid, nickname, avatar, register_ip) VALUES (:openid, :unionid, :nickname, :avatar, :ip)"), {"openid": identity["openid"], "unionid": identity.get("unionid"), "nickname": request.nickname, "avatar": request.avatar, "ip": ip})
+            columns = ["openid", "unionid", "nickname", "avatar", "register_ip"]
+            values = [":openid", ":unionid", ":nickname", ":avatar", ":ip"]
+            payload: dict[str, Any] = {
+                "openid": identity["openid"], "unionid": identity.get("unionid"),
+                "nickname": request.nickname, "avatar": request.avatar, "ip": ip,
+            }
+            if "source" in await _users_columns(db):
+                columns.append("source")
+                values.append(":source")
+                payload["source"] = SOURCE_SELF_REGISTER
+            result = await db.execute(
+                text(_render_user_insert(columns, values)),
+                payload,
+            )
             user_id, phone = result.lastrowid, None
         await ensure_default_user_role(db, user_id)
         tokens = await create_session(db, user_id, request.device_id, request.platform, request.app_version, ip, user_agent)
@@ -418,6 +464,12 @@ async def login_existing_account(db: AsyncSession, request: ExistingAccountLogin
 async def bind_phone(db: AsyncSession, user_id: int, request: BindPhoneRequest, ip: str | None) -> None:
     if request.purpose != "bind_phone":
         raise HTTPException(422, detail="绑定手机号验证码用途必须为bind_phone")
+    bound = await db.execute(text("SELECT phone FROM users WHERE id = :id"), {"id": user_id})
+    bound_phone = bound.scalar()
+    if bound_phone and bound_phone != request.phone:
+        # 此前该接口对已绑定账号直接覆盖 phone，只校验新号验证码：任何持有有效
+        # token 的人都能用自己的号码改绑并接管账号。已绑定用户必须走换绑流程。
+        raise HTTPException(409, detail="账号已绑定手机号，请使用换绑流程")
     await sms_store.verify(request.phone, "bind_phone", request.code)
     async with db.begin():
         result = await db.execute(text("SELECT id, phone FROM users WHERE id = :id FOR UPDATE"), {"id": user_id})
@@ -426,10 +478,63 @@ async def bind_phone(db: AsyncSession, user_id: int, request: BindPhoneRequest, 
             raise HTTPException(404, detail="用户不存在")
         if current["phone"] == request.phone:
             return
+        if current["phone"]:
+            raise HTTPException(409, detail="账号已绑定手机号，请使用换绑流程")
         result = await db.execute(text("SELECT id FROM users WHERE phone = :phone FOR UPDATE"), {"phone": request.phone})
         if result.first():
             raise HTTPException(409, detail="该手机号已绑定其他账号")
         await db.execute(text("UPDATE users SET phone = :phone, phone_verified_at = UTC_TIMESTAMP(), updated_at = UTC_TIMESTAMP() WHERE id = :id"), {"phone": request.phone, "id": user_id})
+
+
+async def change_phone(
+    db: AsyncSession,
+    user_id: int,
+    session_id: int,
+    request: ChangePhoneRequest,
+    ip: str | None,
+) -> None:
+    """换绑手机号：旧号（验证码或密码）+ 新号验证码双证明，成功后踢掉其他会话。
+
+    与 ``bind_phone`` 的区别：bind 只服务「从未绑定」的账号（微信登录后补绑），
+    因此对已绑定账号直接 409；换绑必须在这里完成，且两端都要证明归属。
+    """
+    async with db.begin():
+        result = await db.execute(
+            text("SELECT id, phone, password FROM users WHERE id = :id FOR UPDATE"), {"id": user_id}
+        )
+        row = result.mappings().first()
+        if not row:
+            raise HTTPException(404, detail="用户不存在")
+        current_phone = row["phone"]
+        if not current_phone:
+            raise HTTPException(409, detail="账号尚未绑定手机号，请使用绑定流程")
+        if current_phone == request.new_phone:
+            raise HTTPException(422, detail="新手机号与当前手机号相同")
+        if request.old_code:
+            await sms_store.verify(current_phone, "change_phone_old", request.old_code)
+        else:
+            if not row["password"] or not verify_password(request.password or "", row["password"]):
+                raise HTTPException(401, detail="账号密码错误")
+        await sms_store.verify(request.new_phone, "change_phone_new", request.new_code)
+        occupied = await db.execute(
+            text("SELECT id FROM users WHERE phone = :phone FOR UPDATE"), {"phone": request.new_phone}
+        )
+        if occupied.first():
+            raise HTTPException(409, detail="该手机号已绑定其他账号")
+        await db.execute(
+            text(
+                "UPDATE users SET phone = :phone, phone_verified_at = UTC_TIMESTAMP(), updated_at = UTC_TIMESTAMP() WHERE id = :id"
+            ),
+            {"phone": request.new_phone, "id": user_id},
+        )
+        # 换绑等同凭证变更：除当前设备外全部会话失效，防止旧号留存设备继续使用。
+        await db.execute(
+            text(
+                "UPDATE user_session SET status = 2, revoked_at = UTC_TIMESTAMP(), revoke_reason = 'phone_changed'"
+                " WHERE user_id = :id AND status = 1 AND id <> :sid"
+            ),
+            {"id": user_id, "sid": session_id},
+        )
 
 
 async def refresh_session(db: AsyncSession, request: RefreshRequest, ip: str | None, user_agent: str | None) -> dict[str, Any]:

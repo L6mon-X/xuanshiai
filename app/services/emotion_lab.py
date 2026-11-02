@@ -19,9 +19,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas.auth import ProfileUpdateRequest
 from app.schemas.emotion_lab import (
+    EmotionLabMatchItem,
+    EmotionLabMatchesResponse,
     EmotionLabProfileSourceRequest,
     EmotionLabProfileSourceResponse,
 )
+from app.services.discovery import emotion_lab_matches as _rank_matches
 from app.services.profile import update_profile
 
 
@@ -68,4 +71,24 @@ async def sync_profile_source(
         assessment_version=None,
         result_id=request.result_id,
         confirmed_at=confirmed_at,
+    )
+
+
+async def matches(
+    db: AsyncSession, user_id: int, limit: int = 6
+) -> EmotionLabMatchesResponse:
+    """「合拍的人」：自身 MBTI 为空时返回空列表 + 可展示提示，不抛 404。
+
+    排序复用 ``services.discovery.emotion_lab_matches``（内部即首页卡片的
+    ``_candidate_score``），因此与首页合拍度同源、同配置。
+    """
+    row = await _profile_row(db, user_id)
+    if row is None:
+        raise HTTPException(404, detail="资料不存在，请先完成注册")
+    if not row.get("mbti"):
+        return EmotionLabMatchesResponse(items=[], hint="完成 MBTI 测试后才能看到合拍的人")
+    ranked = await _rank_matches(db, user_id, limit)
+    return EmotionLabMatchesResponse(
+        items=[EmotionLabMatchItem(**item) for item in ranked],
+        hint=None if ranked else "暂时没有可推荐的合拍用户",
     )

@@ -82,6 +82,51 @@ AI 自然语言搜索入口；草稿、快照、搜索建议和异步任务契�
 
 旧匹配解释入口；`match_type` 为 `who_likes_me/i_like/material/soul`。新 shadow 资料合拍参考见 `docs/api/AI匹配度.md`。
 
+### `GET /api/v1/ai/capabilities`
+
+**基本信息**
+
+- 用途：一次性返回「当前登录用户此刻哪些 AI 能力真的可用」，供前端按真实开关出态
+- 完整 URL：`/api/v1/ai/capabilities`
+- Method：`GET`
+- 是否需要登录：是
+- 所需角色/权限：任意登录用户
+- Content-Type：无请求体；响应 `application/json`
+- 成功状态码：`200 OK`
+
+**返回参数**
+
+| 字段 | 类型 | 必返 | 含义 |
+|---|---|---|---|
+| `master` | boolean | 是 | AI 总闸；为 `false` 时其余字段恒为 `false` |
+| `profile` | boolean | 是 | AI 画像 / 用心度 / 资料卡是否可用 |
+| `search` | boolean | 是 | AI 搜索与自然语言筛选是否可用 |
+| `voice` | boolean | 是 | 语音播报 / 语音输入是否可用 |
+| `advisor` | boolean | 是 | AI 军师是否可用 |
+| `avatar` | boolean | 是 | AI 分身是否可用 |
+
+返回示例（默认关闭）：
+
+```json
+{ "master": false, "profile": false, "search": false, "voice": false, "advisor": false, "avatar": false }
+```
+
+**业务规则**
+
+1. 每个字段等价于「对应接口此刻会不会返回 `503 AI_FEATURE_DISABLED`」，判定直接复用
+   `services.ai.flags.require_ai_feature`（含 master 总闸、功能开关、生产三道审批门、
+   `AI_TEST_ONLY_USER_IDS` 范围），**不在前端复制开关逻辑**。
+2. `master=false` 时其余字段一定为 `false`，前端只需判 `master` 即可决定是否展示 AI 入口组。
+3. 前端建议缓存 5 分钟；能力开关变更不需要推送，重新拉取即可。
+
+**错误**
+
+| HTTP | 触发条件 | 前端处理 |
+|---|---|---|
+| 401 | 未登录 / token 失效 | 走登录引导 |
+
+**兼容性**：新增接口，无旧调用方。
+
 ## 运行时 OpenAPI 路径对账（2026-09-25）
 
 以下清单以当前应用 `GET /openapi.json` 的 `paths` 为准；参数名使用路由模板。新增或删除 AI HTTP 路径时必须同步本索引和对应专门文档。
@@ -91,6 +136,7 @@ AI 自然语言搜索入口；草稿、快照、搜索建议和异步任务契�
 - **资料卡 / 搜索 / 推荐**：`/ai/profile-card/draft`（GET）、`/ai/profile-card/summarize`（POST）、`/ai/profile-card/draft/apply`（POST）；`/ai/search-drafts`（POST）、`/ai/search-drafts/{draft_id}`（GET/PATCH）、`/ai/search-drafts/{draft_id}/confirm`（POST）、`/ai/search-snapshots/{snapshot_id}`（DELETE）、`/ai/search-snapshots/{snapshot_id}/results`（GET）、`/ai/search-suggestions`（GET）、`/ai/search-suggestions/generate`（POST）、`/ai/recommendations`（GET）。
 - **授权 / 任务 / 匹配度 / 记忆 / 墨相师**：`/ai/consents`（GET）、`/ai/consents/{scope}`（PUT/DELETE）；`/ai/tasks/{task_id}`（GET）、`/ai/tasks/{task_id}/cancel`（POST）；`/ai/compatibility/{target_user_id}`（GET）、`/ai/compatibility/{target_user_id}/recompute`（POST）；`/ai/memory`、`/ai/memory/view`、`/ai/memory/{claim_id}/confirm`、`/ai/memory/{claim_id}/correct`、`/ai/memory/{claim_id}/suppress`、`/ai/memory/suppressions/{suppression_id}/lift`、`/ai/memory/grants/{grant_id}/revoke`、`/ai/memory/pause`、`/ai/memory/forget`；`/ai/moxiang/state`（GET）、`/ai/moxiang/archive`（GET）、`/ai/moxiang/journey/start`（POST）。
 - **语音 HTTP**：`/voice/ws-ticket`（POST）、`/voice/transcribe`（POST）、`/voice/synthesize`（POST）。
+- **能力探测**：`/ai/capabilities`（GET）。
 
 WebSocket 路径不会出现在 OpenAPI `paths`，但属于同一发布边界：
 `/voice/conversation?ticket=<ticket>` 和 `/voice/moxiang-master?ticket=<ticket>`。两者均先调用
@@ -99,6 +145,7 @@ WebSocket 路径不会出现在 OpenAPI `paths`，但属于同一发布边界：
 
 ### 变更记录
 
+- 2026-11-02：新增 `GET /ai/capabilities` 运行时能力探测。此前前端无法预知 AI 开关，四个症状（AI 搜索不可用 / 画像不可用 / 语音不可用 / 用心度 503）实为同一事实。
 - 2026-09-25：按当前运行时 OpenAPI 重建路径索引；AI 默认关闭和生产 fail-closed 配置改为实际 `ai_*` 字段，移除旧的 `AI_ENABLED=true` 示例。
 - 2026-09-07：新增 AI 资料用心度评审接口（GET/POST `/ai/profile/thoughtfulness`）。
 - 2026-08-19：新增阶段一 AI 助手、文字资料润色、自然语言搜索和四类匹配解释接口。

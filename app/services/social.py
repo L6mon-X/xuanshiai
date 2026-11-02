@@ -152,7 +152,12 @@ async def _relation_page(db: AsyncSession, user_id: int, relation_type: str, inc
         selected = "user_id" if incoming else "target_user_id"
         ids_sql = f"SELECT {selected} AS target_user_id FROM user_favorite WHERE {field} = :user_id AND type = {type_value} ORDER BY created_at DESC"
     rows = (await db.execute(text(ids_sql), {"user_id": user_id})).mappings().all()
-    targets = await _target_rows(db, user_id, [int(row["target_user_id"]) for row in rows])
+    # 「我的喜欢 / 我的收藏 / 我的关注」是已发生的关系记录，不是推荐曝光位：
+    # 不能套用推荐流的资料完整度门禁（score >= 100），否则被收藏者资料不完整时
+    # 整条记录被过滤，表现为「收藏成功但列表里找不到」。封禁/隐私 predicate 不变。
+    targets = await _target_rows(
+        db, user_id, [int(row["target_user_id"]) for row in rows], skip_completion_gate=True
+    )
     visible = [_social_user(targets[int(row["target_user_id"])]) for row in rows if int(row["target_user_id"]) in targets]
     start = (page - 1) * page_size
     return RelationPage(items=visible[start:start + page_size], page=page, page_size=page_size, total=len(visible))

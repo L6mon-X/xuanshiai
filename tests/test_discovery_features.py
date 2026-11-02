@@ -908,6 +908,7 @@ async def test_record_lists_use_the_shared_visibility_predicate(
         candidate_alias: str = "u",
         privacy_alias: str = "pr",
         completion_alias: str = "c",
+        skip_completion_gate: bool = False,
     ) -> tuple[dict[str, object], bool, object]:
         seen_scenes.append(str(scene))
         predicate = CandidateVisibilityService().predicate(
