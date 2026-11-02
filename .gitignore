@@ -67,6 +67,11 @@ scripts/*
 !scripts/migrate_admin_public_media.py
 # 7.2 迁移差集检查脚本必须随仓库发布，团队成员与 CI 均可直接执行
 !scripts/check_migrations.py
+# 业务迁移执行器：tests/test_business_schema_migration_contract.py 直接导入
+!scripts/manage_business_migration.py
+# 微信支付 real 模式预检与安全暂停脚本：backend-ci.yml 的 admin Ruff 门禁引用
+!scripts/verify_wechat_pay_preflight.py
+!scripts/pause_real_pay.py
 artifacts/
 
 # Local runtime logs
