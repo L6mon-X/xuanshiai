@@ -27,7 +27,7 @@ jobs:
       ENVIRONMENT: testing
       AUTO_INIT_DB: "true"
       DATABASE_URL: mysql+aiomysql://root:@127.0.0.1:3306/xuanshiai_contract
-      UPLOAD_DIR: ${{ runner.temp }}/xuanshiai-schema-contract-uploads
+      UPLOAD_DIR: ${{ github.workspace }}/.ci-uploads
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
