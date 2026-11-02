@@ -74,17 +74,20 @@ def actor(user_id=21):
 async def view_both(db, who=None):
     who = who or actor()
     await view_workspace_introduction_contact(db, who, 12, "from")
-    return await view_workspace_introduction_contact(db, who, 12, "to")
+    return await view_workspace_introduction_contact(db, who, 12, "to", True)
 
 
 @pytest.mark.asyncio
-async def test_one_phone_stays_pending_second_phone_advances_and_retries_are_safe():
+async def test_viewing_both_phones_requires_explicit_confirmation_and_retries_are_safe():
     db = DB()
     first = await view_workspace_introduction_contact(db, actor(), 12, "from")
     assert first.status == "PENDING" and first.from_phone_viewed and not first.to_phone_viewed
     assert first.contact.phone == "13800000001" and first.contact.wechat is None
+    second = await view_workspace_introduction_contact(db, actor(), 12, "to")
+    assert second.status == "PENDING" and second.from_phone_viewed and second.to_phone_viewed
+    assert not any(a["action"].endswith("introduction.status") for a in db.audit)
     assert (await view_both(db)).status == "IN_PROGRESS"
-    assert (await view_workspace_introduction_contact(db, actor(), 12, "to")).status == "IN_PROGRESS"
+    assert (await view_workspace_introduction_contact(db, actor(), 12, "to", True)).status == "IN_PROGRESS"
     transitions = [a for a in db.audit if a["action"].endswith("introduction.status")]
     assert len(transitions) == 1
     assert not any("138000" in str(a) for a in db.audit)
@@ -94,9 +97,14 @@ async def test_one_phone_stays_pending_second_phone_advances_and_retries_are_saf
 async def test_missing_phone_does_not_count_as_viewed():
     db = DB()
     db.members[2]["phone"] = None
-    result = await view_both(db)
+    await view_workspace_introduction_contact(db, actor(), 12, "from")
+    result = await view_workspace_introduction_contact(db, actor(), 12, "to")
     assert result.status == "PENDING" and not result.to_phone_viewed
     assert result.contact.phone is None
+    with pytest.raises(HTTPException) as error:
+        await view_workspace_introduction_contact(db, actor(), 12, "to", True)
+    assert error.value.status_code == 409
+    assert db.record["status"] == "PENDING"
 
 
 @pytest.mark.asyncio
@@ -131,7 +139,8 @@ async def test_rejection_invalidates_previous_round_phone_views():
     db.audit.append(dict(actor_id=2, resource_id=12, action="matchmaker_workspace.introduction.response.rejected"))
     result = await view_workspace_introduction_contact(db, actor(), 12, "from")
     assert result.status == "PENDING" and not result.to_phone_viewed
-    assert (await view_workspace_introduction_contact(db, actor(), 12, "to")).status == "IN_PROGRESS"
+    assert (await view_workspace_introduction_contact(db, actor(), 12, "to")).status == "PENDING"
+    assert (await view_workspace_introduction_contact(db, actor(), 12, "to", True)).status == "IN_PROGRESS"
 
 
 @pytest.mark.asyncio
@@ -223,7 +232,9 @@ def test_http_contact_view_and_result_contract(monkeypatch):
         first = client.post(url + "/contact-views", json={"side": "from"})
         assert first.status_code == 200 and first.json()["status"] == "PENDING"
         second = client.post(url + "/contact-views", json={"side": "to"})
-        assert second.status_code == 200 and second.json()["status"] == "IN_PROGRESS"
+        assert second.status_code == 200 and second.json()["status"] == "PENDING"
+        confirmed = client.post(url + "/contact-views", json={"side": "to", "contacts_obtained": True})
+        assert confirmed.status_code == 200 and confirmed.json()["status"] == "IN_PROGRESS"
         assert client.patch(url + "/status", json={"status": "SUCCEEDED"}).status_code == 409
         response = client.patch(url + "/status", json={"status": "SUCCEEDED", "contact_confirmed": True})
         assert response.status_code == 204 and response.content == b""

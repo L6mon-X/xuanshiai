@@ -887,7 +887,7 @@ async def update_workbench_introduction_status(
 @router.post(
     "/workbench/introductions/{introduction_id}/contact-views",
     response_model=WorkspaceIntroductionContactViewed,
-    summary="逐侧查看牵线电话，双方均查看后进入牵线中",
+    summary="逐侧查看牵线电话，确认已获得双方联系方式后进入牵线中",
 )
 async def view_workbench_introduction_contact(
     introduction_id: int = Path(..., ge=1),
@@ -895,7 +895,7 @@ async def view_workbench_introduction_contact(
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> WorkspaceIntroductionContactViewed:
-    return await view_workspace_introduction_contact(db, await require_workspace(db, current), introduction_id, body.side)
+    return await view_workspace_introduction_contact(db, await require_workspace(db, current), introduction_id, body.side, body.contacts_obtained)
 
 
 @router.post(

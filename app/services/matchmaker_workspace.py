@@ -2852,9 +2852,9 @@ async def _introduction_phone_views(db: AsyncSession, actor_id: int, introductio
 
 
 async def view_workspace_introduction_contact(
-    db: AsyncSession, actor: WorkspaceActor, introduction_id: int, side: str,
+    db: AsyncSession, actor: WorkspaceActor, introduction_id: int, side: str, contacts_obtained: bool = False,
 ) -> WorkspaceIntroductionContactViewed:
-    """按牵线记录授权、逐侧读电话；同一红娘查看双方有效电话后原子推进状态。"""
+    """逐侧读取电话；同一红娘查看双方电话并明确确认获得联系方式后才推进状态。"""
     if side not in {"from", "to"}:
         raise HTTPException(422, detail="无效的牵线方")
     params: dict[str, object] = {"id": introduction_id}
@@ -2877,7 +2877,10 @@ async def view_workspace_introduction_contact(
         await _audit(db, actor.user_id, "matchmaker_workspace.introduction.phone.empty", "matchmaker_introduction", introduction_id, side)
     from_viewed, to_viewed = await _introduction_phone_views(db, actor.user_id, introduction_id)
     status = str(row["status"])
-    if status == "PENDING" and from_viewed and to_viewed:
+    if contacts_obtained and not (from_viewed and to_viewed):
+        raise HTTPException(409, detail="请先查看双方电话，再确认已获得双方联系方式")
+    if status == "PENDING" and from_viewed and to_viewed and contacts_obtained:
+        await _audit(db, actor.user_id, "matchmaker_workspace.introduction.contacts_obtained", "matchmaker_introduction", introduction_id)
         status = "IN_PROGRESS"
         await db.execute(text("""UPDATE matchmaker_introduction SET status = 'IN_PROGRESS',
             updated_at = UTC_TIMESTAMP() WHERE id = :id AND status = 'PENDING'"""), {"id": introduction_id})

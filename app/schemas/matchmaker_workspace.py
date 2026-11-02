@@ -470,11 +470,12 @@ class WorkspaceIntroductionPage(BaseModel):
 
 class WorkspaceIntroductionContactView(BaseModel):
     side: Literal["from", "to"] = Field(description="from=申请人，to=被牵线方；禁止传入任意会员ID")
+    contacts_obtained: bool = Field(default=False, description="红娘明确确认已获得双方联系方式；双方电话均查看后才可推进牵线中")
 
 
 class WorkspaceIntroductionContactViewed(BaseModel):
     introduction_id: int = Field(description="本次查看所对应的牵线记录ID")
-    status: IntroductionStatus = Field(description="查看后的权威阶段；双方有效电话均已查看时待牵线自动进入牵线中")
+    status: IntroductionStatus = Field(description="权威阶段；双方电话均已查看且红娘确认已获得联系方式后进入牵线中")
     contact: WorkspaceMemberContact = Field(description="仅本次指定方的电话，微信固定null；电话缺失不计入成功查看")
     from_phone_viewed: bool = Field(description="当前红娘在本条、本轮已查看申请人有效电话")
     to_phone_viewed: bool = Field(description="当前红娘在本条、本轮已查看被牵线方有效电话")
