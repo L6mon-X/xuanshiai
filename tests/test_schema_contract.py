@@ -31,6 +31,14 @@ def test_code_schema_covers_every_table_with_a_primary_key() -> None:
     assert schema["users"]["columns"]["id"] == "bigint unsigned"
 
 
+def test_multiline_generated_column_is_not_parsed_as_column() -> None:
+    """生成列的多行 CASE 表达式不得被当成列名（schema-contract CI 的假缺口）。"""
+    columns = parse_code_schema()["ai_profile_build_invite"]["columns"]
+    assert columns["active_slot"] == "tinyint"
+    assert "CASE" not in columns
+    assert "WHEN" not in columns
+
+
 def test_bootstrap_only_columns_exclude_base_ddl_columns() -> None:
     gaps = bootstrap_only_columns()
     total = sum(len(columns) for columns in gaps.values())
