@@ -151,6 +151,7 @@ async def test_nickname_is_written_to_users_and_audited() -> None:
     db = StubDB()
     await update_workspace_homepage(db, actor(), MatchmakerHomepageUpdate(nickname="  钱多多  "))
     assert db.write_for("UPDATE users SET nickname")[1] == {"value": "钱多多", "id": MATCHMAKER_ID}
+    assert db.write_for("UPDATE matchmaker_workspace_profile SET display_name")[1] == {"value": "钱多多", "id": MATCHMAKER_ID}
     assert db.write_for("INTO business_audit_log")
     assert db.commits == 1
 

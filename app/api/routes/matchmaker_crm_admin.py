@@ -504,6 +504,8 @@ async def _member_query(
         {user_expr('register_ip')} AS ip_location,
         {user_expr('ip_region')} AS ip_region,
         {user_expr('phone_region')} AS phone_region,
+        (SELECT pu.nickname FROM promotion_attribution pa JOIN users pu ON pu.id = pa.promoter_id
+          WHERE pa.user_id = u.id AND pa.status = 1 ORDER BY pa.id DESC LIMIT 1) AS promoter_nickname,
         {user_expr('login_num')} AS login_num,
         {MEMBER_POINTS_EXPR} AS points,
         {MEMBER_BALANCE_EXPR} AS balance,

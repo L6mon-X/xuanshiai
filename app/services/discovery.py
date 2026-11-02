@@ -1468,11 +1468,12 @@ async def respond_application(db: AsyncSession, viewer_id: int, application_id: 
             raise _forbidden("REALNAME_REQUIRED", "请先完成实名认证后再回应认识申请")
     status = 1 if accepted else 2
     await db.execute(text("UPDATE match_apply SET status = :status, responded_at = UTC_TIMESTAMP(), updated_at = UTC_TIMESTAMP() WHERE id = :id"), {"status": status, "id": application_id})
-    # 被认识方的决定就是这条牵线的结果：同意即牵线成功，拒绝即牵线失败，同步进红娘的牵线管理。
+    # 同意直接牵线成功；拒绝回待牵线并标注回应，留给红娘联系跟进。
     await sync_member_application_introduction(
         db,
         int(row["from_user_id"]),
         viewer_id,
+        application_id=application_id,
         succeeded=accepted,
         failure_reason=None if accepted else (request.reason if request is not None else None),
     )
@@ -1525,17 +1526,10 @@ async def respond_application(db: AsyncSession, viewer_id: int, application_id: 
 
 
 async def _expire_pending_applications(db: AsyncSession) -> None:
-    expiring = (await db.execute(text("""SELECT from_user_id, to_user_id FROM match_apply
-        WHERE status = 0 AND expire_at IS NOT NULL AND expire_at <= UTC_TIMESTAMP()"""))).mappings().all()
     await db.execute(text("""UPDATE match_apply
         SET status = 3, updated_at = UTC_TIMESTAMP()
         WHERE status = 0 AND expire_at IS NOT NULL AND expire_at <= UTC_TIMESTAMP()"""))
-    # 超时未回应等于这次撮合没成：牵线记录同步成失败，红娘的牵线管理里不留悬挂的进行中行。
-    for item in expiring:
-        await sync_member_application_introduction(
-            db, int(item["from_user_id"]), int(item["to_user_id"]),
-            succeeded=False, failure_reason="对方超时未回应",
-        )
+    # 认识申请过期仍是「未回应」；不替红娘判定失败，也不重置正在跟进的牵线。
 
 
 async def create_superlike(db: AsyncSession, viewer_id: int, target_id: int, idempotency_key: str) -> SuperLikeResponse:

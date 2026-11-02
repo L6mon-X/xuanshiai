@@ -453,6 +453,10 @@ class WorkspaceIntroduction(BaseModel):
     updated_at: datetime
     from_user: WorkspaceIntroductionPerson
     to_user: WorkspaceIntroductionPerson
+    application_response: Literal["UNANSWERED", "ACCEPTED", "REJECTED"] = Field(default="UNANSWERED", description="会员对认识申请的回应，与红娘跟进结果分开；过期仍为未回应")
+    response_reason: str | None = Field(default=None, description="对方拒绝时的附言，不是红娘牵线失败原因")
+    from_phone_viewed: bool = Field(default=False, description="当前红娘在本轮待牵线阶段已成功查看申请人电话")
+    to_phone_viewed: bool = Field(default=False, description="当前红娘在本轮待牵线阶段已成功查看被牵线方电话")
 
 
 class WorkspaceIntroductionPage(BaseModel):
@@ -461,6 +465,19 @@ class WorkspaceIntroductionPage(BaseModel):
     page_size: int
     total: int
     has_more: bool
+    workflow_version: Literal[2] = Field(default=2, description="2=双方电话已查看后进入牵线中，确认已联系后判断结果")
+
+
+class WorkspaceIntroductionContactView(BaseModel):
+    side: Literal["from", "to"] = Field(description="from=申请人，to=被牵线方；禁止传入任意会员ID")
+
+
+class WorkspaceIntroductionContactViewed(BaseModel):
+    introduction_id: int = Field(description="本次查看所对应的牵线记录ID")
+    status: IntroductionStatus = Field(description="查看后的权威阶段；双方有效电话均已查看时待牵线自动进入牵线中")
+    contact: WorkspaceMemberContact = Field(description="仅本次指定方的电话，微信固定null；电话缺失不计入成功查看")
+    from_phone_viewed: bool = Field(description="当前红娘在本条、本轮已查看申请人有效电话")
+    to_phone_viewed: bool = Field(description="当前红娘在本条、本轮已查看被牵线方有效电话")
 
 
 class WorkspaceCommissionEntry(BaseModel):
@@ -777,10 +794,11 @@ class WorkspaceMeetingRecordStatusUpdate(BaseModel):
 
 
 class WorkspaceIntroductionStatusUpdate(BaseModel):
-    """牵线状态流转；失败必须给出失败原因，其他状态不允许携带备注。"""
+    """牵线中确认已联系后才能判定结果；待牵线由查看双方电话自动推进。"""
 
     status: Literal["PENDING", "IN_PROGRESS", "SUCCEEDED", "FAILED"]
     failure_reason: str | None = Field(default=None, max_length=500)
+    contact_confirmed: bool = Field(default=False, description="红娘确认已联系双方并了解被牵线方态度；判定成功/失败时必须为true")
 
     @model_validator(mode="after")
     def require_failure_reason(self) -> "WorkspaceIntroductionStatusUpdate":
@@ -792,23 +810,21 @@ class WorkspaceIntroductionStatusUpdate(BaseModel):
 
 
 class WorkspaceIntroductionCreate(BaseModel):
-    """服务红娘手工添加牵线记录；双方必须是工作范围内会员。"""
+    """服务红娘手工添加待牵线记录；不能通过录入绕过双方电话查看和联系确认。"""
 
     from_user_id: int = Field(ge=1)
     to_user_id: int = Field(ge=1)
     applied_at: date | None = None
-    finished_at: date | None = None
-    result: Literal["SUCCEEDED", "FAILED"]
+    finished_at: date | None = Field(default=None, description="兼容保留，新建待牵线记录必须为null")
+    result: Literal["PENDING"] = "PENDING"
     failure_reason: str | None = Field(default=None, max_length=500)
 
     @model_validator(mode="after")
     def validate_pairs(self) -> "WorkspaceIntroductionCreate":
         if self.from_user_id == self.to_user_id:
             raise ValueError("牵线会员与被牵线会员不能是同一人")
-        if self.result == "FAILED" and not (self.failure_reason and str(self.failure_reason).strip()):
-            raise ValueError("牵线失败必须填写失败原因")
-        if self.result == "SUCCEEDED" and self.finished_at is None:
-            raise ValueError("牵线成功必须选择牵线完成时间")
+        if self.finished_at is not None or self.failure_reason:
+            raise ValueError("新牵线记录必须从待牵线开始，不能填写完成时间或失败原因")
         return self
 
 

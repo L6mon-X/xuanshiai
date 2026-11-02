@@ -2,8 +2,8 @@
 
 口径（2026-10-23 定）：
 - 谁发起申请就挂谁的服务红娘；申请人只归属到门店、没指定具体红娘时挂承接门店（matchmaker_id 用 0 占位）；
-- 申请落库即「待牵线」，被认识方同意=牵线成功、拒绝=牵线失败，超时未回应=牵线失败（理由「对方超时未回应」）；
-- 牵线记录只在 PENDING/IN_PROGRESS 时被会员侧结果改写，红娘手工判过的终态不动。
+- 申请落库即「待牵线」，被认识方同意=牵线成功、拒绝=待牵线，超时未回应仍待跟进；
+- 只同步对应申请ID，避免改动同一对会员的其他记录。
 全部用 StubDB 按 SQL 文本分派，不依赖 MySQL。
 """
 
@@ -70,7 +70,7 @@ class StubDB:
             if not self.assigned:
                 return StubResult()
             return StubResult([{"matchmaker_id": self.matchmaker_id, "organization_id": self.organization_id}])
-        if "INTO matchmaker_introduction" in text or "UPDATE matchmaker_introduction" in text or "UPDATE match_apply" in text:
+        if "INTO matchmaker_introduction" in text or "UPDATE matchmaker_introduction" in text or "UPDATE match_apply" in text or "INTO business_audit_log" in text:
             self.writes.append((text, dict(params or {})))
             return StubResult()
         raise AssertionError(f"未预期的语句：{text}")
@@ -144,27 +144,28 @@ async def test_same_application_never_produces_a_second_row() -> None:
 @pytest.mark.asyncio
 async def test_acceptance_marks_the_introduction_succeeded() -> None:
     db = StubDB()
-    await sync_member_application_introduction(db, APPLICANT_ID, TARGET_ID, succeeded=True)
+    await sync_member_application_introduction(db, APPLICANT_ID, TARGET_ID, application_id=APPLICATION_ID, succeeded=True)
     statement, params = db.write_for("UPDATE matchmaker_introduction")
-    assert params == {"status": "SUCCEEDED", "reason": None, "f": APPLICANT_ID, "t": TARGET_ID}
-    assert "status IN ('PENDING', 'IN_PROGRESS')" in statement
+    assert params == {"status": "SUCCEEDED", "reason": None, "f": APPLICANT_ID, "t": TARGET_ID, "note": f"discovery-apply:{APPLICATION_ID}", "admin_note": f"admin-entry:{APPLICATION_ID}"}
+    assert "note IN (:note, :admin_note)" in statement
+    assert "status IN ('PENDING', 'IN_PROGRESS', 'FAILED')" in statement
 
 
 @pytest.mark.asyncio
-async def test_rejection_marks_the_introduction_failed_with_the_member_reason() -> None:
+async def test_rejection_returns_pending_with_response_reason() -> None:
     db = StubDB()
     await sync_member_application_introduction(
-        db, APPLICANT_ID, TARGET_ID, succeeded=False, failure_reason="暂不考虑"
+        db, APPLICANT_ID, TARGET_ID, application_id=APPLICATION_ID, succeeded=False, failure_reason="暂不考虑"
     )
     _, params = db.write_for("UPDATE matchmaker_introduction")
-    assert params["status"] == "FAILED"
+    assert params["status"] == "PENDING"
     assert params["reason"] == "暂不考虑"
 
 
 @pytest.mark.asyncio
 async def test_blank_reject_reason_falls_back_to_the_member_facing_copy() -> None:
     db = StubDB()
-    await sync_member_application_introduction(db, APPLICANT_ID, TARGET_ID, succeeded=False, failure_reason=None)
+    await sync_member_application_introduction(db, APPLICANT_ID, TARGET_ID, application_id=APPLICATION_ID, succeeded=False, failure_reason=None)
     _, params = db.write_for("UPDATE matchmaker_introduction")
     assert params["reason"] == "对方暂时婉拒了你的申请"
 
@@ -173,33 +174,16 @@ async def test_blank_reject_reason_falls_back_to_the_member_facing_copy() -> Non
 async def test_overlong_reject_reason_is_truncated_to_the_column_width() -> None:
     db = StubDB()
     await sync_member_application_introduction(
-        db, APPLICANT_ID, TARGET_ID, succeeded=False, failure_reason="长" * 600
+        db, APPLICANT_ID, TARGET_ID, application_id=APPLICATION_ID, succeeded=False, failure_reason="长" * 600
     )
     _, params = db.write_for("UPDATE matchmaker_introduction")
     assert len(params["reason"]) == 500
 
 
 @pytest.mark.asyncio
-async def test_timeout_sweeps_applications_and_fails_their_introductions() -> None:
-    """过期清扫不能只改 match_apply：牵线管理里会留下一堆永远撮合不成的进行中记录。"""
-
-    class SweepDB(StubDB):
-        async def execute(self, sql: object, params: dict | None = None) -> StubResult:
-            text = str(sql)
-            if text.startswith("SELECT from_user_id, to_user_id FROM match_apply"):
-                return StubResult([
-                    {"from_user_id": APPLICANT_ID, "to_user_id": TARGET_ID},
-                    {"from_user_id": 8, "to_user_id": 9},
-                ])
-            return await super().execute(sql, params)
-
-    db = SweepDB()
+async def test_timeout_leaves_introductions_for_matchmaker_follow_up() -> None:
+    db = StubDB()
     await discovery._expire_pending_applications(db)
     sweep, _ = db.write_for("UPDATE match_apply")
     assert "SET status = 3" in sweep
-    updates = [p for statement, p in db.writes if "UPDATE matchmaker_introduction" in statement]
-    assert len(updates) == 2
-    assert updates[0] == {
-        "status": "FAILED", "reason": "对方超时未回应", "f": APPLICANT_ID, "t": TARGET_ID,
-    }
-    assert updates[1]["f"] == 8 and updates[1]["reason"] == "对方超时未回应"
+    assert not any("matchmaker_introduction" in sql for sql, _ in db.writes)

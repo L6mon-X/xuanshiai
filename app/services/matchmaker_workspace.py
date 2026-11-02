@@ -93,6 +93,7 @@ from app.schemas.matchmaker_workspace import (
     WorkspaceIntroductionCreated,
     WorkspaceIntroductionPage,
     WorkspaceIntroductionPerson,
+    WorkspaceIntroductionContactViewed,
     WorkspaceMatchCandidate,
     WorkspaceMatchCandidatePage,
     WorkspaceMatchHistoryItem,
@@ -460,6 +461,10 @@ async def update_workspace_homepage(
             text("UPDATE users SET nickname = :value WHERE id = :id"),
             {"value": values["nickname"], "id": actor.user_id},
         )
+        await db.execute(
+            text("UPDATE matchmaker_workspace_profile SET display_name = :value WHERE user_id = :id"),
+            {"value": values["nickname"], "id": actor.user_id},
+        )
     if "slogan" in values:
         await db.execute(
             text("UPDATE user_matchmaker_apply SET slogan = :value WHERE id = :id"),
@@ -775,6 +780,10 @@ def _introduction_from_row(row: object) -> WorkspaceIntroduction:
         note=values.get("note"),
         created_at=values["created_at"],
         updated_at=values["updated_at"],
+        application_response={1: "ACCEPTED", 2: "REJECTED"}.get(values.get("application_status"), "UNANSWERED"),
+        response_reason=values.get("failure_reason") if values.get("application_status") == 2 and values["status"] == "PENDING" else None,
+        from_phone_viewed=bool(values.get("from_phone_viewed")),
+        to_phone_viewed=bool(values.get("to_phone_viewed")),
         from_user=WorkspaceIntroductionPerson(
             user_id=int(values["from_user_id"]),
             nickname=str(values["from_nickname"] or "未命名会员"),
@@ -812,12 +821,27 @@ async def list_workspace_introductions(
         )
         params["search"] = search
     clause = " AND ".join(where)
+    params["viewer_id"] = actor.user_id
     base = """FROM matchmaker_introduction mi
         JOIN users fu ON fu.id = mi.from_user_id
-        JOIN users tu ON tu.id = mi.to_user_id"""
+        JOIN users tu ON tu.id = mi.to_user_id
+        LEFT JOIN match_apply ma ON ma.id = CASE
+            WHEN mi.note LIKE 'discovery-apply:%' THEN CAST(SUBSTRING(mi.note, 17) AS UNSIGNED)
+            WHEN mi.note LIKE 'admin-entry:%' THEN CAST(SUBSTRING(mi.note, 13) AS UNSIGNED)
+            ELSE NULL END
+        LEFT JOIN (SELECT resource_id,
+            MAX(CASE WHEN action = 'matchmaker_workspace.introduction.phone.from' AND actor_user_id = :viewer_id THEN id END) AS from_view_id,
+            MAX(CASE WHEN action = 'matchmaker_workspace.introduction.phone.to' AND actor_user_id = :viewer_id THEN id END) AS to_view_id,
+            MAX(CASE WHEN action = 'matchmaker_workspace.introduction.response.rejected' THEN id ELSE 0 END) AS reset_view_id
+            FROM business_audit_log WHERE resource_type = 'matchmaker_introduction'
+            AND (actor_user_id = :viewer_id OR action = 'matchmaker_workspace.introduction.response.rejected')
+            AND action IN ('matchmaker_workspace.introduction.phone.from', 'matchmaker_workspace.introduction.phone.to', 'matchmaker_workspace.introduction.response.rejected')
+            GROUP BY resource_id) pv ON pv.resource_id = mi.id"""
     rows = await db.execute(
         text(
-            f"""SELECT mi.id, mi.status, mi.failure_reason, mi.note, mi.created_at, mi.updated_at,
+            f"""SELECT mi.id, mi.status, mi.failure_reason, mi.note, mi.created_at, mi.updated_at, ma.status AS application_status,
+            pv.from_view_id > COALESCE(pv.reset_view_id, 0) AS from_phone_viewed,
+            pv.to_view_id > COALESCE(pv.reset_view_id, 0) AS to_phone_viewed,
             fu.id AS from_user_id, fu.nickname AS from_nickname, fu.avatar AS from_avatar, fu.gender AS from_gender,
             EXISTS (SELECT 1 FROM user_membership mf WHERE mf.user_id = fu.id AND mf.status = 1
                     AND (mf.start_at IS NULL OR mf.start_at <= UTC_TIMESTAMP())
@@ -2755,31 +2779,95 @@ async def update_workspace_meeting_record_status(
 
 
 async def update_workspace_introduction_status(
-    db: AsyncSession, actor: WorkspaceActor, introduction_id: int, status: str, failure_reason: str | None
+    db: AsyncSession, actor: WorkspaceActor, introduction_id: int, status: str, failure_reason: str | None,
+    contact_confirmed: bool = False,
 ) -> None:
     params: dict[str, object] = {"id": introduction_id}
     clause = _scope_predicate(actor, "mi", params)
-    row = await db.execute(text(f"SELECT id, status FROM matchmaker_introduction mi WHERE mi.id = :id AND {clause}"), params)
-    current = row.first()
+    row = await db.execute(text(f"SELECT id, status, created_at, updated_at FROM matchmaker_introduction mi WHERE mi.id = :id AND {clause} FOR UPDATE"), params)
+    current = row.mappings().first()
     if current is None:
         raise HTTPException(404, detail="牵线记录不存在或不在服务范围")
+    if status not in {"PENDING", "IN_PROGRESS", "SUCCEEDED", "FAILED"}:
+        raise HTTPException(422, detail="无效的牵线状态")
+    if current["status"] == status:
+        return  # 重复确认不改写结果，也不重复审计。
+    if current["status"] != "IN_PROGRESS" or status not in {"SUCCEEDED", "FAILED"}:
+        raise HTTPException(409, detail="待牵线需先查看双方电话；仅牵线中可确认结果，已完成记录不可回退")
+    if not contact_confirmed:
+        raise HTTPException(409, detail="请先确认已联系双方，并根据被牵线方态度判断结果")
+    if not all(await _introduction_phone_views(db, actor.user_id, introduction_id)):
+        raise HTTPException(409, detail="请先在本条牵线记录中查看双方电话")
     reason_value = failure_reason.strip() if failure_reason else None
+    if status == "FAILED" and not reason_value:
+        raise HTTPException(422, detail="牵线失败必须填写失败原因")
     if status == "FAILED":
         await db.execute(text(
             "UPDATE matchmaker_introduction SET status = :status, failure_reason = :reason, updated_at = UTC_TIMESTAMP() WHERE id = :id"
         ), {"id": introduction_id, "status": status, "reason": reason_value})
     else:
         await db.execute(text(
-            "UPDATE matchmaker_introduction SET status = :status, updated_at = UTC_TIMESTAMP() WHERE id = :id"
+            "UPDATE matchmaker_introduction SET status = :status, failure_reason = NULL, updated_at = UTC_TIMESTAMP() WHERE id = :id"
         ), {"id": introduction_id, "status": status})
+    await _audit(db, actor.user_id, "matchmaker_workspace.introduction.contact_confirmed", "matchmaker_introduction", introduction_id, status)
     await _audit(db, actor.user_id, "matchmaker_workspace.introduction.status", "matchmaker_introduction", introduction_id, status)
     await db.commit()
+
+
+async def _introduction_phone_views(db: AsyncSession, actor_id: int, introduction_id: int) -> tuple[bool, bool]:
+    views = (await db.execute(text("""SELECT DISTINCT action FROM business_audit_log
+        WHERE actor_user_id = :actor_id AND resource_type = 'matchmaker_introduction' AND resource_id = :id
+        AND id > COALESCE((SELECT MAX(reset_log.id) FROM business_audit_log reset_log
+            WHERE reset_log.resource_type = 'matchmaker_introduction' AND reset_log.resource_id = :id
+            AND reset_log.action = 'matchmaker_workspace.introduction.response.rejected'), 0)
+        AND action IN ('matchmaker_workspace.introduction.phone.from', 'matchmaker_workspace.introduction.phone.to')"""),
+        {"actor_id": actor_id, "id": introduction_id})).scalars().all()
+    return ("matchmaker_workspace.introduction.phone.from" in views, "matchmaker_workspace.introduction.phone.to" in views)
+
+
+async def view_workspace_introduction_contact(
+    db: AsyncSession, actor: WorkspaceActor, introduction_id: int, side: str,
+) -> WorkspaceIntroductionContactViewed:
+    """按牵线记录授权、逐侧读电话；同一红娘查看双方有效电话后原子推进状态。"""
+    if side not in {"from", "to"}:
+        raise HTTPException(422, detail="无效的牵线方")
+    params: dict[str, object] = {"id": introduction_id}
+    clause = _scope_predicate(actor, "mi", params)
+    row = (await db.execute(text(f"""SELECT mi.id, mi.status, mi.from_user_id, mi.to_user_id,
+        mi.created_at, mi.updated_at FROM matchmaker_introduction mi
+        WHERE mi.id = :id AND {clause} FOR UPDATE"""), params)).mappings().first()
+    if row is None:
+        raise HTTPException(404, detail="牵线记录不存在或不在服务范围")
+    member_id = int(row["from_user_id"] if side == "from" else row["to_user_id"])
+    member = (await db.execute(text("""SELECT u.id, u.nickname, u.phone,
+        (SELECT a.real_name FROM user_auth a WHERE a.user_id = u.id LIMIT 1) AS real_name
+        FROM users u WHERE u.id = :member_id AND u.status = 1"""), {"member_id": member_id})).mappings().first()
+    if member is None:
+        raise HTTPException(404, detail="会员不存在或不可联系")
+    phone = str(member["phone"] or "").strip()
+    if phone:
+        await _audit(db, actor.user_id, "matchmaker_workspace.introduction.phone." + side, "matchmaker_introduction", introduction_id)
+    else:
+        await _audit(db, actor.user_id, "matchmaker_workspace.introduction.phone.empty", "matchmaker_introduction", introduction_id, side)
+    from_viewed, to_viewed = await _introduction_phone_views(db, actor.user_id, introduction_id)
+    status = str(row["status"])
+    if status == "PENDING" and from_viewed and to_viewed:
+        status = "IN_PROGRESS"
+        await db.execute(text("""UPDATE matchmaker_introduction SET status = 'IN_PROGRESS',
+            updated_at = UTC_TIMESTAMP() WHERE id = :id AND status = 'PENDING'"""), {"id": introduction_id})
+        await _audit(db, actor.user_id, "matchmaker_workspace.introduction.status", "matchmaker_introduction", introduction_id, status)
+    await db.commit()
+    return WorkspaceIntroductionContactViewed(
+        introduction_id=introduction_id, status=status, from_phone_viewed=from_viewed, to_phone_viewed=to_viewed,
+        contact=WorkspaceMemberContact(user_id=member_id, nickname=member["nickname"], real_name=member["real_name"],
+            phone=phone or None, wechat=None, scope="ALL" if actor.level == "SUPER" else "SERVED"),
+    )
 
 
 async def create_workspace_introduction(
     db: AsyncSession, actor: WorkspaceActor, body: WorkspaceIntroductionCreate
 ) -> WorkspaceIntroductionCreated:
-    """添加牵线记录：双方须在工作范围内，时间/结果按业务口径落库。"""
+    """添加待牵线记录：双方须在工作范围内，不允许录入终态绕过跟进。"""
     member_params: dict[str, object] = {"a": body.from_user_id, "b": body.to_user_id}
     member_clause = _member_scope_predicate(actor, member_params)
     found = await db.execute(
@@ -2803,7 +2891,7 @@ async def create_workspace_introduction(
     ), {
         "f": body.from_user_id, "t": body.to_user_id, "m": actor.user_id,
         "org": actor.organization_id, "status": body.result,
-        "reason": (body.failure_reason or "").strip() or None if body.result == "FAILED" else None,
+        "reason": None,
         "note": note, "applied": applied,
     })
     introduction_id = int(result.lastrowid)
@@ -2876,21 +2964,25 @@ async def record_member_application_introduction(
 
 
 async def sync_member_application_introduction(
-    db: AsyncSession, from_user_id: int, to_user_id: int, *, succeeded: bool, failure_reason: str | None = None
+    db: AsyncSession, from_user_id: int, to_user_id: int, *, application_id: int,
+    succeeded: bool, failure_reason: str | None = None
 ) -> None:
-    """被申请方同意或拒绝、以及申请超时后，把这对会员仍在进行的牵线记录同步成终态。
-
-    只改 PENDING/IN_PROGRESS：红娘手工判过的成功/失败是她对线下撮合过程的结论，不被会员侧结果改写。
-    会员自发起与红娘手工录入的进行中记录都会同步，口径统一到「被认识方的决定即牵线结果」。
-    """
-    status = "SUCCEEDED" if succeeded else "FAILED"
+    """同意直接成功；拒绝回待牵线。只处理这一条认识申请，不能改动同一对会员的其他牵线。"""
+    status = "SUCCEEDED" if succeeded else "PENDING"
     reason = None if succeeded else (failure_reason or "对方暂时婉拒了你的申请")[:500]
+    allowed = "('PENDING', 'IN_PROGRESS', 'FAILED')" if succeeded else "('PENDING', 'IN_PROGRESS')"
     await db.execute(
-        text("""UPDATE matchmaker_introduction
+        text(f"""UPDATE matchmaker_introduction
             SET status = :status, failure_reason = :reason, updated_at = UTC_TIMESTAMP()
-            WHERE from_user_id = :f AND to_user_id = :t AND status IN ('PENDING', 'IN_PROGRESS')"""),
-        {"status": status, "reason": reason, "f": from_user_id, "t": to_user_id},
+            WHERE from_user_id = :f AND to_user_id = :t AND note IN (:note, :admin_note) AND status IN {allowed}"""),
+        {"status": status, "reason": reason, "f": from_user_id, "t": to_user_id, "note": f"discovery-apply:{application_id}", "admin_note": f"admin-entry:{application_id}"},
     )
+    if not succeeded:
+        # 用审计ID分隔跟进轮次，避免秒级时间戳令拒绝前的查看记录误算为本轮查看。
+        await db.execute(text("""INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id)
+            SELECT :actor_id, 'matchmaker_workspace.introduction.response.rejected', 'matchmaker_introduction', id
+            FROM matchmaker_introduction WHERE note IN (:note, :admin_note) AND from_user_id = :f AND to_user_id = :t AND status = 'PENDING'"""),
+            {"actor_id": to_user_id, "note": f"discovery-apply:{application_id}", "admin_note": f"admin-entry:{application_id}", "f": from_user_id, "t": to_user_id})
 
 
 ADMIN_MATCH_RECORD_NOTE_PREFIX = "admin-entry"

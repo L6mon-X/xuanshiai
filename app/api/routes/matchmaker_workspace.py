@@ -48,6 +48,8 @@ from app.schemas.matchmaker_workspace import (
     WorkspaceIntroductionCreate,
     WorkspaceIntroductionCreated,
     WorkspaceIntroductionPage,
+    WorkspaceIntroductionContactView,
+    WorkspaceIntroductionContactViewed,
     WorkspaceMatchCandidatePage,
     WorkspaceMatchHistoryPage,
     WorkspacePennantPage,
@@ -110,6 +112,7 @@ from app.services.matchmaker_workspace import (
     update_workspace_meeting_record_status,
     create_workspace_introduction,
     update_workspace_introduction_status,
+    view_workspace_introduction_contact,
     update_workspace_meeting_status,
     list_member_follow_ups,
     list_workbench_good_news,
@@ -878,7 +881,21 @@ async def update_workbench_introduction_status(
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    await update_workspace_introduction_status(db, await require_workspace(db, current), introduction_id, body.status, body.failure_reason)
+    await update_workspace_introduction_status(db, await require_workspace(db, current), introduction_id, body.status, body.failure_reason, body.contact_confirmed)
+
+
+@router.post(
+    "/workbench/introductions/{introduction_id}/contact-views",
+    response_model=WorkspaceIntroductionContactViewed,
+    summary="逐侧查看牵线电话，双方均查看后进入牵线中",
+)
+async def view_workbench_introduction_contact(
+    introduction_id: int = Path(..., ge=1),
+    body: WorkspaceIntroductionContactView = ...,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WorkspaceIntroductionContactViewed:
+    return await view_workspace_introduction_contact(db, await require_workspace(db, current), introduction_id, body.side)
 
 
 @router.post(
