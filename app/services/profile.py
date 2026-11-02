@@ -967,15 +967,13 @@ async def delete_photo(db: AsyncSession, user_id: int, media_id: int) -> None:
         raise HTTPException(404, detail="相册图片不存在")
     await db.execute(text("UPDATE user_media SET deleted_at = UTC_TIMESTAMP() WHERE id = :id"), {"id": media_id})
     if row["is_primary"]:
+        # 只把相册内封面顺延到下一张，**不动** users.avatar。
+        # 头像只能由 upload_avatar / set_primary 显式修改；否则删一张相册图
+        # 会在用户无感知的情况下换掉公开头像（与 upload_photo 的定版口径一致）。
         next_media = await db.execute(text("SELECT id, file_url FROM user_media WHERE user_id = :user_id AND media_type = 'photo' AND deleted_at IS NULL ORDER BY sort_order, id LIMIT 1"), {"user_id": user_id})
         next_row = next_media.mappings().first()
         if next_row:
             await db.execute(text("UPDATE user_media SET is_primary = 1 WHERE id = :id"), {"id": next_row["id"]})
-            await db.execute(text("UPDATE users SET avatar = :avatar WHERE id = :id"), {"avatar": next_row["file_url"], "id": user_id})
-        else:
-            avatar = await db.execute(text("SELECT file_url FROM user_media WHERE user_id = :user_id AND media_type = 'avatar' AND deleted_at IS NULL ORDER BY id DESC LIMIT 1"), {"user_id": user_id})
-            avatar_row = avatar.mappings().first()
-            await db.execute(text("UPDATE users SET avatar = :avatar WHERE id = :id"), {"avatar": avatar_row["file_url"] if avatar_row else None, "id": user_id})
     await recalculate_completion(db, user_id)
     await db.commit()
 

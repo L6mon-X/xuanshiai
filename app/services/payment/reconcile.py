@@ -25,6 +25,7 @@ from typing import Any, Mapping
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.payment.base import PaymentAPIError
 from app.services.payment.wechat_v3 import WechatPayV3Client
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,19 @@ class ReconcileService:
             raw = await self.gateway.download_bill(download_url)
             text_data = _decode_bill(raw)
             rows = _parse_trade_bill(text_data)
+        except PaymentAPIError as exc:
+            if _is_missing_bill_error(exc):
+                await _record_batch_empty(db, bill_date_value)
+                logger.info("payment_reconcile_empty bill_date=%s", bill_date_value)
+                return {
+                    "bill_date": bill_date_value.isoformat(),
+                    "batch_id": None,
+                    "record_count": 0,
+                    "diff_count": 0,
+                    "status": "EMPTY",
+                }
+            await _record_batch_failure(db, bill_date_value, str(exc))
+            raise
         except Exception as exc:
             await _record_batch_failure(db, bill_date_value, str(exc))
             raise
@@ -475,6 +489,48 @@ def _diff(
         "remote_status": remote_status,
         "remark": remark[:255],
     }
+
+
+def _is_missing_bill_error(exc: PaymentAPIError) -> bool:
+    """微信在“当天/该类型没有账单”时返回 400 账单文件不存在。
+
+    这不是对账失败，写成 FAILED 会让每天出现一条 ERROR 噪声；单独记为
+    EMPTY，既保留可追溯性，又不会触发失败告警。
+    """
+    if exc.status_code != 400:
+        return False
+    code = str(exc.code or "").upper()
+    message = str(exc)
+    return code in {"BILL_NOT_EXIST", "BILL_NOT_FOUND"} or "账单文件不存在" in message
+
+
+async def _record_batch_empty(
+    db: AsyncSession,
+    bill_date: date,
+) -> None:
+    """记录“当日无账单”的空批次；后续若账单补发，下一轮仍会重新下载。"""
+    try:
+        await db.rollback()
+        async with db.begin():
+            await db.execute(
+                text(
+                    """INSERT INTO payment_reconcile_batch
+                       (bill_date, bill_type, channel, status, record_count,
+                        diff_count, total_amount, error)
+                       VALUES (:bill_date, :bill_type, :channel, 'EMPTY', 0, 0, 0, NULL)
+                       ON DUPLICATE KEY UPDATE
+                           status = 'EMPTY', record_count = 0, diff_count = 0,
+                           total_amount = 0, error = NULL,
+                           updated_at = UTC_TIMESTAMP()"""
+                ),
+                {
+                    "bill_date": bill_date,
+                    "bill_type": _BILL_TYPE,
+                    "channel": _CHANNEL,
+                },
+            )
+    except Exception:
+        logger.exception("payment_reconcile_batch_empty_write_failed")
 
 
 async def _record_batch_failure(

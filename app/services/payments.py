@@ -61,11 +61,14 @@ async def _create_order(
         return _paid_order(row)
     order_no = f"TEST{order_type}{datetime.now(UTC):%Y%m%d%H%M%S}{secrets.token_hex(5).upper()}"
     expire_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=30)
+    # real 模式下这些订单会走真实微信预支付，标记为微信支付而不是测试支付。
+    pay_type = 1 if settings.wechat_pay_mode == "real" else 4
     await db.execute(text("""INSERT INTO payment_order
         (user_id, order_no, type, product_id, product_type, product_name, amount, pay_type, status, expire_at, idempotency_key)
-        VALUES (:user_id, :order_no, :type, :product_id, :product_type, :product_name, :amount, 4, 0, :expire_at, :key)"""), {
+        VALUES (:user_id, :order_no, :type, :product_id, :product_type, :product_name, :amount, :pay_type, 0, :expire_at, :key)"""), {
         "user_id": user_id, "order_no": order_no, "type": order_type, "product_id": product_id,
         "product_type": product_code, "product_name": product_name, "amount": amount,
+        "pay_type": pay_type,
         "expire_at": expire_at, "key": idempotency_key,
     })
     await db.commit()

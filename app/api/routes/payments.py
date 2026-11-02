@@ -64,7 +64,7 @@ async def boost_status(current: CurrentUser = Depends(get_current_user), db: Asy
     return await get_boost_status(db, current.id)
 
 
-@router.post("/boost/orders", response_model=PaidOrderResponse, status_code=201, summary="创建置顶测试支付订单")
+@router.post("/boost/orders", response_model=PaidOrderResponse, status_code=201, summary="创建置顶订单")
 async def boost_order(
     body: CreateBoostOrderRequest,
     idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=8, max_length=128),
@@ -79,7 +79,7 @@ async def boost_order_detail(order_no: str = Path(..., min_length=8, max_length=
     return await get_paid_order(db, current.id, order_no, 4)
 
 
-@router.post("/spotlights/payments", response_model=PaidOrderResponse, status_code=201, summary="创建爆灯测试支付订单")
+@router.post("/spotlights/payments", response_model=PaidOrderResponse, status_code=201, summary="创建爆灯订单")
 async def spotlight_order(
     body: SpotlightPaymentRequest,
     idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=8, max_length=128),

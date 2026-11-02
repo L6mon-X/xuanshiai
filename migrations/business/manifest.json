@@ -118,6 +118,19 @@
         "verify": "cc4e65efb2bfde604b3d1f5e19052ebf7f7073d5bf84125a7cfe0237e3e663ea",
         "verify_previous": "3f49147eda0555f65ede310ea74fc20df58af2bf4b8928043cef0da664f78f2d"
       }
+    },
+    {
+      "version": "20261102_01_user_feedback",
+      "up": "20261102_01_user_feedback_up.sql",
+      "down": "20261102_01_user_feedback_down.sql",
+      "verify": "20261102_01_user_feedback_verify.sql",
+      "verify_previous": "20261102_01_user_feedback_verify_previous.sql",
+      "sha256": {
+        "up": "93526e9ff58c59780bdcf7b33d6ab2974e26b3c9506819b6e5f7d14c508bfdd1",
+        "down": "d5a15c40b2b2b28137cd7801661b9df2a800452848f7b6703e7159c51938989d",
+        "verify": "0e56f1df512f5adc31474d629e4118f644aadf890ee94aac98791736797705ca",
+        "verify_previous": "e9160d54bb483e03b76c368de185aa110db41aad7ddfd1ab9fcbbd8cfa4f40ef"
+      }
     }
   ]
 }

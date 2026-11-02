@@ -53,6 +53,11 @@ def test_manifest_checksums_are_lf_normalised() -> None:
         "20261027_02_account_security_gaps",
         "20261027_03_profile_payment_gaps",
         "20261027_04_fk_delete_policy",
+        "20261030_01_payment_v3_core",
+        "20261030_02_payment_reconcile",
+        "20261030_03_payment_entitlement_keys",
+        "20261030_04_user_points_biz_key",
+        "20261102_01_user_feedback",
     ]
     for entry in manifest["versions"]:
         for direction in ("up", "down", "verify", "verify_previous"):

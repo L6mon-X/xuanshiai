@@ -26,6 +26,7 @@ from app.core.security import (
 )
 from app.schemas.auth import (
     BindPhoneRequest,
+    ChangePhoneRequest,
     PhoneLoginRequest,
     RealNameRequest,
     RefreshRequest,
@@ -463,6 +464,12 @@ async def login_existing_account(db: AsyncSession, request: ExistingAccountLogin
 async def bind_phone(db: AsyncSession, user_id: int, request: BindPhoneRequest, ip: str | None) -> None:
     if request.purpose != "bind_phone":
         raise HTTPException(422, detail="绑定手机号验证码用途必须为bind_phone")
+    bound = await db.execute(text("SELECT phone FROM users WHERE id = :id"), {"id": user_id})
+    bound_phone = bound.scalar()
+    if bound_phone and bound_phone != request.phone:
+        # 此前该接口对已绑定账号直接覆盖 phone，只校验新号验证码：任何持有有效
+        # token 的人都能用自己的号码改绑并接管账号。已绑定用户必须走换绑流程。
+        raise HTTPException(409, detail="账号已绑定手机号，请使用换绑流程")
     await sms_store.verify(request.phone, "bind_phone", request.code)
     async with db.begin():
         result = await db.execute(text("SELECT id, phone FROM users WHERE id = :id FOR UPDATE"), {"id": user_id})
@@ -471,10 +478,63 @@ async def bind_phone(db: AsyncSession, user_id: int, request: BindPhoneRequest, 
             raise HTTPException(404, detail="用户不存在")
         if current["phone"] == request.phone:
             return
+        if current["phone"]:
+            raise HTTPException(409, detail="账号已绑定手机号，请使用换绑流程")
         result = await db.execute(text("SELECT id FROM users WHERE phone = :phone FOR UPDATE"), {"phone": request.phone})
         if result.first():
             raise HTTPException(409, detail="该手机号已绑定其他账号")
         await db.execute(text("UPDATE users SET phone = :phone, phone_verified_at = UTC_TIMESTAMP(), updated_at = UTC_TIMESTAMP() WHERE id = :id"), {"phone": request.phone, "id": user_id})
+
+
+async def change_phone(
+    db: AsyncSession,
+    user_id: int,
+    session_id: int,
+    request: ChangePhoneRequest,
+    ip: str | None,
+) -> None:
+    """换绑手机号：旧号（验证码或密码）+ 新号验证码双证明，成功后踢掉其他会话。
+
+    与 ``bind_phone`` 的区别：bind 只服务「从未绑定」的账号（微信登录后补绑），
+    因此对已绑定账号直接 409；换绑必须在这里完成，且两端都要证明归属。
+    """
+    async with db.begin():
+        result = await db.execute(
+            text("SELECT id, phone, password FROM users WHERE id = :id FOR UPDATE"), {"id": user_id}
+        )
+        row = result.mappings().first()
+        if not row:
+            raise HTTPException(404, detail="用户不存在")
+        current_phone = row["phone"]
+        if not current_phone:
+            raise HTTPException(409, detail="账号尚未绑定手机号，请使用绑定流程")
+        if current_phone == request.new_phone:
+            raise HTTPException(422, detail="新手机号与当前手机号相同")
+        if request.old_code:
+            await sms_store.verify(current_phone, "change_phone_old", request.old_code)
+        else:
+            if not row["password"] or not verify_password(request.password or "", row["password"]):
+                raise HTTPException(401, detail="账号密码错误")
+        await sms_store.verify(request.new_phone, "change_phone_new", request.new_code)
+        occupied = await db.execute(
+            text("SELECT id FROM users WHERE phone = :phone FOR UPDATE"), {"phone": request.new_phone}
+        )
+        if occupied.first():
+            raise HTTPException(409, detail="该手机号已绑定其他账号")
+        await db.execute(
+            text(
+                "UPDATE users SET phone = :phone, phone_verified_at = UTC_TIMESTAMP(), updated_at = UTC_TIMESTAMP() WHERE id = :id"
+            ),
+            {"phone": request.new_phone, "id": user_id},
+        )
+        # 换绑等同凭证变更：除当前设备外全部会话失效，防止旧号留存设备继续使用。
+        await db.execute(
+            text(
+                "UPDATE user_session SET status = 2, revoked_at = UTC_TIMESTAMP(), revoke_reason = 'phone_changed'"
+                " WHERE user_id = :id AND status = 1 AND id <> :sid"
+            ),
+            {"id": user_id, "sid": session_id},
+        )
 
 
 async def refresh_session(db: AsyncSession, request: RefreshRequest, ip: str | None, user_agent: str | None) -> dict[str, Any]:

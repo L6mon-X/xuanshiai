@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import CurrentUser, get_current_user
 from app.db.session import get_db
+from app.schemas.face import FaceVerifyRequest, FaceVerifyResponse
 from app.schemas.auth import (
     CompletionResponse,
     IntroTemplateResponse,
@@ -39,6 +40,7 @@ from app.services.profile import (
     update_nickname,
 )
 from app.schemas.user_cancellation_admin import UserCancellationSelfResponse
+from app.services.face.verify import verify_avatar
 from app.services.user_cancellation_admin import (
     cancel_user_cancellation,
     get_current_user_cancellation,
@@ -133,6 +135,16 @@ async def preferences(current: CurrentUser = Depends(get_current_user), db: Asyn
 async def edit_preferences(body: PreferenceUpdateRequest, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
     """更新择偶要求并立即影响后续推荐。"""
     return await update_preferences(db, current.id, body)
+
+
+@router.post("/face-verify", response_model=FaceVerifyResponse, summary="头像人脸核验")
+async def face_verify(
+    body: FaceVerifyRequest,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> FaceVerifyResponse:
+    """核验本人已上传头像与实名照片；provider 未配置时 fail-closed 503。"""
+    return await verify_avatar(db, current.id, body.avatar_url)
 
 
 @router.post("/avatar", response_model=ProfileMediaResponse, status_code=201, summary="上传头像")

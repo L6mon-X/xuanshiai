@@ -87,6 +87,15 @@ candidate_query_service = CandidateQueryService(secret_key=settings.secret_key)
 # 不触碰旧字段或推荐排序。
 LEGACY_MATCH_ALGORITHM_VERSION = "legacy-rule-v1"
 
+# MBTI 筛选维度：值域与 ``app/schemas/auth.py::MbtiType`` 完全一致（16 型大写），
+# 前后端使用同一套编码，避免再出现「有字段但筛不了」。
+MBTI_TYPE_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("INTJ", "建筑师"), ("INTP", "逻辑学家"), ("ENTJ", "指挥官"), ("ENTP", "辩论家"),
+    ("INFJ", "提倡者"), ("INFP", "调停者"), ("ENFJ", "主人公"), ("ENFP", "竞选者"),
+    ("ISTJ", "物流师"), ("ISFJ", "守卫者"), ("ESTJ", "总经理"), ("ESFJ", "执政官"),
+    ("ISTP", "鉴赏家"), ("ISFP", "探险家"), ("ESTP", "企业家"), ("ESFP", "表演者"),
+)
+
 
 CARD_SELECT = """
     SELECT u.id AS user_id, u.nickname, u.avatar, u.gender,
@@ -210,6 +219,7 @@ async def _scene_visibility(
     candidate_alias: str = "u",
     privacy_alias: str = "pr",
     completion_alias: str = "c",
+    skip_completion_gate: bool = False,
 ) -> tuple[dict[str, Any], bool, SqlPredicate]:
     viewer = await _viewer_context(db, viewer_id)
     viewer_is_vip = await _is_vip(db, viewer_id)
@@ -224,6 +234,7 @@ async def _scene_visibility(
             candidate_alias=candidate_alias,
             privacy_alias=privacy_alias,
             completion_alias=completion_alias,
+            skip_completion_gate=skip_completion_gate,
         ),
     )
 
@@ -404,6 +415,14 @@ def _filter_sql(filters: DiscoveryFilters, params: dict[str, Any]) -> list[str]:
     if filters.marriage_status:
         clauses.append("u.is_married = :filter_marriage")
         params["filter_marriage"] = filters.marriage_status
+    if filters.mbti:
+        # 多型 IN 查询；占位符逐个生成，禁止把用户输入拼进 SQL（3.1）。
+        placeholders = []
+        for index, value in enumerate(filters.mbti):
+            key = f"filter_mbti_{index}"
+            placeholders.append(f":{key}")
+            params[key] = value
+        clauses.append(f"p.mbti IN ({', '.join(placeholders)})")
     if filters.education_min:
         clauses.append("p.education_level >= :filter_education")
         params["filter_education"] = filters.education_min
@@ -689,6 +708,7 @@ async def get_filter_options() -> FilterOptionsResponse:
             {"value": 5, "label": "博士"},
         ],
         cities=sorted(DISCOVERY_CITY_OPTIONS),
+        mbti_types=[{"value": code, "label": label} for code, label in MBTI_TYPE_OPTIONS],
     )
 
 
@@ -1015,8 +1035,11 @@ async def _target_rows(
 
 
 async def browse_history(db: AsyncSession, viewer_id: int, page: int, page_size: int) -> BrowseHistoryPage:
+    # 浏览记录/访客是「已发生的历史事件」，不是推荐曝光位：不能套用推荐流的
+    # 资料完整度门禁（candidate_visibility 的 score >= 100），否则被浏览者资料
+    # 不完整时整条记录被过滤，会员开通后仍看到空列表。封禁/隐私 predicate 不变。
     viewer, vip, predicate = await _scene_visibility(
-        db, viewer_id, VisibilityScene.HISTORY
+        db, viewer_id, VisibilityScene.HISTORY, skip_completion_gate=True
     )
     offset = (page - 1) * page_size
     history_window = "" if vip else " AND h.created_at >= CURDATE()"
@@ -1034,7 +1057,9 @@ async def browse_history(db: AsyncSession, viewer_id: int, page: int, page_size:
         WHERE h.user_id = :user_id{history_window}{visible}
         GROUP BY h.target_user_id ORDER BY viewed_at DESC LIMIT :limit OFFSET :offset"""), params)
     rows = list(result.mappings().all())
-    targets = await _target_rows(db, viewer_id, [int(row["target_user_id"]) for row in rows])
+    targets = await _target_rows(
+        db, viewer_id, [int(row["target_user_id"]) for row in rows], skip_completion_gate=True
+    )
     items = []
     for row in rows:
         target = targets.get(int(row["target_user_id"]))
@@ -1050,8 +1075,9 @@ async def browse_history(db: AsyncSession, viewer_id: int, page: int, page_size:
 
 
 async def visitors(db: AsyncSession, viewer_id: int, page: int, page_size: int) -> VisitorPage:
+    # 同 browse_history：访客名单不受推荐流完整度门禁约束，只受封禁/隐私约束。
     viewer, vip, predicate = await _scene_visibility(
-        db, viewer_id, VisibilityScene.VISITORS
+        db, viewer_id, VisibilityScene.VISITORS, skip_completion_gate=True
     )
     visible = " AND " + predicate.clause
     params = {"viewer_id": viewer_id, "user_id": viewer_id, **predicate.params}
@@ -1074,7 +1100,9 @@ async def visitors(db: AsyncSession, viewer_id: int, page: int, page_size: int) 
             "offset": (page - 1) * page_size,
         })
     rows = list(result.mappings().all())
-    targets = await _target_rows(db, viewer_id, [int(row["user_id"]) for row in rows])
+    targets = await _target_rows(
+        db, viewer_id, [int(row["user_id"]) for row in rows], skip_completion_gate=True
+    )
     items = [
         BrowseHistoryItem(
             target=_card(
@@ -1088,6 +1116,60 @@ async def visitors(db: AsyncSession, viewer_id: int, page: int, page_size: int) 
         if int(row["user_id"]) in targets
     ]
     return VisitorPage(can_view_details=True, count=count, items=items, page=page, page_size=page_size, has_more=page * page_size < count)
+
+
+_EMOTION_LAB_CANDIDATE_SCAN = 300
+
+
+async def emotion_lab_matches(
+    db: AsyncSession, viewer_id: int, limit: int = 6
+) -> list[dict[str, Any]]:
+    """情感实验室「合拍的人」：候选池与推荐同源，排序用首页卡片的合拍度。
+
+    刻意复用 ``_candidate_score`` 而不是读 ``ai_compatibility_snapshot``：
+    后者受 ``ai_compatibility_shadow_enabled``（默认 False）与 display bucket
+    控制，默认部署下是空数据；而 ``_candidate_score`` 就是首页卡片在用的算法，
+    因此「与首页合拍度一致」是结构上成立的，不依赖额外配置。
+    """
+    viewer = await _viewer_context(db, viewer_id)
+    skip_gates = _skip_discovery_gates()
+    visibility = _visibility_predicate(
+        viewer_id,
+        viewer,
+        await _is_vip(db, viewer_id),
+        VisibilityScene.PROFILE,
+        skip_completion_gate=skip_gates,
+    )
+    params: dict[str, Any] = {"viewer_id": viewer_id, **visibility.params}
+    result = await db.execute(
+        text(
+            f"""SELECT u.id FROM users u
+            LEFT JOIN user_profile p ON p.user_id = u.id
+            LEFT JOIN user_profile_completion c ON c.user_id = u.id
+            LEFT JOIN user_privacy pr ON pr.user_id = u.id
+            WHERE u.id <> :viewer_id AND u.status = 1 AND {visibility.clause}
+            ORDER BY u.id DESC LIMIT {_EMOTION_LAB_CANDIDATE_SCAN}"""
+        ),
+        params,
+    )
+    candidate_ids = [int(row[0]) for row in result.fetchall()]
+    targets = await _target_rows(db, viewer_id, candidate_ids, skip_completion_gate=skip_gates)
+    scored: list[tuple[float, str, dict[str, Any]]] = []
+    for target in targets.values():
+        score, reason = _candidate_score(viewer, target)
+        scored.append((score, reason, target))
+    scored.sort(key=lambda item: (-item[0], int(item[2]["user_id"])))
+    return [
+        {
+            "user_id": int(target["user_id"]),
+            "nickname": target.get("nickname"),
+            "avatar": target.get("avatar"),
+            "mbti": target.get("mbti"),
+            "match_percent": int(round(score)),
+            "match_reason": reason,
+        }
+        for score, reason, target in scored[:limit]
+    ]
 
 
 async def visitor_count(db: AsyncSession, viewer_id: int, target_id: int) -> dict[str, int]:
@@ -1522,8 +1604,11 @@ async def list_superlikes(db: AsyncSession, viewer_id: int, direction: str, page
         raise ValueError("invalid superlike direction")
     owner_field = "b.user_id" if direction == "sent" else "b.target_user_id"
     other_field = "b.target_user_id" if direction == "sent" else "b.user_id"
+    # 爆灯是「已发生的关系事件」，与浏览记录/访客同口径：不套推荐流的完整度门禁。
+    # 否则对方资料掉到 100 分以下时，自己爆过的灯会从「我的爆灯」里整条消失，
+    # 用户只会看到「明明爆过却找不到」。封禁/隐私 predicate 保持不变。
     _, _, predicate = await _scene_visibility(
-        db, viewer_id, VisibilityScene.FAVORITES
+        db, viewer_id, VisibilityScene.FAVORITES, skip_completion_gate=True
     )
     params = {
         "user_id": viewer_id,

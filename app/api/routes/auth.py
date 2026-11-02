@@ -4,13 +4,14 @@ from fastapi import APIRouter, Depends, Request, status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies import CurrentUser, get_current_user
+from app.api.dependencies import CurrentUser, get_current_user, require_sensitive_operation
 from app.core.config import settings
 from app.core.security import decode_access_token
 from app.db.session import get_db
 from app.schemas.auth import (
     AgreementAcceptRequest,
     BindPhoneRequest,
+    ChangePhoneRequest,
     PhoneLoginRequest,
     RefreshRequest,
     RealNameRequest,
@@ -60,8 +61,24 @@ async def test_login(request: Request, body: ExistingAccountLoginRequest, db: As
 
 @router.post("/bind-phone", status_code=status.HTTP_204_NO_CONTENT, summary="绑定手机号")
 async def bind_phone(request: Request, body: BindPhoneRequest, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> None:
-    """为当前微信账号绑定未被其他账号使用的手机号。"""
+    """为当前微信账号绑定未被其他账号使用的手机号。
+
+    仅服务「从未绑定手机号」的账号；已绑定账号返回 409，须走 ``PUT /auth/phone``。
+    """
     await auth.bind_phone(db, current.id, body, request_ip(request))
+    await db.commit()
+
+
+@router.put("/phone", status_code=status.HTTP_204_NO_CONTENT, summary="换绑手机号")
+async def change_phone(
+    request: Request,
+    body: ChangePhoneRequest,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(require_sensitive_operation),
+) -> None:
+    """换绑手机号：旧号验证码或密码 + 新号验证码双证明，成功后失效其他设备会话。"""
+    await auth.change_phone(db, current.id, current.session_id, body, request_ip(request))
     await db.commit()
 
 
