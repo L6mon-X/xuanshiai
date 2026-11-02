@@ -37,5 +37,5 @@ async def wechat_callback(body: WechatPaymentCallback, db: AsyncSession = Depend
 
 @router.post("/payments/test/pay", response_model=TestPaymentResponse, summary="执行测试支付并履约")
 async def test_pay(body: TestPaymentRequest, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> TestPaymentResponse:
-    """Development/testing only; no external payment provider is called."""
+    """Development/testing only; disabled when the real WeChat gateway is enabled."""
     return await complete_test_payment(db, current.id, body)
