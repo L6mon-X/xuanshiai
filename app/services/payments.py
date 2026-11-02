@@ -116,6 +116,8 @@ async def create_spotlight_order(db: AsyncSession, user_id: int, body: Spotlight
 async def complete_test_payment(db: AsyncSession, user_id: int, body: TestPaymentRequest) -> TestPaymentResponse:
     if not settings.is_test_mode:
         raise HTTPException(403, detail="测试支付只允许在 development/testing 环境使用")
+    if settings.wechat_pay_mode == "real":
+        raise HTTPException(403, detail="真实微信支付已启用，测试支付已关闭")
     transaction_id = body.transaction_id or f"TEST-PAY-{secrets.token_hex(8).upper()}"
     async with db.begin():
         result = await db.execute(text("""SELECT * FROM payment_order
