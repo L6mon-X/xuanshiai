@@ -30,7 +30,10 @@ from app.services.payment.wechat_v3 import WechatPayV3Client
 logger = logging.getLogger(__name__)
 
 _CENT = Decimal("0.01")
+# 数据库内部账单类型标签，沿用迁移中的 TRADE/REFUND 口径。
 _BILL_TYPE = "TRADE"
+# 微信 /v3/bill/tradebill 只接受 ALL / SUCCESS / REFUND，不能传内部标签。
+_WECHAT_BILL_TYPE = "ALL"
 _CHANNEL = "wechat"
 # 微信账单日期按商户本地时区（中国大陆为 UTC+8）生成；本地 pay_time 存 UTC。
 _BILL_TZ_OFFSET_HOURS = 8
@@ -72,7 +75,7 @@ class ReconcileService:
         try:
             download_url = await self.gateway.get_bill_download_url(
                 bill_date_value.isoformat(),
-                _BILL_TYPE,
+                _WECHAT_BILL_TYPE,
             )
             raw = await self.gateway.download_bill(download_url)
             text_data = _decode_bill(raw)

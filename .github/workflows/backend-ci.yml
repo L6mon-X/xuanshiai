@@ -120,6 +120,7 @@ jobs:
           tests/test_sensitive_operations.py tests/test_wechat_field_redaction.py
           tests/test_admin_data_scope_d16.py tests/test_admin_date_query_contract.py
           tests/test_legacy_matchmaker_scope_d10.py tests/test_payment_callback_verification.py
+          app/services/payment/reconcile.py tests/test_payment_reconcile.py
           tests/test_permission_code_seed_coverage.py tests/test_realname_face_unification.py
           tests/test_refund_membership_revoke.py
       - name: Admin scope, redaction and soft delete contracts
@@ -141,6 +142,7 @@ jobs:
           tests/test_admin_date_query_contract.py
           tests/test_legacy_matchmaker_scope_d10.py
           tests/test_payment_callback_verification.py
+          tests/test_payment_reconcile.py
           tests/test_permission_code_seed_coverage.py
           tests/test_realname_face_unification.py
           tests/test_refund_membership_revoke.py
