@@ -78,6 +78,58 @@ def normalize_type(column_type: str) -> str:
     return text
 
 
+def _paren_delta(line: str) -> int:
+    """Count parentheses outside quoted strings (single/double quotes)."""
+    delta = 0
+    quote: str | None = None
+    escaped = False
+    for char in line:
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char == "(":
+            delta += 1
+        elif char == ")":
+            delta -= 1
+    return delta
+
+
+def _iter_logical_lines(body: str) -> Iterable[str]:
+    """Join multi-line definitions before column parsing.
+
+    MySQL generated columns may span lines::
+
+        `active_slot` tinyint GENERATED ALWAYS AS (
+            CASE WHEN `status` = 'pending' THEN 1 ELSE NULL END
+        ) STORED,
+
+    Parsing line-by-line would treat ``CASE`` as a column name and report a
+    bogus ``ai_profile_build_invite.CASE`` gap.  Merge lines until parentheses
+    balance, ignoring parentheses inside quoted strings.
+    """
+    buffer: list[str] = []
+    depth = 0
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not buffer and (not line or line.startswith("--")):
+            continue
+        buffer.append(line)
+        depth += _paren_delta(line)
+        if depth <= 0:
+            yield " ".join(buffer).rstrip(",")
+            buffer = []
+            depth = 0
+    if buffer:
+        yield " ".join(buffer).rstrip(",")
+
+
 def _parse_ddl(text: str) -> dict[str, dict[str, Any]]:
     tables: dict[str, dict[str, Any]] = {}
     pos = 0
@@ -95,8 +147,7 @@ def _parse_ddl(text: str) -> dict[str, dict[str, Any]]:
         body = text[match.end() : cursor - 1]
         columns: dict[str, str] = {}
         indexes: list[dict[str, Any]] = []
-        for raw in body.splitlines():
-            line = raw.strip().rstrip(",")
+        for line in _iter_logical_lines(body):
             if not line or line.startswith("--"):
                 continue
             index_match = _INDEX_RE.match(line)
