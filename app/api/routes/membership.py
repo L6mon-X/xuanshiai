@@ -19,7 +19,7 @@ async def status(current: CurrentUser = Depends(get_current_user), db: AsyncSess
 @router.get("/users/me/membership/history", response_model=MembershipHistoryPage, summary="查询会员历史")
 async def membership_history(page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=50), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> MembershipHistoryPage: return await history(db, current.id, page, page_size)
 
-@router.post("/membership/orders", response_model=MembershipOrderResponse, summary="创建会员测试支付订单")
+@router.post("/membership/orders", response_model=MembershipOrderResponse, summary="创建会员订单")
 async def order(body: CreateMembershipOrderRequest, idempotency_key: str | None = Header(None, alias="Idempotency-Key"), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> MembershipOrderResponse: return await create_order(db, current.id, body, idempotency_key)
 
 @router.get("/membership/orders/{order_no}", response_model=MembershipOrderResponse, summary="查询会员订单")

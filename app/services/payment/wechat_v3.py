@@ -414,14 +414,17 @@ class WechatPayV3Client(PaymentGateway):
             if response.content:
                 try:
                     self.crypto.verify_response(response.headers, response.content)
-                except PaymentSignatureError:
+                except PaymentSignatureError as exc:
                     # 5xx 可能是网关错误页，没有微信签名；保留原始状态码映射。
                     if response.status_code < 400:
                         raise
-                    logger.warning(
-                        "wechat pay response signature invalid status=%s path=%s",
+                    # 4xx 的签名失败同样要可见：公钥 ID 配错时，账单 400
+                    # 也说明不了响应验签可用。用 error 级别触发告警。
+                    logger.error(
+                        "wechat pay response signature invalid status=%s path=%s error=%s",
                         response.status_code,
                         path,
+                        exc,
                     )
 
             data = _json_or_empty(response)

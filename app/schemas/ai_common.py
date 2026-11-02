@@ -199,3 +199,19 @@ class TaskPollState(BaseModel):
     stage: str | None = None
     poll_after_ms: int = Field(default=1000, ge=0)
     expires_at: datetime | None = None
+
+
+class AiCapabilitiesResponse(BaseModel):
+    """前端启动时探测「哪些 AI 能力现在真的能用」的结果。
+
+    每个字段都等价于「对应接口此刻会不会返回 503 AI_FEATURE_DISABLED」，
+    由 ``require_ai_feature`` 统一判定（含 master 总闸、功能开关、生产审批门
+    与 ``AI_TEST_ONLY_USER_IDS`` 范围），不在前端复制判断逻辑。
+    """
+
+    master: bool = Field(description="AI 总闸；为 false 时其余字段恒为 false")
+    profile: bool = Field(description="AI 画像 / 用心度 / 资料卡")
+    search: bool = Field(description="AI 搜索与自然语言筛选")
+    voice: bool = Field(description="语音播报 / 语音输入")
+    advisor: bool = Field(description="AI 军师")
+    avatar: bool = Field(description="AI 分身")

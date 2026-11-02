@@ -302,22 +302,55 @@ async def admin_update_service_product(
     return _product_response(row)
 
 
+async def assign_service_matchmaker(db: AsyncSession, *, exclude_user_id: int | None = None) -> int:
+    """为「未指定红娘」的私人定制订单分配一名可用服务红娘。
+
+    选择规则：在办订单（status 0 待支付 / 1 已支付）最少者优先，同负载按 id 升序，
+    保证分配结果可复现。池为空时抛 503 —— 不返回 404，避免前端把「无人接单」
+    误报成「红娘不存在」。
+    """
+    result = await db.execute(
+        text(
+            """SELECT app.user_id, COUNT(po.id) AS active_orders
+            FROM user_matchmaker_apply app
+            JOIN users u ON u.id = app.user_id AND u.status = 1
+            JOIN user_role role ON role.user_id = app.user_id
+              AND role.role_code = 'service_matchmaker' AND role.status = 1
+            LEFT JOIN payment_order po ON po.matchmaker_id = app.user_id
+              AND po.type = 3 AND po.status IN (0, 1)
+            WHERE app.application_type = 'service_matchmaker' AND app.status = 1
+              AND (:exclude_user_id IS NULL OR app.user_id <> :exclude_user_id)
+            GROUP BY app.user_id
+            ORDER BY active_orders ASC, app.user_id ASC
+            LIMIT 1"""
+        ),
+        {"exclude_user_id": exclude_user_id},
+    )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(503, detail="暂无可用服务红娘，请稍后再试")
+    return int(row["user_id"])
+
+
 async def create_service_order(
     db: AsyncSession, current: CurrentUser, request: MatchmakerServiceOrderCreate, idempotency_key: str
 ) -> MatchmakerServiceOrderResponse:
     if current.realname_status != 2:
         raise HTTPException(403, detail="提交牵线申请前必须完成实名认证")
-    if request.matchmaker_id == current.id:
+    matchmaker_id = request.matchmaker_id
+    if matchmaker_id is None:
+        matchmaker_id = await assign_service_matchmaker(db, exclude_user_id=current.id)
+    elif matchmaker_id == current.id:
         raise HTTPException(422, detail="不能向自己提交牵线申请")
     target = await db.execute(text("""SELECT app.user_id FROM user_matchmaker_apply app
         JOIN users u ON u.id = app.user_id AND u.status = 1
         JOIN user_role role ON role.user_id = app.user_id
           AND role.role_code = 'service_matchmaker' AND role.status = 1
         WHERE app.user_id = :matchmaker_id AND app.application_type = 'service_matchmaker'
-          AND app.status = 1"""), {"matchmaker_id": request.matchmaker_id})
+          AND app.status = 1"""), {"matchmaker_id": matchmaker_id})
     if not target.scalar():
         raise HTTPException(404, detail="服务红娘不存在或暂不可用")
-    await ensure_users_can_interact(db, current.id, request.matchmaker_id)
+    await ensure_users_can_interact(db, current.id, matchmaker_id)
     product = await db.execute(text("""SELECT id, name, service_type, price FROM matchmaker_service_product
         WHERE id = :id AND status = 1 AND service_type IN (1, 3)"""), {"id": request.product_id})
     product_row = product.mappings().first()
@@ -342,7 +375,7 @@ async def create_service_order(
              DATE_ADD(UTC_TIMESTAMP(), INTERVAL 30 MINUTE))"""), {
             "user_id": current.id, "order_no": order_no, "product_id": request.product_id,
             "product_name": product_row["name"], "amount": product_row["price"],
-            "service_product_id": request.product_id, "matchmaker_id": request.matchmaker_id,
+            "service_product_id": request.product_id, "matchmaker_id": matchmaker_id,
             "requirement": request.requirement, "idempotency_key": idempotency_key,
         })
     except IntegrityError:

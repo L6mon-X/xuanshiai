@@ -1,0 +1,72 @@
+"""头像人脸自助核验（Q32，2026-11-02）。
+
+现状：``get_face_provider()`` 已存在但全仓无调用点，``face_verified`` 只能由
+后台人工审核写入。本模块把「本人已上传头像 → 人脸服务核验 → 写认证标记」
+串成一条自助链路；provider 未配置时保持 fail-closed（503），不允许静默通过。
+"""
+
+from __future__ import annotations
+
+from fastapi import HTTPException
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.redis import consume_daily, daily_quota_key, get_daily_used
+from app.schemas.face import FaceVerifyResponse
+from app.services.face.providers import DisabledFaceProvider, get_face_provider
+
+DAILY_FACE_VERIFY_LIMIT = 3
+_DAILY_KEY_PREFIX = "face:verify"
+
+
+async def verify_avatar(db: AsyncSession, user_id: int, avatar_url: str) -> FaceVerifyResponse:
+    row = (
+        await db.execute(
+            text("SELECT avatar FROM users WHERE id = :id"), {"id": user_id}
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    if not row.get("avatar") or avatar_url != row["avatar"]:
+        raise HTTPException(status_code=403, detail="只能核验本人已上传的头像")
+
+    provider = get_face_provider()
+    if isinstance(provider, DisabledFaceProvider):
+        # 未配置供应商时先 fail-closed，不消耗用户当日次数。
+        raise HTTPException(status_code=503, detail="人脸认证服务未配置")
+
+    key = daily_quota_key(_DAILY_KEY_PREFIX, user_id)
+    if not await consume_daily(key, DAILY_FACE_VERIFY_LIMIT):
+        raise HTTPException(status_code=429, detail="今日人脸核验次数已达上限（3 次）")
+    remaining = max(0, DAILY_FACE_VERIFY_LIMIT - await get_daily_used(key))
+
+    result = await provider.verify(user_id=user_id, image_ref=avatar_url, scene="face_auth")
+    if not result.verified:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "FACE_NOT_MATCHED", "remaining_attempts": remaining},
+        )
+
+    await db.execute(
+        text(
+            "INSERT INTO user_auth (user_id, face_verified, face_score, face_method, face_vendor, verified_at) "
+            "VALUES (:user_id, 1, :score, 'self_service', :provider, UTC_TIMESTAMP()) "
+            "ON DUPLICATE KEY UPDATE face_verified = 1, face_score = :score, "
+            "face_method = 'self_service', face_vendor = :provider, verified_at = UTC_TIMESTAMP()"
+        ),
+        {"user_id": user_id, "score": result.score, "provider": result.provider},
+    )
+    await db.execute(
+        text(
+            "INSERT INTO business_audit_log (actor_user_id, action, resource_type, resource_id) "
+            "VALUES (:actor, 'user.face_verify', 'user_auth', :id)"
+        ),
+        {"actor": user_id, "id": user_id},
+    )
+    await db.commit()
+    return FaceVerifyResponse(
+        verified=True,
+        provider=result.provider,
+        score=result.score,
+        remaining_attempts=remaining,
+    )

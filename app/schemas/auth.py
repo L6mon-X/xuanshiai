@@ -49,7 +49,9 @@ class ProfileQaAnswer(BaseModel):
 
 class SmsSendRequest(BaseModel):
     phone: str = Field(pattern=r"^1[3-9]\d{9}$", examples=["13812345678"], description="11位大陆手机号")
-    purpose: Literal["login", "bind_phone"] = "login"
+    # change_phone_old 发给旧号、change_phone_new 发给新号：换绑必须两端都验证，
+    # 只有新号验证码就能改绑等于「拿到 token 即可劫持账号」（见 services/auth.change_phone）。
+    purpose: Literal["login", "bind_phone", "change_phone_old", "change_phone_new"] = "login"
 
 
 class SmsSendResponse(BaseModel):
@@ -92,6 +94,34 @@ class ExistingAccountLoginRequest(BaseModel):
 
 class BindPhoneRequest(PhoneLoginRequest):
     pass
+
+
+class ChangePhoneRequest(BaseModel):
+    """换绑手机号：必须同时证明「旧号归属」与「新号可用」。"""
+
+    new_phone: str = Field(pattern=r"^1[3-9]\d{9}$", description="新手机号")
+    new_code: str = Field(
+        min_length=6,
+        max_length=6,
+        pattern=r"^\d{6}$",
+        description="新手机号收到的验证码（purpose=change_phone_new）",
+    )
+    old_code: str | None = Field(
+        default=None,
+        min_length=6,
+        max_length=6,
+        pattern=r"^\d{6}$",
+        description="旧手机号收到的验证码（purpose=change_phone_old）",
+    )
+    password: str | None = Field(
+        default=None, min_length=1, max_length=64, description="账号密码，与 old_code 二选一"
+    )
+
+    @model_validator(mode="after")
+    def _require_one_proof(self) -> ChangePhoneRequest:
+        if not self.old_code and not self.password:
+            raise ValueError("旧手机号验证码与账号密码必须提供一项")
+        return self
 
 
 class RefreshRequest(BaseModel):
