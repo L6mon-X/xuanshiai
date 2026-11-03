@@ -55,6 +55,7 @@ jobs:
           tests/test_schema_contract.py
           tests/test_business_schema_migration_contract.py
           scripts/manage_business_migration.py
+          scripts/schema_contract.py
           tests/test_discovery_features.py
       - name: Message and media unit contracts (no integration/live/manual)
         env:
