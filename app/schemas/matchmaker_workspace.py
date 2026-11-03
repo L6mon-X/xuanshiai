@@ -4,7 +4,7 @@ The routes in this module deliberately use the normal mobile user session.  They
 are not aliases for the independent ``/admin`` matchmaker console.
 """
 
-from datetime import UTC, date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -536,6 +536,7 @@ class WorkspaceMeetingRecordSummary(BaseModel):
     scheduled_at: datetime
     location: str
     cancel_reason: str | None
+    follow_up_content: str | None = None
 
 
 class WorkspaceMeetingRequest(BaseModel):
@@ -556,6 +557,7 @@ class WorkspaceMeetingRequestPage(BaseModel):
     page_size: int
     total: int
     has_more: bool
+    workflow_version: int = 2
 
 
 class PartnerTeamUpdate(BaseModel):
@@ -761,6 +763,10 @@ class WorkspaceMeetingStatusUpdate(BaseModel):
     """约见申请处理状态流转；待处理=SUBMITTED，已处理=ACCEPTED/DECLINED/CLOSED。"""
 
     status: Literal["SUBMITTED", "CONTACTED", "ACCEPTED", "DECLINED", "CLOSED"]
+    contacts_confirmed: bool = False
+    applicant_agreed: bool = False
+    target_agreed: bool = False
+    reason: str | None = Field(default=None, max_length=200)
 
 
 class WorkspaceMeetingScheduleCreate(BaseModel):
@@ -769,13 +775,37 @@ class WorkspaceMeetingScheduleCreate(BaseModel):
     scheduled_at: datetime
     location: str = Field(min_length=1, max_length=128)
 
+    @field_validator("location")
+    @classmethod
+    def require_location(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("请填写约会地点")
+        return value.strip()
+
     @field_validator("scheduled_at")
     @classmethod
     def require_future_time(cls, value: datetime) -> datetime:
-        now = datetime.now(UTC) if value.tzinfo is not None else datetime.now()
-        if value <= now:
+        china = timezone(timedelta(hours=8))
+        local = value.astimezone(china).replace(tzinfo=None) if value.tzinfo else value
+        if local <= datetime.now(china).replace(tzinfo=None):
             raise ValueError("约见时间必须晚于当前时间")
-        return value
+        return local
+
+
+class WorkspaceMeetingDirectCreate(WorkspaceMeetingScheduleCreate):
+    applicant_user_id: int = Field(ge=1)
+    target_user_id: int = Field(ge=1)
+    contacts_confirmed: bool
+    applicant_agreed: bool
+    target_agreed: bool
+
+    @model_validator(mode="after")
+    def require_both_consents(self) -> "WorkspaceMeetingDirectCreate":
+        if self.applicant_user_id == self.target_user_id:
+            raise ValueError("不能安排同一用户与自己约会")
+        if not (self.contacts_confirmed and self.applicant_agreed and self.target_agreed):
+            raise ValueError("请先联系双方并确认双方均同意约会")
+        return self
 
 
 class WorkspaceMeetingRecordStatusUpdate(BaseModel):
@@ -783,9 +813,14 @@ class WorkspaceMeetingRecordStatusUpdate(BaseModel):
 
     status: Literal["REMINDED", "CHECKED_IN", "COMPLETED", "CANCELLED", "NO_SHOW"]
     cancel_reason: str | None = Field(default=None, max_length=200)
+    follow_up_content: str | None = Field(default=None, max_length=2000)
 
     @model_validator(mode="after")
     def require_cancel_reason(self) -> "WorkspaceMeetingRecordStatusUpdate":
+        if self.status == "COMPLETED" and not (self.follow_up_content and self.follow_up_content.strip()):
+            raise ValueError("完成约会前必须填写跟进记录")
+        if self.status != "COMPLETED" and self.follow_up_content:
+            raise ValueError("请在完成约会时提交跟进记录")
         if self.status in {"CANCELLED", "NO_SHOW"} and not (
             self.cancel_reason and str(self.cancel_reason).strip()
         ):

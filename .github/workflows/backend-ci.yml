@@ -128,9 +128,39 @@ jobs:
       - name: Install backend and dev dependencies
         run: uv sync --locked --extra dev
       - name: Ruff workspace lead contracts
-        run: uv run --no-sync ruff check app/schemas/matchmaker_workspace.py scripts/verify_remote_workspace_leads.py tests/test_matchmaker_workspace_contracts.py
+        run: uv run --no-sync ruff check app/schemas/matchmaker_workspace.py app/services/meeting.py app/services/meeting_ownership.py app/services/matchmaker_workspace.py app/api/routes/matchmaker_workspace.py scripts/verify_remote_workspace_leads.py tests/test_matchmaker_workspace_contracts.py tests/test_workspace_meeting_workflow.py
       - name: Test workspace lead contracts
-        run: uv run --no-sync pytest tests/test_matchmaker_workspace_contracts.py -q
+        run: uv run --no-sync pytest tests/test_matchmaker_workspace_contracts.py tests/test_workspace_meeting_workflow.py -q
+
+  workspace-meeting-mysql:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: meeting_ci
+          MYSQL_DATABASE: meeting_ci
+          MYSQL_ROOT_HOST: "%"
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pmeeting_ci"
+          --health-interval=10s --health-timeout=5s --health-retries=12
+    env:
+      ENVIRONMENT: testing
+      AUTO_INIT_DB: "false"
+      DATABASE_URL: mysql+aiomysql://root:meeting_ci@127.0.0.1:3306/meeting_ci
+      WORKSPACE_MEETING_MYSQL_URL: mysql+aiomysql://root:meeting_ci@127.0.0.1:3306/meeting_ci
+      REDIS_URL: redis://127.0.0.1:1/5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked --extra dev
+      - run: uv run --no-sync ruff check tests/integration/business/test_workspace_meeting_mysql.py
+      - run: uv run --no-sync pytest tests/integration/business/test_workspace_meeting_mysql.py -q
 
   admin-scope-unit:
     runs-on: ubuntu-24.04

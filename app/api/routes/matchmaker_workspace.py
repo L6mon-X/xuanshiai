@@ -69,6 +69,7 @@ from app.schemas.matchmaker_workspace import (
     WorkspaceMeetingRecordSummary,
     WorkspaceIntroductionStatusUpdate,
     WorkspaceMeetingScheduleCreate,
+    WorkspaceMeetingDirectCreate,
     WorkspaceMeetingRecordStatusUpdate,
     WorkspaceMeetingStatusUpdate,
     PartnerJoinRequestCreate,
@@ -107,6 +108,7 @@ from app.services.matchmaker_workspace import (
     delete_workspace_meeting_request,
     review_partner_join_request,
     schedule_workspace_meeting,
+    create_workspace_meeting,
     submit_partner_join_request,
     create_team_qr_code,
     update_workspace_meeting_record_status,
@@ -825,7 +827,7 @@ async def update_workbench_meeting_status(
     current: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    await update_workspace_meeting_status(db, await require_workspace(db, current), request_id, body.status)
+    await update_workspace_meeting_status(db, await require_workspace(db, current), request_id, body.status, body)
 
 
 @router.delete(
@@ -839,6 +841,15 @@ async def delete_workbench_meeting_request(
     db: AsyncSession = Depends(get_db),
 ) -> None:
     await delete_workspace_meeting_request(db, await require_workspace(db, current), request_id)
+
+
+@router.post("/workbench/meetings", response_model=WorkspaceMeetingRecordSummary, status_code=201, summary="红娘联系双方并获得同意后添加约会")
+async def create_workbench_meeting(
+    body: WorkspaceMeetingDirectCreate,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WorkspaceMeetingRecordSummary:
+    return await create_workspace_meeting(db, await require_workspace(db, current), body)
 
 
 @router.post(

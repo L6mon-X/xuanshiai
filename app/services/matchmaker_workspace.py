@@ -6,16 +6,16 @@ import asyncio
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 import base64
 import json
 from secrets import token_urlsafe
-from typing import Any
 
 import aiofiles
 import httpx
+from app.services.meeting_ownership import applicant_assignment, meeting_owner_sql
 from fastapi import HTTPException, UploadFile
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -113,6 +113,8 @@ from app.schemas.matchmaker_workspace import (
     WorkspaceMeetingRequest,
     WorkspaceMeetingRequestPage,
     WorkspaceMeetingScheduleCreate,
+    WorkspaceMeetingDirectCreate,
+    WorkspaceMeetingStatusUpdate,
     WorkspaceMeetingRecordStatusUpdate,
     WorkspaceMetric,
 )
@@ -255,6 +257,23 @@ def _scope_predicate(actor: WorkspaceActor, alias: str, params: dict[str, object
         return "1 = 1"
     params["scope_organization_id"] = actor.organization_id
     return f"{alias}.organization_id = :scope_organization_id"
+
+
+def _meeting_scope_predicate(actor: WorkspaceActor, alias: str, params: dict[str, object]) -> str:
+    if actor.scope == "SELF":
+        params["scope_matchmaker_id"] = actor.user_id
+        return meeting_owner_sql(alias) + " = :scope_matchmaker_id"
+    if actor.organization_id is None:
+        return "1 = 1"
+    params["scope_organization_id"] = actor.organization_id
+    return meeting_owner_sql(alias, "organization_id") + " = :scope_organization_id"
+
+
+def _meeting_follow_up_sql(alias: str = "m") -> str:
+    return f"""(SELECT f.content FROM business_audit_log log
+        JOIN member_follow_up f ON f.id = CAST(JSON_UNQUOTE(JSON_EXTRACT(log.after_json, '$.follow_up_id')) AS UNSIGNED)
+        WHERE log.resource_type = 'meeting_record' AND log.resource_id = {alias}.id
+        AND log.action = 'matchmaker_workspace.meeting.completed' ORDER BY log.id DESC LIMIT 1)"""
 
 
 def _applied_matchmaker_exists(user_id_sql: str) -> str:
@@ -577,15 +596,13 @@ async def workspace_dashboard(
         or 0
     )
     meeting_params: dict[str, object] = {}
-    meeting_scope = _scope_predicate(actor, "mr", meeting_params)
-    # 与小程序工作台的「约见申请」同口径：待处理 = 申请仍在跟进且尚未安排约见；
-    # 已安排约见的申请转入「待见面」，不再重复计入待处理。
+    meeting_scope = _meeting_scope_predicate(actor, "mr", meeting_params)
+    # 约见申请入口对应全部；待见面包含已接受但尚未排期，以及尚未完成跟进的约会。
     meeting_request_count = int(
         await db.scalar(
             text(
                 f"""SELECT COUNT(*) FROM meeting_request mr WHERE {meeting_scope}
-                AND mr.status IN ('SUBMITTED', 'CONTACTED', 'ACCEPTED')
-                AND NOT EXISTS (SELECT 1 FROM meeting_record m WHERE m.request_id = mr.id)"""
+                """
             ),
             meeting_params,
         )
@@ -594,9 +611,11 @@ async def workspace_dashboard(
     pending_meeting_count = int(
         await db.scalar(
             text(
-                f"""SELECT COUNT(*) FROM meeting_record m
-                JOIN meeting_request mr ON mr.id = m.request_id
-                WHERE {meeting_scope} AND m.status IN ('SCHEDULED', 'REMINDED', 'CHECKED_IN')"""
+                f"""SELECT COUNT(*) FROM meeting_request mr
+                LEFT JOIN meeting_record m ON m.id = (SELECT MAX(mm.id) FROM meeting_record mm WHERE mm.request_id = mr.id)
+                WHERE {meeting_scope} AND mr.status = 'ACCEPTED'
+                AND (m.id IS NULL OR m.status IN ('SCHEDULED', 'REMINDED', 'CHECKED_IN')
+                    OR (m.status = 'COMPLETED' AND {_meeting_follow_up_sql()} IS NULL))"""
             ),
             meeting_params,
         )
@@ -876,6 +895,7 @@ def _meeting_request_from_row(row: object) -> WorkspaceMeetingRequest:
             scheduled_at=values["scheduled_at"],
             location=str(values["location"] or "待确认地点"),
             cancel_reason=values.get("cancel_reason"),
+            follow_up_content=values.get("follow_up_content"),
         )
     return WorkspaceMeetingRequest(
         id=int(values["id"]),
@@ -910,7 +930,7 @@ async def list_workspace_meeting_requests(
     search: str | None,
 ) -> WorkspaceMeetingRequestPage:
     params: dict[str, object] = {"limit": page_size, "offset": (page - 1) * page_size}
-    where = [_scope_predicate(actor, "mr", params)]
+    where = [_meeting_scope_predicate(actor, "mr", params)]
     if search:
         where.append(
             "(au.nickname LIKE CONCAT('%', :search, '%') OR tu.nickname LIKE CONCAT('%', :search, '%') "
@@ -918,11 +938,11 @@ async def list_workspace_meeting_requests(
         )
         params["search"] = search
     clause = " AND ".join(where)
-    base = """FROM meeting_request mr
+    base = f"""FROM meeting_request mr
         JOIN users au ON au.id = mr.user_id
         JOIN users tu ON tu.id = mr.target_user_id
-        LEFT JOIN users mu ON mu.id = mr.matchmaker_id
-        LEFT JOIN matchmaker_workspace_profile mwp ON mwp.user_id = mr.matchmaker_id AND mwp.status = 1
+        LEFT JOIN users mu ON mu.id = {meeting_owner_sql("mr")}
+        LEFT JOIN matchmaker_workspace_profile mwp ON mwp.user_id = {meeting_owner_sql("mr")} AND mwp.status = 1
         LEFT JOIN (
             SELECT request_id, MAX(id) AS meeting_id FROM meeting_record GROUP BY request_id
         ) latest ON latest.request_id = mr.id
@@ -939,7 +959,8 @@ async def list_workspace_meeting_requests(
                     AND (mt.start_at IS NULL OR mt.start_at <= UTC_TIMESTAMP())
                     AND (mt.end_at IS NULL OR mt.end_at > UTC_TIMESTAMP())) AS target_is_vip,
             mu.nickname AS matchmaker_nickname, mwp.display_name AS matchmaker_display_name,
-            m.id AS meeting_id, m.status AS meeting_status, m.scheduled_at, m.location, m.cancel_reason
+            m.id AS meeting_id, m.status AS meeting_status, m.scheduled_at, m.location, m.cancel_reason,
+            {_meeting_follow_up_sql()} AS follow_up_content
             {base} WHERE {clause} ORDER BY mr.created_at DESC, mr.id DESC LIMIT :limit OFFSET :offset"""
         ),
         params,
@@ -2687,18 +2708,33 @@ async def create_workspace_member(
 
 
 async def update_workspace_meeting_status(
-    db: AsyncSession, actor: WorkspaceActor, request_id: int, status: str
+    db: AsyncSession, actor: WorkspaceActor, request_id: int, status: str,
+    body: WorkspaceMeetingStatusUpdate | None = None,
 ) -> None:
     params: dict[str, object] = {"id": request_id}
-    clause = _scope_predicate(actor, "mr", params)
-    row = await db.execute(text(f"SELECT id FROM meeting_request mr WHERE mr.id = :id AND {clause}"), params)
-    if not row.scalar():
+    clause = _meeting_scope_predicate(actor, "mr", params)
+    row = (await db.execute(text(f"SELECT id, user_id, status FROM meeting_request mr WHERE mr.id = :id AND {clause} FOR UPDATE"), params)).mappings().first()
+    if row is None:
         raise HTTPException(404, detail="约见申请不存在或不在服务范围")
+    if row["status"] == status:
+        return
+    if row["status"] not in {"SUBMITTED", "CONTACTED"} or status not in {"CONTACTED", "ACCEPTED", "DECLINED", "CLOSED"}:
+        raise HTTPException(409, detail="申请结果不可回退，请在约会安排中记录后续情况")
+    if status == "ACCEPTED" and not (body and body.contacts_confirmed and body.applicant_agreed and body.target_agreed):
+        raise HTTPException(409, detail="请先联系双方并确认双方均同意约会")
+    if status in {"DECLINED", "CLOSED"} and not (body and body.reason and body.reason.strip()):
+        raise HTTPException(422, detail="约会失败必须填写原因")
     await db.execute(
         text("UPDATE meeting_request SET status = :status, updated_at = UTC_TIMESTAMP() WHERE id = :id"),
         {"id": request_id, "status": status},
     )
-    await _audit(db, actor.user_id, "matchmaker_workspace.meeting.status", "meeting_request", request_id, status)
+    if status in {"DECLINED", "CLOSED"}:
+        # 用户申请消耗的次数仅退回一次；红娘手工添加已是 ACCEPTED，不走此分支。
+        await db.execute(text("""UPDATE matchmaker_service_quota SET available_count = available_count + 1,
+            used_count = GREATEST(used_count - 1, 0), refunded_count = refunded_count + 1 WHERE user_id = :user_id"""),
+            {"user_id": row["user_id"]})
+    await _audit(db, actor.user_id, "matchmaker_workspace.meeting.status", "meeting_request", request_id,
+                 body.reason.strip() if body and body.reason else status)
     await db.commit()
 
 
@@ -2706,7 +2742,7 @@ async def delete_workspace_meeting_request(
     db: AsyncSession, actor: WorkspaceActor, request_id: int
 ) -> None:
     params: dict[str, object] = {"id": request_id}
-    clause = _scope_predicate(actor, "mr", params)
+    clause = _meeting_scope_predicate(actor, "mr", params)
     row = await db.execute(text(f"SELECT id FROM meeting_request mr WHERE mr.id = :id AND {clause}"), params)
     if not row.scalar():
         raise HTTPException(404, detail="约见申请不存在或不在服务范围")
@@ -2716,14 +2752,52 @@ async def delete_workspace_meeting_request(
     await db.commit()
 
 
+async def _ensure_meeting_users_can_interact(db: AsyncSession, applicant_id: int, target_id: int) -> None:
+    # social -> discovery -> workspace，延迟导入避免模块初始化环。
+    from app.services.social import ensure_users_can_interact
+    await ensure_users_can_interact(db, applicant_id, target_id)
+
+
+async def create_workspace_meeting(
+    db: AsyncSession, actor: WorkspaceActor, body: WorkspaceMeetingDirectCreate,
+) -> WorkspaceMeetingRecordSummary:
+    """红娘已联系双方并获得同意后，为名下申请人直接安排约会。"""
+    assignment = await applicant_assignment(db, body.applicant_user_id)
+    if assignment.get("matchmaker_id") != actor.user_id:
+        raise HTTPException(404, detail="申请人不属于当前红娘名下")
+    await _require_scoped_member(db, actor, body.target_user_id)
+    await _ensure_meeting_users_can_interact(db, body.applicant_user_id, body.target_user_id)
+    # 锁申请人，串行化本红娘为同一申请人发起的重复添加。
+    applicant = await db.execute(text("SELECT id FROM users WHERE id = :id AND status = 1 FOR UPDATE"), {"id": body.applicant_user_id})
+    if applicant.first() is None:
+        raise HTTPException(404, detail="申请人不存在或不可用")
+    duplicate = await db.scalar(text("""SELECT id FROM meeting_request WHERE user_id = :applicant
+        AND target_user_id = :target AND status IN ('SUBMITTED', 'CONTACTED', 'ACCEPTED')
+        AND NOT EXISTS (SELECT 1 FROM meeting_record m WHERE m.request_id = meeting_request.id
+            AND m.status IN ('COMPLETED', 'CANCELLED', 'NO_SHOW')) LIMIT 1"""),
+        {"applicant": body.applicant_user_id, "target": body.target_user_id})
+    if duplicate:
+        raise HTTPException(409, detail="双方已有待处理或待见面的约会，请处理原记录")
+    result = await db.execute(text("""INSERT INTO meeting_request
+        (user_id, target_user_id, matchmaker_id, organization_id, status, note)
+        VALUES (:applicant, :target, :owner, :organization, 'ACCEPTED', :note)"""), {
+        "applicant": body.applicant_user_id, "target": body.target_user_id, "owner": actor.user_id,
+        "organization": assignment.get("organization_id"), "note": "红娘已联系双方并确认双方均同意约会",
+    })
+    request_id = int(result.lastrowid)
+    await _audit(db, actor.user_id, "matchmaker_workspace.meeting.both_agreed", "meeting_request", request_id,
+                 "红娘确认已联系双方，申请人和被邀请方均同意约会")
+    return await schedule_workspace_meeting(db, actor, request_id, body)
+
+
 async def schedule_workspace_meeting(
     db: AsyncSession, actor: WorkspaceActor, request_id: int, body: WorkspaceMeetingScheduleCreate
 ) -> WorkspaceMeetingRecordSummary:
     """为双方接受的约见申请创建约见安排；同一申请同时只允许一份进行中的安排。"""
     params: dict[str, object] = {"id": request_id}
-    clause = _scope_predicate(actor, "mr", params)
+    clause = _meeting_scope_predicate(actor, "mr", params)
     request_row = await db.execute(
-        text(f"SELECT id, status FROM meeting_request mr WHERE mr.id = :id AND {clause}"), params
+        text(f"SELECT id, status FROM meeting_request mr WHERE mr.id = :id AND {clause} FOR UPDATE"), params
     )
     current = request_row.first()
     if current is None:
@@ -2734,14 +2808,14 @@ async def schedule_workspace_meeting(
         await db.scalar(
             text(
                 """SELECT COUNT(*) FROM meeting_record WHERE request_id = :id
-                AND status IN ('SCHEDULED', 'REMINDED', 'CHECKED_IN')"""
+                """
             ),
             {"id": request_id},
         )
         or 0
     )
     if active_count > 0:
-        raise HTTPException(409, detail="该申请已有进行中的约见安排")
+        raise HTTPException(409, detail="该申请已有约会安排，不能重复添加")
     insert_result = await db.execute(
         text(
             """INSERT INTO meeting_record
@@ -2779,20 +2853,43 @@ async def update_workspace_meeting_record_status(
 ) -> None:
     """流转工作范围内的约见安排状态；已取消的约见不可恢复。"""
     params: dict[str, object] = {"id": meeting_id}
-    clause = _scope_predicate(actor, "mr", params)
+    clause = _meeting_scope_predicate(actor, "mr", params)
     row = await db.execute(
         text(
-            f"""SELECT m.id, m.status FROM meeting_record m
+            f"""SELECT m.id, m.status, m.scheduled_at, mr.user_id FROM meeting_record m
             JOIN meeting_request mr ON mr.id = m.request_id
-            WHERE m.id = :id AND {clause}"""
+            WHERE m.id = :id AND {clause} FOR UPDATE"""
         ),
         params,
     )
-    current = row.first()
+    current = row.mappings().first()
     if current is None:
         raise HTTPException(404, detail="约见安排不存在或不在服务范围")
-    if current.status == "CANCELLED":
-        raise HTTPException(409, detail="已取消的约见不能恢复")
+    if current["status"] in {"CANCELLED", "NO_SHOW"}:
+        raise HTTPException(409, detail="失败约会不能恢复或完成")
+    if current["status"] == "COMPLETED" and body.status != "COMPLETED":
+        raise HTTPException(409, detail="完成约会不能回退")
+    if body.status == "COMPLETED":
+        scheduled_at = current["scheduled_at"]
+        now = datetime.now(scheduled_at.tzinfo) if scheduled_at.tzinfo else datetime.now(timezone(timedelta(hours=8))).replace(tzinfo=None)
+        if scheduled_at > now:
+            raise HTTPException(409, detail="约会时间尚未到，不能完成约会")
+        existing = await db.scalar(text(f"SELECT {_meeting_follow_up_sql()} FROM meeting_record m WHERE m.id = :id"), params)
+        if existing:
+            return  # 同一完成操作重复提交不重复创建跟进。
+        content = (body.follow_up_content or "").strip()
+        if not content:
+            raise HTTPException(422, detail="完成约会前必须填写跟进记录")
+        follow_up = await db.execute(text("""INSERT INTO member_follow_up (user_id, method, content, created_by)
+            VALUES (:user_id, 'OTHER', :content, :actor)"""), {
+            "user_id": current["user_id"], "content": content, "actor": actor.user_id,
+        })
+        await db.execute(text("""INSERT INTO business_audit_log
+            (actor_user_id, action, resource_type, resource_id, after_json)
+            VALUES (:actor, 'matchmaker_workspace.meeting.completed', 'meeting_record', :id, :payload)"""), {
+            "actor": actor.user_id, "id": meeting_id,
+            "payload": json.dumps({"follow_up_id": int(follow_up.lastrowid)}),
+        })
     cancel_reason = body.cancel_reason.strip() if body.cancel_reason else None
     await db.execute(
         text(
