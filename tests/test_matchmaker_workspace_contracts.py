@@ -1,15 +1,23 @@
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 import pytest
 
 from app.main import app
+from app.api.dependencies import CurrentUser, get_current_user
+from app.api.routes import matchmaker_workspace as workspace_routes
+from app.db.session import get_db
 from app.schemas.customer_lead_admin import CustomerLeadCreate, CustomerLeadUpdate
 from app.schemas.matchmaker_workspace import (
     MatchmakerWorkspaceProfileUpdate,
     PromoterLeadCreate,
     WorkspaceLead,
     WorkspaceLeadCreate,
+    WorkspaceLeadFollowUp,
+    WorkspaceLeadFollowUpCreate,
     WorkspaceLeadUpdate,
     WorkspaceMemberReviewUpdate,
 )
@@ -17,6 +25,7 @@ from app.services.customer_lead_contact import normalize_contact
 from app.services.matchmaker_workspace import (
     WorkspaceActor,
     _LEAD_SELECT,
+    _lead_from_row,
     require_review_authority,
     workspace_identity,
     workspace_role_name,
@@ -24,6 +33,65 @@ from app.services.matchmaker_workspace import (
 
 
 client = TestClient(app)
+
+
+@pytest.mark.parametrize("level", range(1, 8))
+def test_workspace_lead_levels_match_admin_and_preserve_stored_values(level: int) -> None:
+    """等级 4 曾使整页 500；同库后台允许的七档必须原样读取和写入。"""
+    row = {
+        "id": 1, "name": "测试客源", "phone": None, "wechat": None,
+        "source": "测试", "intention_level": level, "status": "NEW",
+        "next_follow_at": None, "created_at": "2026-11-03T12:00:00",
+        "updated_at": "2026-11-03T12:00:00",
+    }
+    assert _lead_from_row(row).intention_level == level
+    payload = {"name": "测试客源", "phone": "13800000000", "source": "测试", "intention_level": level}
+    assert CustomerLeadCreate(**payload).intention_level == WorkspaceLeadCreate(**payload).intention_level
+    assert WorkspaceLeadUpdate(intention_level=level).intention_level == level
+    assert WorkspaceLeadFollowUpCreate(method="PHONE", content="测试", intention_level=level).intention_level == level
+    assert WorkspaceLeadFollowUp(
+        id=1, lead_id=1, method="PHONE", content="测试", intention_level=level,
+        next_follow_at=None, created_at="2026-11-03T12:00:00",
+    ).intention_level == level
+
+
+@pytest.mark.parametrize("level", [0, 8, -1])
+def test_workspace_lead_rejects_levels_outside_admin_range(level: int) -> None:
+    with pytest.raises(ValidationError):
+        WorkspaceLeadUpdate(intention_level=level)
+    with pytest.raises(ValidationError):
+        WorkspaceLeadFollowUpCreate(method="PHONE", content="测试", intention_level=level)
+
+
+def test_leads_http_list_serializes_all_seven_levels_without_local_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """走真实路由、列表服务及响应序列化；仅认证身份和 DB 查询结果由测试替身提供。"""
+    rows = [{
+        "id": level, "name": "测试客源", "phone": None, "wechat": None,
+        "source": "测试", "intention_level": level, "status": "NEW",
+        "next_follow_at": None, "created_at": "2026-11-03T12:00:00",
+        "updated_at": "2026-11-03T12:00:00",
+    } for level in range(1, 8)]
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: rows))),
+        scalar=AsyncMock(return_value=len(rows)),
+    )
+    actor = WorkspaceActor(user_id=21, display_name="测试红娘", level="NORMAL", organization_id=1)
+    monkeypatch.setattr(workspace_routes, "require_workspace", AsyncMock(return_value=actor))
+    previous_overrides = dict(app.dependency_overrides)
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: CurrentUser(
+        id=21, session_id=1, phone=None, status=1, realname_status=1,
+    )
+    try:
+        response = client.get("/api/v1/matchmaker/workbench/leads?page=1&page_size=100")
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(previous_overrides)
+    assert response.status_code == 200, response.text
+    page = response.json()
+    assert [item["intention_level"] for item in page["items"]] == list(range(1, 8))
+    assert page["total"] == 7 and page["page_size"] == 100 and page["has_more"] is False
+    assert db.execute.await_args.args[1]["scope_matchmaker_id"] == actor.user_id
 
 
 def test_workspace_routes_are_registered_and_require_normal_user_authentication() -> None:

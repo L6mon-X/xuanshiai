@@ -14,6 +14,7 @@ WorkspaceLevel = Literal["NORMAL", "SUPER"]
 WorkspaceScope = Literal["SELF", "ORGANIZATION"]
 ReviewStatus = Literal["PENDING", "PASSED", "REJECTED"]
 LeadStatus = Literal["NEW", "CONTACTED", "INTENDED", "CONVERTED", "LOST", "CLOSED"]
+LeadIntentionLevel = Literal[1, 2, 3, 4, 5, 6, 7]
 FollowUpMethod = Literal["PHONE", "WECHAT", "VISIT", "OTHER"]
 IntroductionStatus = Literal["PENDING", "IN_PROGRESS", "SUCCEEDED", "FAILED"]
 
@@ -146,7 +147,7 @@ class WorkspaceLeadCreate(BaseModel):
     phone: str | None = Field(default=None, pattern=r"^1[3-9]\d{9}$")
     wechat: str | None = Field(default=None, max_length=128)
     source: str = Field(min_length=1, max_length=64)
-    intention_level: Literal[1, 2, 3] = 1
+    intention_level: LeadIntentionLevel = 1
     remark: str | None = Field(default=None, max_length=2000)
     photo: str | None = Field(default=None, max_length=512)
     gender: Literal[1, 2] | None = None
@@ -172,7 +173,7 @@ class WorkspaceLeadUpdate(BaseModel):
     real_name: str | None = Field(default=None, max_length=64)
     phone: str | None = Field(default=None, pattern=r"^1[3-9]\d{9}$")
     wechat: str | None = Field(default=None, max_length=128)
-    intention_level: Literal[1, 2, 3] | None = None
+    intention_level: LeadIntentionLevel | None = None
     status: LeadStatus | None = None
     remark: str | None = Field(default=None, max_length=2000)
     next_follow_at: datetime | None = None
@@ -204,7 +205,7 @@ class WorkspaceLead(BaseModel):
     phone: str | None
     wechat: str | None
     source: str
-    intention_level: Literal[1, 2, 3]
+    intention_level: LeadIntentionLevel
     status: LeadStatus
     next_follow_at: datetime | None
     created_at: datetime
@@ -235,7 +236,7 @@ class WorkspaceLeadPage(BaseModel):
 class WorkspaceLeadFollowUpCreate(BaseModel):
     method: FollowUpMethod
     content: str = Field(min_length=1, max_length=2000)
-    intention_level: Literal[1, 2, 3] | None = None
+    intention_level: LeadIntentionLevel | None = None
     next_follow_at: datetime | None = None
 
 
@@ -244,7 +245,7 @@ class WorkspaceLeadFollowUp(BaseModel):
     lead_id: int
     method: FollowUpMethod
     content: str
-    intention_level: Literal[1, 2, 3] | None
+    intention_level: LeadIntentionLevel | None
     next_follow_at: datetime | None
     created_at: datetime
 

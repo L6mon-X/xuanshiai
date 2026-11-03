@@ -111,6 +111,26 @@ jobs:
   # 审计整改（脱敏 / 数据范围 / 事务 / 报名软删除）：全部为不依赖 DB 的单元契约。
   # 2026-10-14 补齐 PR #49 新增的 7 个测试文件（此前未挂任何 job，CI 里从不执行，
   # 导致「新增回归测试」实际没有门禁）；同批补齐了配套的 Ruff 文件列表。
+  workspace-lead-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      ENVIRONMENT: testing
+      AUTO_INIT_DB: "false"
+      DATABASE_URL: mysql+aiomysql://ci:ci@127.0.0.1:1/ci_unreachable
+      REDIS_URL: redis://127.0.0.1:1/5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install backend and dev dependencies
+        run: uv sync --locked --extra dev
+      - name: Ruff workspace lead contracts
+        run: uv run --no-sync ruff check app/schemas/matchmaker_workspace.py scripts/verify_remote_workspace_leads.py tests/test_matchmaker_workspace_contracts.py
+      - name: Test workspace lead contracts
+        run: uv run --no-sync pytest tests/test_matchmaker_workspace_contracts.py -q
+
   admin-scope-unit:
     runs-on: ubuntu-24.04
     timeout-minutes: 20

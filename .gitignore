@@ -72,6 +72,7 @@ scripts/*
 # 微信支付 real 模式预检与安全暂停脚本：backend-ci.yml 的 admin Ruff 门禁引用
 !scripts/verify_wechat_pay_preflight.py
 !scripts/pause_real_pay.py
+!scripts/verify_remote_workspace_leads.py
 artifacts/
 
 # Local runtime logs
