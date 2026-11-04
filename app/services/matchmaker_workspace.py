@@ -3230,7 +3230,7 @@ def _positive_id(raw: object) -> int | None:
 
 
 async def list_workbench_good_news(
-    db: AsyncSession, actor: WorkspaceActor, stage: str, page: int, page_size: int
+    db: AsyncSession, actor: WorkspaceActor, stage: str, page: int, page_size: int, item_id: int | None = None,
 ) -> WorkspaceGoodNewsPage:
     """红娘工作台的「红娘喜讯」列表。
 
@@ -3251,6 +3251,9 @@ async def list_workbench_good_news(
     if stage:
         conditions.append("JSON_UNQUOTE(JSON_EXTRACT(extra_json, '$.status')) = :stage")
         params["stage"] = stage
+    if item_id is not None:
+        conditions.append("id = :item_id")
+        params["item_id"] = item_id
     own_matchmaker_id = str(actor.user_id)
     if actor.scope == "SELF":
         conditions.append("status IN (1, 2)")
@@ -3321,6 +3324,15 @@ async def create_workbench_good_news(
     partner_name = request.partner_name.strip()
     if not stage or not partner_name:
         raise HTTPException(422, detail="当前状态与对方称呼都要填写")
+    if stage not in {"牵手成功", "恋爱生活", "已见父母", "已订婚", "已领证", "已办婚礼", "婚后生活"}:
+        raise HTTPException(422, detail="请选择有效的喜讯阶段")
+    if request.consent_confirmed is False:
+        raise HTTPException(422, detail="请先确认已取得相关会员同意")
+    if request.client_request_id:
+        from app.services.workspace_good_news import find_duplicate_submission
+        existing = await find_duplicate_submission(db, actor, GOOD_NEWS_DOMAIN, request.client_request_id)
+        if existing is not None:
+            return existing
     images = [url.strip() for url in request.images if url.strip()][:9]
     extra = {
         "status": stage,
@@ -3332,6 +3344,10 @@ async def create_workbench_good_news(
         "images": images,
         "blessing_count": 0,
         "source": "matchmaker_workspace",
+        "feedback_name": request.feedback_name.strip(),
+        "consent_confirmed": request.consent_confirmed is True,
+        "public": request.consent_confirmed is True,
+        "client_request_id": request.client_request_id,
     }
     result = await db.execute(
         text(
@@ -3353,24 +3369,33 @@ async def create_workbench_good_news(
 
 
 async def list_workbench_good_news_pennants(
-    db: AsyncSession, actor: WorkspaceActor, page: int, page_size: int
+    db: AsyncSession, actor: WorkspaceActor, page: int, page_size: int, item_id: int | None = None,
 ) -> WorkspacePennantPage:
     """锦旗墙（domain=good_news_pennant）。
 
-    锦旗的受赠人是 `extra.target` 文本（后台按红娘姓名录入，没有 ID 列），所以普通红娘只能按
-    本人工作台显示名精确匹配，改名即失配；这类归属问题等红娘端能上传锦旗时再补 ID 字段。
+    新提交按 `extra.target_user_id` 绑定受赠红娘，改名不影响归属；
+    无 ID 的后台历史记录仍按 `extra.target` 显示名兼容匹配。
     """
-    conditions = ["tenant_id = 1", "domain = :domain", "status = 1"]
+    conditions = ["tenant_id = 1", "domain = :domain", "status IN (1, 2)"]
     params: dict[str, object] = {
         "domain": GOOD_NEWS_PENNANT_DOMAIN, "limit": page_size, "offset": (page - 1) * page_size,
     }
     if actor.scope == "SELF":
-        conditions.append("JSON_UNQUOTE(JSON_EXTRACT(extra_json, '$.target')) = :own_target")
+        conditions.append("""(JSON_UNQUOTE(JSON_EXTRACT(extra_json, '$.target_user_id')) = :own_id
+            OR (JSON_EXTRACT(extra_json, '$.target_user_id') IS NULL
+                AND JSON_UNQUOTE(JSON_EXTRACT(extra_json, '$.target')) = :own_target))""")
         params["own_target"] = actor.display_name
+        params["own_id"] = str(actor.user_id)
+    else:
+        conditions.append("(status = 1 OR JSON_UNQUOTE(JSON_EXTRACT(extra_json, '$.target_user_id')) = :own_id)")
+        params["own_id"] = str(actor.user_id)
+    if item_id is not None:
+        conditions.append("id = :item_id")
+        params["item_id"] = item_id
     where = " AND ".join(conditions)
     total = int(await db.scalar(text(f"SELECT COUNT(*) FROM admin_content_item WHERE {where}"), params) or 0)
     rows = (
-        await db.execute(text(f"""SELECT id, title, subtitle, image_url, extra_json, created_at
+        await db.execute(text(f"""SELECT id, title, subtitle, image_url, status, extra_json, created_at
             FROM admin_content_item WHERE {where}
             ORDER BY sort DESC, created_at DESC, id DESC LIMIT :limit OFFSET :offset"""), params)
     ).mappings().all()
@@ -3386,6 +3411,11 @@ async def list_workbench_good_news_pennants(
             words=str(extra.get("words") or ""),
             image_url=row.get("image_url"),
             created_at=row.get("created_at"),
+            left_words=str(extra.get("left_words") or ""),
+            right_words=str(extra.get("right_words") or ""),
+            date_text=str(extra.get("date_text") or ""),
+            target_user_id=_positive_id(extra.get("target_user_id")),
+            pending_review=int(row.get("status") or 1) != 1,
         ))
     return WorkspacePennantPage(
         items=items, page=page, page_size=page_size, total=total, has_more=_page(total, page, page_size)

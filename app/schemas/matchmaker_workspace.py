@@ -900,6 +900,9 @@ class WorkspaceGoodNewsCreate(BaseModel):
     meet_duration: str = Field("", max_length=20, description="相识时间，按月填数字或自由文本")
     content: str = Field("", max_length=1000, description="情感状态描述与对服务的反馈")
     images: list[str] = Field(default_factory=list, max_length=9, description="已上传图片 URL")
+    feedback_name: str = Field("", max_length=40)
+    consent_confirmed: bool | None = None
+    client_request_id: str | None = Field(default=None, min_length=8, max_length=64)
 
 
 class WorkspaceGoodNewsCreated(BaseModel):
@@ -913,6 +916,7 @@ class WorkspaceGoodNewsPage(BaseModel):
     page_size: int
     total: int
     has_more: bool
+    workflow_version: int = 2
 
 
 class WorkspacePennantItem(BaseModel):
@@ -925,6 +929,11 @@ class WorkspacePennantItem(BaseModel):
     words: str
     image_url: str | None
     created_at: datetime | None
+    left_words: str = ""
+    right_words: str = ""
+    date_text: str = ""
+    target_user_id: int | None = None
+    pending_review: bool = False
 
 
 class WorkspacePennantPage(BaseModel):
@@ -933,3 +942,57 @@ class WorkspacePennantPage(BaseModel):
     page_size: int
     total: int
     has_more: bool
+    workflow_version: int = 2
+
+
+class WorkspacePennantCreate(BaseModel):
+    giver: str = Field(min_length=1, max_length=40)
+    left_words: str = Field(min_length=1, max_length=8)
+    right_words: str = Field(min_length=1, max_length=8)
+    date_text: str = Field("", max_length=24)
+    image_url: str | None = Field(default=None, max_length=1024)
+    consent_confirmed: bool
+    client_request_id: str = Field(min_length=8, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_gift(self) -> "WorkspacePennantCreate":
+        if not self.consent_confirmed:
+            raise ValueError("请确认已取得赠送人同意")
+        if not all(value.strip() for value in (self.giver, self.left_words, self.right_words)):
+            raise ValueError("赠送人与感谢语不能为空")
+        if self.image_url and not self.image_url.startswith("/storage/uploads/good-news/"):
+            raise ValueError("请使用已上传的锦旗图片")
+        return self
+
+
+class WorkspaceGoodNewsBlessingCreate(BaseModel):
+    message: str = Field(min_length=1, max_length=100)
+
+    @field_validator("message")
+    @classmethod
+    def validate_message(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("请填写祝福语")
+        return value.strip()
+
+
+class WorkspaceGoodNewsBlessingResult(BaseModel):
+    blessing_count: int
+    blessed: bool
+    created: bool
+
+
+class WorkspaceGoodNewsBlessingItem(BaseModel):
+    id: int
+    nickname: str
+    avatar: str | None
+    message: str
+    created_at: datetime
+
+
+class WorkspaceGoodNewsBlessingPage(BaseModel):
+    items: list[WorkspaceGoodNewsBlessingItem]
+    total: int
+    page: int
+    has_more: bool
+    blessed: bool

@@ -5,6 +5,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import CurrentUser, get_current_user
 from app.db.session import get_db
+from app.schemas.matchmaker_workspace import (
+    WorkspaceGoodNewsBlessingCreate, WorkspaceGoodNewsBlessingPage, WorkspaceGoodNewsBlessingResult,
+    WorkspaceGoodNewsItem, WorkspacePennantCreate, WorkspacePennantItem,
+)
+from app.services.workspace_good_news import (
+    create_blessing, create_pennant, good_news_detail, list_blessings, pennant_detail,
+)
 from app.schemas.auth import (
     CompletionResponse,
     NicknameUpdateRequest,
@@ -921,3 +928,28 @@ async def create_workbench_introduction(
     db: AsyncSession = Depends(get_db),
 ) -> WorkspaceIntroductionCreated:
     return await create_workspace_introduction(db, await require_workspace(db, current), body)
+
+
+@router.post("/workbench/good-news/pennants", response_model=WorkspaceGoodNewsCreated, status_code=201, summary="代会员提交锦旗，进入后台待审")
+async def submit_workbench_pennant(body: WorkspacePennantCreate, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> WorkspaceGoodNewsCreated:
+    return await create_pennant(db, await require_workspace(db, current), body)
+
+
+@router.get("/workbench/good-news/pennants/{item_id}", response_model=WorkspacePennantItem, summary="查看范围内锦旗详情")
+async def workbench_pennant_detail(item_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> WorkspacePennantItem:
+    return await pennant_detail(db, await require_workspace(db, current), item_id)
+
+
+@router.get("/workbench/good-news/{item_id}", response_model=WorkspaceGoodNewsItem, summary="查看范围内喜讯详情")
+async def workbench_good_news_detail(item_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> WorkspaceGoodNewsItem:
+    return await good_news_detail(db, await require_workspace(db, current), item_id)
+
+
+@router.post("/workbench/good-news/{item_id}/blessings", response_model=WorkspaceGoodNewsBlessingResult, summary="为已审核喜讯送祝福，每人一次")
+async def bless_workbench_good_news(body: WorkspaceGoodNewsBlessingCreate, item_id: int = Path(..., ge=1), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> WorkspaceGoodNewsBlessingResult:
+    return await create_blessing(db, await require_workspace(db, current), item_id, body)
+
+
+@router.get("/workbench/good-news/{item_id}/blessings", response_model=WorkspaceGoodNewsBlessingPage, summary="查看喜讯祝福记录")
+async def workbench_good_news_blessings(item_id: int = Path(..., ge=1), page: int = Query(1, ge=1, le=1000), page_size: int = Query(20, ge=1, le=100), current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> WorkspaceGoodNewsBlessingPage:
+    return await list_blessings(db, await require_workspace(db, current), item_id, page, page_size)

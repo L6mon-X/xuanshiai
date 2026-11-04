@@ -176,7 +176,8 @@ async def test_pennant_wall_matches_the_receiving_matchmaker_by_display_name() -
     db = StubDB(rows=[row], total=1, profiles={})
     page = await list_workbench_good_news_pennants(db, _super(), 1, 20)
     assert db.list_params["domain"] == "good_news_pennant"
-    assert "target" not in db.list_sql
+    assert "status = 1 OR" in db.list_sql
+    assert "$.target_user_id" in db.list_sql  # Own pending gifts remain visible; other pending gifts do not.
     assert page.items[0].target == "红娘测试账号"
     assert page.items[0].words == "牵线搭桥成就姻缘"
 
